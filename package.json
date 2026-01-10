@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@vercel/node": "^3.0.0",
-    "playwright-core": "^1.41.0"
+    "@sparticuz/chromium": "^131.0.0",
+    "puppeteer-core": "^23.0.0"
   }
 }
