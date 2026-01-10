@@ -2,7 +2,8 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install OS deps + certificates
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 RUN apt-get update && apt-get install -y \
   ca-certificates \
   wget \
@@ -11,7 +12,6 @@ RUN apt-get update && apt-get install -y \
 COPY package*.json ./
 RUN npm install
 
-# ✅ IMPORTANT: download Playwright browser (Chromium) inside the image
 RUN npx playwright install --with-deps chromium
 
 COPY . .
