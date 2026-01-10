@@ -1,0 +1,9 @@
+{
+  "name": "neo-browser-crawler",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/node": "^3.0.0",
+    "playwright-core": "^1.41.0"
+  }
+}
