@@ -9,7 +9,19 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// ✅ expanded + safer selectors
+// ------------------------------
+// CONFIG LIMITS (CRITICAL FOR 1007 FIX)
+// ------------------------------
+const MAX_PAGES_DEFAULT = 30;
+const MAX_PAGES_HARD = 60;
+
+// hard limits to prevent token overflow later
+const MAX_CHARS_PER_PAGE = 18000;        // keep page texts compact
+const MAX_TOTAL_CHARS = 280000;          // total across all pages
+
+// ------------------------------
+// Selectors & scoring
+// ------------------------------
 const CLICK_SELECTORS = [
   // generic
   "button",
@@ -18,7 +30,6 @@ const CLICK_SELECTORS = [
 
   // accordion/dropdowns
   "[aria-expanded='false']",
-  "[aria-expanded='true']",
   "[data-bs-toggle]",
   ".accordion button",
   ".accordion-header",
@@ -27,35 +38,41 @@ const CLICK_SELECTORS = [
   ".menu-toggle",
   ".navbar-toggler",
 
-  // tabs
+  // tabs (common libs)
   "[role='tab']",
+  "[aria-controls]",
   ".tabs button",
   ".tab",
   "[data-tab]",
   "[data-state='closed']",
+  "[data-radix-collection-item]",
 
-  // common “read more”
+  // common read-more
   "button:has-text('Виж')",
   "button:has-text('Още')",
   "button:has-text('Прочети')",
+  "button:has-text('Разгледай')",
   "button:has-text('Read more')",
   "button:has-text('More')",
 ];
 
 const KEYWORD_IMPORTANCE =
-  /rooms|accommodation|suite|deluxe|apart|стаи|настаняване|апартамент|резервац|booking|reservation|pricing|цени|price|tariff|contact|контакт|location|местоположение|how-to-get|spa|restaurant|menu|меню|services|услуги|faq|въпроси/i;
+  /rooms|accommodation|suite|deluxe|apart|стаи|настаняване|апартамент|резервац|booking|reservation|pricing|цени|price|tariff|contact|контакт|location|местоположение|how-to-get|spa|restaurant|menu|меню|services|услуги|faq|въпроси|packages|пакети|offers|оферти|conditions|условия/i;
 
-// ---------- helpers ----------
+// ------------------------------
+// Helpers
+// ------------------------------
 function cleanText(t = "") {
   return String(t)
-    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\t/g, " ")
+    .replace(/[ \u00A0]+/g, " ")
     .replace(/\s+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \u00A0]+/g, " ")
     .trim();
 }
 
+// removes repeating boilerplate lines + cookie terms
 function stripBoilerplate(text = "") {
   if (!text) return "";
 
@@ -64,46 +81,67 @@ function stripBoilerplate(text = "") {
     .map((l) => l.trim())
     .filter(Boolean);
 
+  const seen = new Set();
+  const filtered = [];
+
   const badLine = (l) => {
     const s = l.toLowerCase();
 
-    // too short = menu items
+    // too short / menu fragment
     if (l.length <= 2) return true;
 
-    // cookie/GDPR/terms
+    // typical cookie/gdpr/policy lines
     const bad =
-      s.includes("cookies") ||
       s.includes("cookie") ||
+      s.includes("cookies") ||
       s.includes("бисквит") ||
       s.includes("gdpr") ||
       s.includes("privacy") ||
       s.includes("terms") ||
+      s.includes("policy") ||
       s.includes("лични данни") ||
-      s.includes("политика") ||
       s.includes("условия") ||
+      s.includes("политика") ||
       s.includes("consent") ||
       s.includes("preferences") ||
       s.includes("accept") ||
       s.includes("decline") ||
       s.includes("manage") ||
-      s.includes("правата са запазени") ||
-      s.includes("all rights reserved");
+      s.includes("all rights reserved") ||
+      s.includes("правата са запазени");
 
     if (bad) return true;
 
     // footer noise
     if (s === "facebook" || s === "instagram" || s === "linkedin") return true;
 
+    // 100% garbage lines
+    if (/^(ok|yes|no|close)$/i.test(s)) return true;
+
     return false;
   };
 
-  const filtered = lines.filter((l) => !badLine(l));
-  const joined = filtered.join("\n");
+  for (const l of lines) {
+    if (badLine(l)) continue;
 
-  // fallback safety
+    // remove repeated identical lines (menus etc.)
+    const key = l.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    filtered.push(l);
+  }
+
+  const joined = filtered.join("\n");
   if (joined.length < 250) return cleanText(text).slice(0, 5000);
 
   return cleanText(joined);
+}
+
+function clamp(str, max) {
+  if (!str) return "";
+  if (str.length <= max) return str;
+  return str.slice(0, max);
 }
 
 function json(res, status, obj) {
@@ -115,6 +153,17 @@ function normalizeUrl(u) {
   try {
     const url = new URL(u);
     url.hash = "";
+
+    // drop useless tracking params
+    const killParams = [
+      "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+      "gclid", "fbclid", "yclid", "mc_cid", "mc_eid"
+    ];
+    killParams.forEach((p) => url.searchParams.delete(p));
+
+    // if still huge query -> drop full query
+    if (url.search && url.search.length > 80) url.search = "";
+
     return url.toString();
   } catch {
     return null;
@@ -122,15 +171,21 @@ function normalizeUrl(u) {
 }
 
 function isUselessUrl(u = "") {
-  const s = u.toLowerCase();
+  const s = String(u).toLowerCase();
   return (
     s.includes("privacy") ||
     s.includes("cookies") ||
+    s.includes("cookie") ||
     s.includes("terms") ||
     s.includes("gdpr") ||
     s.includes("policy") ||
     s.includes("legal") ||
-    s.includes("consent")
+    s.includes("consent") ||
+    s.includes("/cart") ||
+    s.includes("/checkout") ||
+    s.includes("/login") ||
+    s.includes("/account") ||
+    s.includes("wp-login")
   );
 }
 
@@ -140,25 +195,23 @@ function pagePriorityScore(url, title = "", text = "") {
   const c = String(text || "").toLowerCase();
   let score = 0;
 
-  if (KEYWORD_IMPORTANCE.test(u)) score += 60;
-  if (KEYWORD_IMPORTANCE.test(t)) score += 40;
+  if (KEYWORD_IMPORTANCE.test(u)) score += 70;
+  if (KEYWORD_IMPORTANCE.test(t)) score += 50;
 
-  // extra hotel boosts
-  if (u.includes("rooms") || u.includes("sta") || u.includes("accommodation") || u.includes("настан")) score += 80;
-  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 70;
-  if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 70;
-  if (u.includes("contact") || u.includes("контакт")) score += 60;
-  if (u.includes("location") || u.includes("местополож")) score += 55;
+  // hard boosts
+  if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
+  if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 110;
+  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 90;
+  if (u.includes("contact") || u.includes("контакт")) score += 80;
+  if (u.includes("location") || u.includes("местополож")) score += 70;
 
-  // content hints
-  if (c.includes("лв") || c.includes("лева") || c.includes("eur") || c.includes("евро")) score += 25;
+  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро")) score += 30;
   if (c.includes("тел") || c.includes("телефон") || c.includes("@")) score += 20;
 
-  // penalize legal pages
   if (isUselessUrl(u)) score -= 999;
 
-  // prefer long-ish useful pages
-  score += Math.min(Math.floor((text || "").length / 2000) * 5, 30);
+  // prefer pages with real content length
+  score += Math.min(Math.floor((text || "").length / 1500) * 6, 36);
 
   return score;
 }
@@ -172,7 +225,7 @@ async function safeClick(el) {
   }
 }
 
-// ✅ remove popups/cookie banners + nav/footer before extracting text
+// remove popups/cookies + nav/footer before extracting text
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
@@ -181,7 +234,7 @@ async function removeNoiseDom(page) {
       "nav",
       "aside",
 
-      // cookie banners / GDPR
+      // Cookie banners
       "#onetrust-banner-sdk",
       "#onetrust-consent-sdk",
       ".ot-sdk-container",
@@ -202,35 +255,59 @@ async function removeNoiseDom(page) {
       "[id*='gdpr']",
       "[class*='gdpr']",
 
-      // modal/popup overlays
+      // overlays
       ".modal",
       ".popup",
       ".overlay",
       "[role='dialog']",
       "[aria-modal='true']",
+
+      // chat widgets
+      "iframe[src*='tawk']",
+      "iframe[src*='intercom']",
+      "iframe[src*='crisp']",
+      "iframe[src*='zendesk']",
+      "iframe[src*='livechat']",
     ];
 
     for (const sel of selectorsToRemove) {
       document.querySelectorAll(sel).forEach((el) => el.remove());
     }
+
+    // try close buttons on overlays
+    const closeSelectors = [
+      "button[aria-label*='close' i]",
+      "button[title*='close' i]",
+      "button:has-text('×')",
+      "button:has-text('Close')",
+      "button:has-text('Затвори')",
+      "button:has-text('Приемам')",
+      "button:has-text('Съгласен')",
+      "button:has-text('OK')",
+    ];
+    for (const sel of closeSelectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        try { el.click(); } catch {}
+      });
+    }
   });
 }
 
-// ✅ click-expand + scroll for dynamic content
+// click-expand + scroll for dynamic content
 async function autoExpand(page) {
-  // initial scroll (lazy-load)
+  // initial scroll
   for (let i = 0; i < 6; i++) {
-    await page.mouse.wheel(0, 1400);
-    await page.waitForTimeout(650);
+    await page.mouse.wheel(0, 1500);
+    await page.waitForTimeout(600);
   }
 
   // click common UI elements
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
-      for (let i = 0; i < Math.min(nodes.length, 40); i++) {
+      for (let i = 0; i < Math.min(nodes.length, 50); i++) {
         const ok = await safeClick(nodes[i]);
-        if (ok) await page.waitForTimeout(160);
+        if (ok) await page.waitForTimeout(140);
       }
     } catch {
       // ignore
@@ -239,12 +316,12 @@ async function autoExpand(page) {
 
   // final scroll
   for (let i = 0; i < 4; i++) {
-    await page.mouse.wheel(0, 1600);
-    await page.waitForTimeout(600);
+    await page.mouse.wheel(0, 1700);
+    await page.waitForTimeout(550);
   }
 }
 
-// ✅ extract only meaningful content (main/article)
+// extract main content only
 async function extractMainText(page) {
   const raw = await page.evaluate(() => {
     const candidates = [
@@ -255,6 +332,7 @@ async function extractMainText(page) {
       document.querySelector(".content"),
       document.querySelector(".main-content"),
       document.querySelector("#main"),
+      document.querySelector(".container"),
     ].filter(Boolean);
 
     const el = candidates[0] || document.body;
@@ -262,21 +340,21 @@ async function extractMainText(page) {
   });
 
   const cleaned = cleanText(raw);
-  return stripBoilerplate(cleaned);
+  const stripped = stripBoilerplate(cleaned);
+
+  // HARD clamp to avoid 1007 later
+  return clamp(stripped, MAX_CHARS_PER_PAGE);
 }
 
-// ✅ link collection
 async function collectLinks(page) {
-  const links = await page.evaluate(() => {
+  return await page.evaluate(() => {
     return Array.from(document.querySelectorAll("a[href]"))
       .map((a) => a.href)
       .filter((h) => typeof h === "string");
   });
-
-  return links;
 }
 
-function pickInternalLinks(allLinks, rootUrl, maxPages = 30) {
+function pickInternalLinks(allLinks, rootUrl) {
   const base = new URL(rootUrl);
 
   const sameOrigin = allLinks
@@ -292,24 +370,24 @@ function pickInternalLinks(allLinks, rootUrl, maxPages = 30) {
     })
     .filter((l) => !isUselessUrl(l));
 
-  // unique
   const unique = Array.from(new Set(sameOrigin));
 
-  // prioritize by keywords in URL first
-  const important = unique
+  // prioritize keywords in url
+  const sorted = unique
     .map((l) => ({
       url: l,
-      score: KEYWORD_IMPORTANCE.test(l) ? 50 : 0,
+      score: (KEYWORD_IMPORTANCE.test(l) ? 80 : 0) + (l.length < 120 ? 10 : 0),
     }))
     .sort((a, b) => b.score - a.score)
     .map((x) => x.url);
 
-  // take more pages (not 12 only!)
-  return important.slice(0, maxPages);
+  return sorted;
 }
 
-// ✅ MAIN crawl
-async function crawlSite(url, maxPages = 30) {
+// ------------------------------
+// MAIN CRAWL (BFS)
+// ------------------------------
+async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -325,72 +403,76 @@ async function crawlSite(url, maxPages = 30) {
   const pages = [];
   const visited = new Set();
 
+  let totalChars = 0;
+
   try {
-    // 1) root page
-    const page = await context.newPage();
-    page.setDefaultTimeout(45000);
+    const queue = [url];
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(1500);
-
-    await autoExpand(page);
-    await removeNoiseDom(page);
-
-    const title = cleanText(await page.title());
-    const text = await extractMainText(page);
-
-    pages.push({ url, title, text });
-    visited.add(normalizeUrl(url));
-
-    // 2) collect links
-    const links = await collectLinks(page);
-    const internalLinks = pickInternalLinks(links, url, maxPages + 8);
-
-    // 3) crawl internal pages
-    for (const link of internalLinks) {
+    while (queue.length && pages.length < maxPages && totalChars < MAX_TOTAL_CHARS) {
+      const link = queue.shift();
       const norm = normalizeUrl(link);
       if (!norm) continue;
       if (visited.has(norm)) continue;
-      if (normalizeUrl(link) === normalizeUrl(url)) continue;
+      if (isUselessUrl(norm)) continue;
 
       visited.add(norm);
 
+      let page;
       try {
-        const p2 = await context.newPage();
-        p2.setDefaultTimeout(45000);
+        page = await context.newPage();
+        page.setDefaultTimeout(45000);
 
-        await p2.goto(link, { waitUntil: "domcontentloaded", timeout: 45000 });
-        await p2.waitForTimeout(1200);
+        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 45000 });
+        await page.waitForTimeout(1200);
 
-        await autoExpand(p2);
-        await removeNoiseDom(p2);
+        await autoExpand(page);
+        await removeNoiseDom(page);
 
-        const t2 = cleanText(await p2.title());
-        const tx2 = await extractMainText(p2);
+        const title = cleanText(await page.title());
+        const text = await extractMainText(page);
 
-        // skip useless content
-        if (tx2 && tx2.length > 450 && !isUselessUrl(link)) {
-          pages.push({ url: link, title: t2, text: tx2 });
+        // Skip short garbage pages
+        if (text && text.length > 450) {
+          const remaining = MAX_TOTAL_CHARS - totalChars;
+          const finalText = clamp(text, Math.max(0, remaining));
+          const item = { url: norm, title, text: finalText };
+
+          pages.push(item);
+          totalChars += finalText.length;
         }
 
-        await p2.close();
-      } catch {
-        // ignore page errors
-      }
+        // expand link graph
+        const links = await collectLinks(page);
+        const internalLinks = pickInternalLinks(links, url);
 
-      if (pages.length >= maxPages) break;
+        // enqueue next pages (priority order)
+        for (const l of internalLinks) {
+          const ln = normalizeUrl(l);
+          if (!ln) continue;
+          if (visited.has(ln)) continue;
+          if (queue.length > 400) break; // safety for huge sites
+          queue.push(ln);
+        }
+      } catch {
+        // ignore
+      } finally {
+        try { if (page) await page.close(); } catch {}
+      }
     }
 
-    // 4) final sort by importance (so knowledge is better)
+    // sort by business importance
     pages.sort((a, b) => pagePriorityScore(b.url, b.title, b.text) - pagePriorityScore(a.url, a.title, a.text));
 
+    // final clamp pages count
     return pages.slice(0, maxPages);
   } finally {
     await browser.close();
   }
 }
 
-// ---------- HTTP server ----------
+// ------------------------------
+// HTTP SERVER
+// ------------------------------
 const server = http.createServer(async (req, res) => {
   // CORS preflight
   if (req.method === "OPTIONS") {
@@ -425,12 +507,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { success: false, error: "Unauthorized" });
     }
 
-    const resolvedMaxPages = Math.min(Math.max(Number(maxPages || 30), 6), 60);
+    const resolvedMaxPages = Math.min(Math.max(Number(maxPages || MAX_PAGES_DEFAULT), 6), MAX_PAGES_HARD);
 
     console.log("==================================================");
     console.log("[CRAWL] url:", url);
     console.log("[CRAWL] maxPages:", resolvedMaxPages);
-    console.log("[ENV] NODE_ENV =", process.env.NODE_ENV);
+    console.log("[LIMITS] MAX_CHARS_PER_PAGE:", MAX_CHARS_PER_PAGE);
+    console.log("[LIMITS] MAX_TOTAL_CHARS:", MAX_TOTAL_CHARS);
     console.log("==================================================");
 
     const pages = await crawlSite(url, resolvedMaxPages);
@@ -439,6 +522,7 @@ const server = http.createServer(async (req, res) => {
       success: true,
       root: url,
       pagesCount: pages.length,
+      totalChars: pages.reduce((a, p) => a + (p.text?.length || 0), 0),
       pages,
     });
   } catch (e) {
