@@ -10,24 +10,28 @@ const corsHeaders = {
 };
 
 // ------------------------------
-// CONFIG LIMITS
+// LIMITS (safe for Render)
 // ------------------------------
 const MAX_PAGES_DEFAULT = 30;
-const MAX_PAGES_HARD = 150;
+const MAX_PAGES_HARD = 100;
 
-const MAX_CHARS_PER_PAGE = 18000;
-const MAX_TOTAL_CHARS = 420000;
+const MAX_CHARS_PER_PAGE = 16000;
+const MAX_TOTAL_CHARS = 320000;
 const MIN_PAGE_CHARS = 180;
 
+const MAX_QUEUE = 600;
+
 // ------------------------------
-// Selectors
+// Safe selectors ONLY
+// (NO :has-text, because it breaks querySelectorAll in evaluate)
 // ------------------------------
 const CLICK_SELECTORS = [
-  "a[href]",
+  // generic
   "button",
   "[role='button']",
   "details > summary",
 
+  // accordion/dropdowns
   "[aria-expanded='false']",
   "[data-bs-toggle]",
   ".accordion button",
@@ -37,27 +41,13 @@ const CLICK_SELECTORS = [
   ".menu-toggle",
   ".navbar-toggler",
 
+  // tabs
   "[role='tab']",
   "[aria-controls]",
   ".tabs button",
   ".tab",
   "[data-tab]",
   "[data-state='closed']",
-  "[data-radix-collection-item]",
-
-  "button:has-text('Виж')",
-  "button:has-text('Още')",
-  "button:has-text('Прочети')",
-  "button:has-text('Разгледай')",
-  "button:has-text('Read more')",
-  "button:has-text('More')",
-
-  "a:has-text('Цени')",
-  "a:has-text('Услуги')",
-  "a:has-text('Стаи')",
-  "a:has-text('Настаняване')",
-  "a:has-text('Контакт')",
-  "a:has-text('Резервация')",
 ];
 
 const KEYWORD_IMPORTANCE =
@@ -100,18 +90,15 @@ function stripBoilerplate(text = "") {
       s.includes("terms") ||
       s.includes("policy") ||
       s.includes("лични данни") ||
-      s.includes("условия") ||
       s.includes("политика") ||
       s.includes("consent") ||
       s.includes("preferences") ||
       s.includes("accept") ||
       s.includes("decline") ||
-      s.includes("manage") ||
       s.includes("all rights reserved") ||
       s.includes("правата са запазени");
 
     if (bad) return true;
-
     if (s === "facebook" || s === "instagram" || s === "linkedin") return true;
     if (/^(ok|yes|no|close)$/i.test(s)) return true;
 
@@ -143,6 +130,23 @@ function clamp(str, max) {
 function json(res, status, obj) {
   res.writeHead(status, { ...corsHeaders, "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
+}
+
+function normalizeHost(host) {
+  let h = String(host || "").trim().toLowerCase();
+  h = h.replace(/^www\./i, "");
+  h = h.replace(/^m\./i, "");
+  return h;
+}
+
+function isSameDomainOrSubdomain(aHost, bHost) {
+  const a = normalizeHost(aHost);
+  const b = normalizeHost(bHost);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.endsWith("." + b)) return true;
+  if (b.endsWith("." + a)) return true;
+  return false;
 }
 
 function normalizeUrl(u) {
@@ -190,28 +194,9 @@ function isUselessUrl(u = "") {
     s.includes("wp-login") ||
     s.includes("/wp-admin") ||
     s.includes("/tag/") ||
-    s.includes("/author/")
+    s.includes("/author/") ||
+    s.includes("/feed")
   );
-}
-
-function normalizeHost(host) {
-  let h = String(host || "").trim().toLowerCase();
-  h = h.replace(/^www\./i, "");
-  h = h.replace(/^m\./i, "");
-  return h;
-}
-
-function isSameDomainOrSubdomain(aHost, bHost) {
-  const a = normalizeHost(aHost);
-  const b = normalizeHost(bHost);
-  if (!a || !b) return false;
-  if (a === b) return true;
-
-  // subdomain checks
-  if (a.endsWith("." + b)) return true;
-  if (b.endsWith("." + a)) return true;
-
-  return false;
 }
 
 function pagePriorityScore(url, title = "", text = "") {
@@ -224,22 +209,33 @@ function pagePriorityScore(url, title = "", text = "") {
   if (KEYWORD_IMPORTANCE.test(u)) score += 70;
   if (KEYWORD_IMPORTANCE.test(t)) score += 50;
 
-  if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 140;
   if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 130;
-  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 100;
-  if (u.includes("contact") || u.includes("контакт")) score += 90;
-  if (u.includes("location") || u.includes("местополож")) score += 80;
+  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 110;
+  if (u.includes("contact") || u.includes("контакт")) score += 100;
+  if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
 
   if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро"))
     score += 35;
 
-  if (c.includes("тел") || c.includes("телефон") || c.includes("@")) score += 25;
-
   if (isUselessUrl(u)) score -= 999;
 
   score += Math.min(Math.floor((text || "").length / 1400) * 6, 60);
-
   return score;
+}
+
+// ------------------------------
+// Safe DOM helpers
+// ------------------------------
+async function safeWait(page, ms) {
+  try {
+    await page.waitForTimeout(ms);
+  } catch {}
+}
+
+async function safeScroll(page) {
+  try {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  } catch {}
 }
 
 async function safeClick(el) {
@@ -252,79 +248,69 @@ async function safeClick(el) {
 }
 
 async function removeNoiseDom(page) {
-  await page.evaluate(() => {
-    const selectorsToRemove = [
-      "#onetrust-banner-sdk",
-      "#onetrust-consent-sdk",
-      ".ot-sdk-container",
-      ".ot-sdk-row",
-      ".cookie",
-      ".cookies",
-      ".cookie-banner",
-      ".cookie-consent",
-      ".cookie-policy",
-      ".consent",
-      ".gdpr",
-      ".privacy",
-      ".terms",
-      "[id*='cookie']",
-      "[class*='cookie']",
-      "[id*='consent']",
-      "[class*='consent']",
-      "[id*='gdpr']",
-      "[class*='gdpr']",
+  try {
+    await page.evaluate(() => {
+      const selectorsToRemove = [
+        "#onetrust-banner-sdk",
+        "#onetrust-consent-sdk",
+        ".ot-sdk-container",
+        ".ot-sdk-row",
+        ".cookie",
+        ".cookies",
+        ".cookie-banner",
+        ".cookie-consent",
+        ".cookie-policy",
+        ".consent",
+        ".gdpr",
+        ".privacy",
+        ".terms",
+        "[id*='cookie']",
+        "[class*='cookie']",
+        "[id*='consent']",
+        "[class*='consent']",
+        "[id*='gdpr']",
+        "[class*='gdpr']",
 
-      ".modal",
-      ".popup",
-      ".overlay",
-      "[role='dialog']",
-      "[aria-modal='true']",
+        ".modal",
+        ".popup",
+        ".overlay",
+        "[role='dialog']",
+        "[aria-modal='true']",
 
-      "iframe[src*='tawk']",
-      "iframe[src*='intercom']",
-      "iframe[src*='crisp']",
-      "iframe[src*='zendesk']",
-      "iframe[src*='livechat']",
-    ];
+        "iframe[src*='tawk']",
+        "iframe[src*='intercom']",
+        "iframe[src*='crisp']",
+        "iframe[src*='zendesk']",
+        "iframe[src*='livechat']",
+      ];
 
-    for (const sel of selectorsToRemove) {
-      document.querySelectorAll(sel).forEach((el) => el.remove());
-    }
-
-    const closeWords = ["затвори", "приемам", "съгласен", "ок", "close", "accept", "agree", "×", "x"];
-    const buttons = Array.from(document.querySelectorAll("button, [role='button'], a, div"));
-
-    for (const el of buttons) {
-      const txt = (el.textContent || "").trim().toLowerCase();
-      if (!txt) continue;
-      if (closeWords.some((w) => txt === w || txt.includes(w))) {
-        try {
-          el.click();
-        } catch {}
+      for (const sel of selectorsToRemove) {
+        document.querySelectorAll(sel).forEach((el) => el.remove());
       }
-    }
-  });
+    });
+  } catch {}
 }
 
 async function autoExpand(page) {
-  for (let i = 0; i < 7; i++) {
-    await page.mouse.wheel(0, 1600);
-    await page.waitForTimeout(550);
+  // safer scroll (no mouse wheel - that throws if page closes)
+  for (let i = 0; i < 4; i++) {
+    await safeScroll(page);
+    await safeWait(page, 600);
   }
 
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
-      for (let i = 0; i < Math.min(nodes.length, 80); i++) {
+      for (let i = 0; i < Math.min(nodes.length, 60); i++) {
         const ok = await safeClick(nodes[i]);
-        if (ok) await page.waitForTimeout(110);
+        if (ok) await safeWait(page, 120);
       }
     } catch {}
   }
 
-  for (let i = 0; i < 5; i++) {
-    await page.mouse.wheel(0, 1900);
-    await page.waitForTimeout(520);
+  for (let i = 0; i < 3; i++) {
+    await safeScroll(page);
+    await safeWait(page, 550);
   }
 }
 
@@ -351,33 +337,36 @@ async function extractMainText(page) {
   return clamp(stripped, MAX_CHARS_PER_PAGE);
 }
 
-// ✅ collect only http/https, skip mailto/tel/hash/javascript
 async function collectLinks(page) {
-  return await page.evaluate(() => {
-    const out = new Set();
+  try {
+    return await page.evaluate(() => {
+      const out = new Set();
 
-    const add = (u) => {
-      try {
-        const abs = new URL(u, location.href).toString();
-        if (abs.startsWith("http://") || abs.startsWith("https://")) out.add(abs);
-      } catch {}
-    };
+      const add = (u) => {
+        try {
+          const abs = new URL(u, location.href).toString();
+          if (abs.startsWith("http://") || abs.startsWith("https://")) out.add(abs);
+        } catch {}
+      };
 
-    document.querySelectorAll("a[href]").forEach((a) => {
-      const href = a.getAttribute("href");
-      if (!href) return;
-      const h = href.trim();
-      const hl = h.toLowerCase();
-      if (!h) return;
-      if (h.startsWith("#")) return;
-      if (hl.startsWith("javascript:")) return;
-      if (hl.startsWith("mailto:")) return;
-      if (hl.startsWith("tel:")) return;
-      add(h);
+      document.querySelectorAll("a[href]").forEach((a) => {
+        const href = a.getAttribute("href");
+        if (!href) return;
+        const h = href.trim();
+        const hl = h.toLowerCase();
+        if (!h) return;
+        if (h.startsWith("#")) return;
+        if (hl.startsWith("javascript:")) return;
+        if (hl.startsWith("mailto:")) return;
+        if (hl.startsWith("tel:")) return;
+        add(h);
+      });
+
+      return Array.from(out);
     });
-
-    return Array.from(out);
-  });
+  } catch {
+    return [];
+  }
 }
 
 function pickInternalLinks(allLinks, rootUrl) {
@@ -390,13 +379,9 @@ function pickInternalLinks(allLinks, rootUrl) {
     .filter((l) => {
       try {
         const u = new URL(l);
-
         if (!(u.protocol === "http:" || u.protocol === "https:")) return false;
         if (isUselessUrl(u.toString())) return false;
-
-        // ✅ SMART INTERNAL CHECK
         if (!isSameDomainOrSubdomain(u.hostname, baseHost)) return false;
-
         return true;
       } catch {
         return false;
@@ -406,14 +391,10 @@ function pickInternalLinks(allLinks, rootUrl) {
   const unique = Array.from(new Set(internal));
 
   const sorted = unique
-    .map((l) => {
-      const s = l.toLowerCase();
-      const score =
-        (KEYWORD_IMPORTANCE.test(s) ? 90 : 0) +
-        (s.includes(baseHost) ? 10 : 0) +
-        (s.length < 160 ? 8 : 0);
-      return { url: l, score };
-    })
+    .map((l) => ({
+      url: l,
+      score: (KEYWORD_IMPORTANCE.test(l) ? 90 : 0) + (l.length < 160 ? 10 : 0),
+    }))
     .sort((a, b) => b.score - a.score)
     .map((x) => x.url);
 
@@ -424,25 +405,43 @@ function pickInternalLinks(allLinks, rootUrl) {
 // MAIN CRAWL (BFS)
 // ------------------------------
 async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    locale: "bg-BG",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-  });
+  let browser = null;
+  let context = null;
 
   const pages = [];
   const visited = new Set();
   let totalChars = 0;
 
-  try {
-    const queue = [url];
+  const queue = [url];
 
+  const launch = async () => {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      locale: "bg-BG",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    });
+  };
+
+  const closeAll = async () => {
+    try {
+      if (context) await context.close();
+    } catch {}
+    try {
+      if (browser) await browser.close();
+    } catch {}
+    context = null;
+    browser = null;
+  };
+
+  await launch();
+
+  try {
     while (queue.length && pages.length < maxPages && totalChars < MAX_TOTAL_CHARS) {
       const link = queue.shift();
       const norm = normalizeUrl(link);
@@ -452,56 +451,67 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 
       visited.add(norm);
 
-      let page;
+      // prevent queue explosion
+      if (queue.length > MAX_QUEUE) queue.length = MAX_QUEUE;
+
+      let page = null;
+
       try {
+        if (!context) {
+          await closeAll();
+          await launch();
+        }
+
         page = await context.newPage();
         page.setDefaultTimeout(60000);
 
         await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await page.waitForTimeout(1400);
+        await safeWait(page, 1200);
 
         await autoExpand(page);
 
         const links = await collectLinks(page);
-
-        console.log("[PAGE]", norm);
-        console.log("   rawLinksSample:", links.slice(0, 25));
+        const internalLinks = pickInternalLinks(links, url);
 
         await removeNoiseDom(page);
 
         const title = cleanText(await page.title());
         const text = await extractMainText(page);
 
-        console.log("   title:", (title || "").slice(0, 80));
+        console.log("[PAGE]", norm);
+        console.log("   title:", (title || "").slice(0, 90));
         console.log("   textLen:", (text || "").length);
         console.log("   linksFound:", links.length);
+        console.log("   internalLinks:", internalLinks.length);
 
-        if (!text || text.length < MIN_PAGE_CHARS) {
-          console.log("   SKIP page (too short):", norm, "len=", (text || "").length);
-        } else {
+        if (text && text.length >= MIN_PAGE_CHARS) {
           const remaining = MAX_TOTAL_CHARS - totalChars;
           const finalText = clamp(text, Math.max(0, remaining));
-
           pages.push({ url: norm, title, text: finalText });
           totalChars += finalText.length;
 
-          console.log("   ✅ ADDED. pages:", pages.length, "totalChars:", totalChars);
+          console.log("   ✅ ADDED pages:", pages.length, "totalChars:", totalChars);
+        } else {
+          console.log("   SKIP (too short)");
         }
-
-        const internalLinks = pickInternalLinks(links, url);
-        console.log("   internalLinks:", internalLinks.length);
-        console.log("   internalLinksSample:", internalLinks.slice(0, 20));
-        console.log("   visited:", visited.size, "queue:", queue.length);
 
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
-          if (queue.length > 1200) break;
+          if (queue.length >= MAX_QUEUE) break;
           queue.push(ln);
         }
       } catch (e) {
-        console.log("   ❌ ERROR page:", norm, e?.message || String(e));
+        const msg = e?.message || String(e);
+        console.log("   ❌ ERROR page:", norm, msg);
+
+        // ✅ if browser/context died -> restart and continue
+        if (msg.includes("Target page") || msg.includes("browser has been closed") || msg.includes("context")) {
+          console.log("   🔁 Restarting browser/context...");
+          await closeAll();
+          await launch();
+        }
       } finally {
         try {
           if (page) await page.close();
@@ -512,7 +522,7 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
     pages.sort((a, b) => pagePriorityScore(b.url, b.title, b.text) - pagePriorityScore(a.url, a.title, a.text));
     return pages.slice(0, maxPages);
   } finally {
-    await browser.close();
+    await closeAll();
   }
 }
 
