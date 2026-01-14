@@ -13,14 +13,11 @@ const corsHeaders = {
 // CONFIG LIMITS
 // ------------------------------
 const MAX_PAGES_DEFAULT = 30;
-const MAX_PAGES_HARD = 120; // ✅ allow more if site is huge
+const MAX_PAGES_HARD = 120;
 
-// hard limits to prevent token overflow later
 const MAX_CHARS_PER_PAGE = 18000;
-const MAX_TOTAL_CHARS = 420000; // ✅ increased (was 280k) = more pages survive
-
-// ✅ allow smaller pages to count too (many sites have thin pages)
-const MIN_PAGE_CHARS = 180; // ✅ was 450 in your original
+const MAX_TOTAL_CHARS = 420000;
+const MIN_PAGE_CHARS = 180;
 
 // ------------------------------
 // Selectors & scoring
@@ -240,7 +237,7 @@ async function safeClick(el) {
   }
 }
 
-// ✅ Less destructive DOM cleanup
+// ✅ FIXED: no :has-text() inside evaluate
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
@@ -284,36 +281,29 @@ async function removeNoiseDom(page) {
       document.querySelectorAll(sel).forEach((el) => el.remove());
     }
 
-    const closeSelectors = [
-      "button[aria-label*='close' i]",
-      "button[title*='close' i]",
-      "button:has-text('×')",
-      "button:has-text('Close')",
-      "button:has-text('Затвори')",
-      "button:has-text('OK')",
-      "button:has-text('Приемам')",
-      "button:has-text('Съгласен')",
-    ];
+    // ✅ Close buttons by text (works everywhere)
+    const closeWords = ["затвори", "приемам", "съгласен", "ок", "close", "accept", "agree", "×", "x"];
+    const buttons = Array.from(document.querySelectorAll("button, [role='button'], a, div"));
 
-    for (const sel of closeSelectors) {
-      document.querySelectorAll(sel).forEach((el) => {
+    for (const el of buttons) {
+      const txt = (el.textContent || "").trim().toLowerCase();
+      if (!txt) continue;
+      if (closeWords.some((w) => txt === w || txt.includes(w))) {
         try {
           el.click();
         } catch {}
-      });
+      }
     }
   });
 }
 
 // ✅ expand dynamic content
 async function autoExpand(page) {
-  // scroll
   for (let i = 0; i < 7; i++) {
     await page.mouse.wheel(0, 1600);
     await page.waitForTimeout(550);
   }
 
-  // click common elements
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
@@ -324,7 +314,6 @@ async function autoExpand(page) {
     } catch {}
   }
 
-  // final scroll
   for (let i = 0; i < 5; i++) {
     await page.mouse.wheel(0, 1900);
     await page.waitForTimeout(520);
@@ -359,14 +348,12 @@ async function collectLinks(page) {
   return await page.evaluate(() => {
     const out = new Set();
 
-    // <a href>
     document.querySelectorAll("a[href]").forEach((a) => {
       try {
         out.add(a.href);
       } catch {}
     });
 
-    // data-href
     document.querySelectorAll("[data-href]").forEach((el) => {
       const v = el.getAttribute("data-href");
       if (v) {
@@ -376,7 +363,6 @@ async function collectLinks(page) {
       }
     });
 
-    // onclick handlers: location.href='..'
     document.querySelectorAll("[onclick]").forEach((el) => {
       const v = el.getAttribute("onclick") || "";
       const m1 = v.match(/location\.href\s*=\s*['"]([^'"]+)['"]/i);
@@ -389,7 +375,6 @@ async function collectLinks(page) {
       }
     });
 
-    // href-ish attributes
     const attrNames = ["data-url", "data-link", "data-target", "data-route", "href"];
     attrNames.forEach((attr) => {
       document.querySelectorAll(`[${attr}]`).forEach((el) => {
@@ -402,7 +387,6 @@ async function collectLinks(page) {
       });
     });
 
-    // return
     return Array.from(out).filter(Boolean);
   });
 }
@@ -425,11 +409,13 @@ function pickInternalLinks(allLinks, rootUrl) {
 
   const unique = Array.from(new Set(sameOrigin));
 
-  // keyword priority sort
   const sorted = unique
     .map((l) => {
       const s = l.toLowerCase();
-      const score = (KEYWORD_IMPORTANCE.test(s) ? 90 : 0) + (s.includes(base.hostname) ? 8 : 0) + (s.length < 140 ? 8 : 0);
+      const score =
+        (KEYWORD_IMPORTANCE.test(s) ? 90 : 0) +
+        (s.includes(base.hostname) ? 8 : 0) +
+        (s.length < 140 ? 8 : 0);
       return { url: l, score };
     })
     .sort((a, b) => b.score - a.score)
@@ -456,7 +442,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 
   const pages = [];
   const visited = new Set();
-
   let totalChars = 0;
 
   try {
@@ -479,8 +464,9 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
         await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 60000 });
         await page.waitForTimeout(1400);
 
-        // ✅ important: collect links BEFORE removing dom noise
         await autoExpand(page);
+
+        // collect links BEFORE removal
         const links = await collectLinks(page);
 
         await removeNoiseDom(page);
@@ -488,7 +474,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
         const title = cleanText(await page.title());
         const text = await extractMainText(page);
 
-        // ✅ DEBUG logs: show exactly what happens
         console.log("[PAGE]", norm);
         console.log("   title:", (title || "").slice(0, 70));
         console.log("   textLen:", (text || "").length);
@@ -510,7 +495,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
         console.log("   internalLinks:", internalLinks.length);
         console.log("   visited:", visited.size, "queue:", queue.length);
 
-        // enqueue
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
@@ -528,7 +512,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
     }
 
     pages.sort((a, b) => pagePriorityScore(b.url, b.title, b.text) - pagePriorityScore(a.url, a.title, a.text));
-
     return pages.slice(0, maxPages);
   } finally {
     await browser.close();
