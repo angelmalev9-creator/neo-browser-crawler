@@ -20,16 +20,14 @@ const MAX_TOTAL_CHARS = 420000;
 const MIN_PAGE_CHARS = 180;
 
 // ------------------------------
-// Selectors & scoring
+// Selectors
 // ------------------------------
 const CLICK_SELECTORS = [
-  // generic
   "a[href]",
   "button",
   "[role='button']",
   "details > summary",
 
-  // accordion/dropdowns
   "[aria-expanded='false']",
   "[data-bs-toggle]",
   ".accordion button",
@@ -39,7 +37,6 @@ const CLICK_SELECTORS = [
   ".menu-toggle",
   ".navbar-toggler",
 
-  // tabs (common libs)
   "[role='tab']",
   "[aria-controls]",
   ".tabs button",
@@ -48,7 +45,6 @@ const CLICK_SELECTORS = [
   "[data-state='closed']",
   "[data-radix-collection-item]",
 
-  // common read-more
   "button:has-text('Виж')",
   "button:has-text('Още')",
   "button:has-text('Прочети')",
@@ -56,7 +52,6 @@ const CLICK_SELECTORS = [
   "button:has-text('Read more')",
   "button:has-text('More')",
 
-  // Bulgarian keywords triggers
   "a:has-text('Цени')",
   "a:has-text('Услуги')",
   "a:has-text('Стаи')",
@@ -94,7 +89,6 @@ function stripBoilerplate(text = "") {
 
   const badLine = (l) => {
     const s = l.toLowerCase();
-
     if (l.length <= 2) return true;
 
     const bad =
@@ -200,6 +194,10 @@ function isUselessUrl(u = "") {
   );
 }
 
+function normalizeHost(host) {
+  return String(host || "").replace(/^www\./i, "").toLowerCase().trim();
+}
+
 function pagePriorityScore(url, title = "", text = "") {
   const u = String(url || "").toLowerCase();
   const t = String(title || "").toLowerCase();
@@ -237,11 +235,10 @@ async function safeClick(el) {
   }
 }
 
-// ✅ FIXED: no :has-text() inside evaluate
+// ✅ no :has-text() inside evaluate
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
-      // cookie banners
       "#onetrust-banner-sdk",
       "#onetrust-consent-sdk",
       ".ot-sdk-container",
@@ -262,14 +259,12 @@ async function removeNoiseDom(page) {
       "[id*='gdpr']",
       "[class*='gdpr']",
 
-      // overlays
       ".modal",
       ".popup",
       ".overlay",
       "[role='dialog']",
       "[aria-modal='true']",
 
-      // chat widgets
       "iframe[src*='tawk']",
       "iframe[src*='intercom']",
       "iframe[src*='crisp']",
@@ -281,7 +276,6 @@ async function removeNoiseDom(page) {
       document.querySelectorAll(sel).forEach((el) => el.remove());
     }
 
-    // ✅ Close buttons by text (works everywhere)
     const closeWords = ["затвори", "приемам", "съгласен", "ок", "close", "accept", "agree", "×", "x"];
     const buttons = Array.from(document.querySelectorAll("button, [role='button'], a, div"));
 
@@ -297,7 +291,6 @@ async function removeNoiseDom(page) {
   });
 }
 
-// ✅ expand dynamic content
 async function autoExpand(page) {
   for (let i = 0; i < 7; i++) {
     await page.mouse.wheel(0, 1600);
@@ -307,9 +300,9 @@ async function autoExpand(page) {
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
-      for (let i = 0; i < Math.min(nodes.length, 70); i++) {
+      for (let i = 0; i < Math.min(nodes.length, 80); i++) {
         const ok = await safeClick(nodes[i]);
-        if (ok) await page.waitForTimeout(120);
+        if (ok) await page.waitForTimeout(110);
       }
     } catch {}
   }
@@ -343,79 +336,81 @@ async function extractMainText(page) {
   return clamp(stripped, MAX_CHARS_PER_PAGE);
 }
 
-// ✅ BIG FIX: collect links from more than <a href>
+// ✅ FIXED: only collect http/https links
 async function collectLinks(page) {
   return await page.evaluate(() => {
     const out = new Set();
 
-    document.querySelectorAll("a[href]").forEach((a) => {
+    const add = (u) => {
       try {
-        out.add(a.href);
+        const abs = new URL(u, location.href).toString();
+        if (abs.startsWith("http://") || abs.startsWith("https://")) out.add(abs);
       } catch {}
+    };
+
+    document.querySelectorAll("a[href]").forEach((a) => {
+      const href = a.getAttribute("href");
+      if (!href) return;
+      if (href.startsWith("#")) return;
+      if (href.toLowerCase().startsWith("javascript:")) return;
+      if (href.toLowerCase().startsWith("mailto:")) return;
+      if (href.toLowerCase().startsWith("tel:")) return;
+      add(href);
     });
 
+    // data-href / custom routers
     document.querySelectorAll("[data-href]").forEach((el) => {
       const v = el.getAttribute("data-href");
-      if (v) {
-        try {
-          out.add(new URL(v, location.href).toString());
-        } catch {}
-      }
+      if (v) add(v);
     });
 
+    // onclick router patterns
     document.querySelectorAll("[onclick]").forEach((el) => {
       const v = el.getAttribute("onclick") || "";
       const m1 = v.match(/location\.href\s*=\s*['"]([^'"]+)['"]/i);
       const m2 = v.match(/window\.location\s*=\s*['"]([^'"]+)['"]/i);
       const m = m1 || m2;
-      if (m?.[1]) {
-        try {
-          out.add(new URL(m[1], location.href).toString());
-        } catch {}
-      }
+      if (m?.[1]) add(m[1]);
     });
 
-    const attrNames = ["data-url", "data-link", "data-target", "data-route", "href"];
-    attrNames.forEach((attr) => {
-      document.querySelectorAll(`[${attr}]`).forEach((el) => {
-        const v = el.getAttribute(attr);
-        if (v && typeof v === "string" && v.length > 1) {
-          try {
-            out.add(new URL(v, location.href).toString());
-          } catch {}
-        }
-      });
-    });
-
-    return Array.from(out).filter(Boolean);
+    return Array.from(out);
   });
 }
 
 function pickInternalLinks(allLinks, rootUrl) {
   const base = new URL(rootUrl);
+  const baseHost = normalizeHost(base.hostname);
 
-  const sameOrigin = allLinks
+  const internal = allLinks
     .map(normalizeUrl)
     .filter(Boolean)
     .filter((l) => {
       try {
         const u = new URL(l);
-        return u.origin === base.origin;
+
+        // ✅ accept either same origin OR same hostname (www mismatch)
+        const sameHost = normalizeHost(u.hostname) === baseHost;
+        const sameOrigin = u.origin === base.origin;
+
+        if (!sameHost && !sameOrigin) return false;
+        if (!(u.protocol === "http:" || u.protocol === "https:")) return false;
+        if (isUselessUrl(u.toString())) return false;
+
+        return true;
       } catch {
         return false;
       }
-    })
-    .filter((l) => !isUselessUrl(l));
+    });
 
-  const unique = Array.from(new Set(sameOrigin));
+  const unique = Array.from(new Set(internal));
 
   const sorted = unique
     .map((l) => {
       const s = l.toLowerCase();
       const score =
         (KEYWORD_IMPORTANCE.test(s) ? 90 : 0) +
-        (s.includes(base.hostname) ? 8 : 0) +
-        (s.length < 140 ? 8 : 0);
+        (s.includes(baseHost) ? 10 : 0) +
+        (s.length < 160 ? 8 : 0);
       return { url: l, score };
     })
     .sort((a, b) => b.score - a.score)
@@ -466,8 +461,11 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 
         await autoExpand(page);
 
-        // collect links BEFORE removal
+        // collect links first
         const links = await collectLinks(page);
+
+        // DEBUG: show what links we got
+        console.log("   rawLinksSample:", links.slice(0, 20));
 
         await removeNoiseDom(page);
 
@@ -499,7 +497,7 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
-          if (queue.length > 700) break;
+          if (queue.length > 900) break;
           queue.push(ln);
         }
       } catch (e) {
