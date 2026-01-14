@@ -10,25 +10,26 @@ const corsHeaders = {
 };
 
 // ------------------------------
-// CONFIG LIMITS (CRITICAL FOR 1007 FIX)
+// LIMITS (ALLOW 100 PAGES)
 // ------------------------------
-const MAX_PAGES_DEFAULT = 30;
-const MAX_PAGES_HARD = 60;
+const MAX_PAGES_DEFAULT = 60;
+const MAX_PAGES_HARD = 120;
 
-// hard limits to prevent token overflow later
-const MAX_CHARS_PER_PAGE = 18000;        // keep page texts compact
-const MAX_TOTAL_CHARS = 280000;          // total across all pages
+// allow more pages without exploding context later
+const MAX_CHARS_PER_PAGE = 16000;
+const MAX_TOTAL_CHARS = 420000;
+
+// IMPORTANT: lowered threshold (was 450)
+const MIN_PAGE_CHARS = 220;
 
 // ------------------------------
 // Selectors & scoring
 // ------------------------------
 const CLICK_SELECTORS = [
-  // generic
   "button",
   "[role='button']",
   "details > summary",
 
-  // accordion/dropdowns
   "[aria-expanded='false']",
   "[data-bs-toggle]",
   ".accordion button",
@@ -38,7 +39,6 @@ const CLICK_SELECTORS = [
   ".menu-toggle",
   ".navbar-toggler",
 
-  // tabs (common libs)
   "[role='tab']",
   "[aria-controls]",
   ".tabs button",
@@ -47,7 +47,6 @@ const CLICK_SELECTORS = [
   "[data-state='closed']",
   "[data-radix-collection-item]",
 
-  // common read-more
   "button:has-text('Виж')",
   "button:has-text('Още')",
   "button:has-text('Прочети')",
@@ -72,7 +71,6 @@ function cleanText(t = "") {
     .trim();
 }
 
-// removes repeating boilerplate lines + cookie terms
 function stripBoilerplate(text = "") {
   if (!text) return "";
 
@@ -86,11 +84,8 @@ function stripBoilerplate(text = "") {
 
   const badLine = (l) => {
     const s = l.toLowerCase();
-
-    // too short / menu fragment
     if (l.length <= 2) return true;
 
-    // typical cookie/gdpr/policy lines
     const bad =
       s.includes("cookie") ||
       s.includes("cookies") ||
@@ -112,10 +107,7 @@ function stripBoilerplate(text = "") {
 
     if (bad) return true;
 
-    // footer noise
     if (s === "facebook" || s === "instagram" || s === "linkedin") return true;
-
-    // 100% garbage lines
     if (/^(ok|yes|no|close)$/i.test(s)) return true;
 
     return false;
@@ -124,7 +116,6 @@ function stripBoilerplate(text = "") {
   for (const l of lines) {
     if (badLine(l)) continue;
 
-    // remove repeated identical lines (menus etc.)
     const key = l.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -133,7 +124,7 @@ function stripBoilerplate(text = "") {
   }
 
   const joined = filtered.join("\n");
-  if (joined.length < 250) return cleanText(text).slice(0, 5000);
+  if (joined.length < 200) return cleanText(text).slice(0, 7000);
 
   return cleanText(joined);
 }
@@ -154,14 +145,12 @@ function normalizeUrl(u) {
     const url = new URL(u);
     url.hash = "";
 
-    // drop useless tracking params
     const killParams = [
       "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
       "gclid", "fbclid", "yclid", "mc_cid", "mc_eid"
     ];
     killParams.forEach((p) => url.searchParams.delete(p));
 
-    // if still huge query -> drop full query
     if (url.search && url.search.length > 80) url.search = "";
 
     return url.toString();
@@ -198,7 +187,6 @@ function pagePriorityScore(url, title = "", text = "") {
   if (KEYWORD_IMPORTANCE.test(u)) score += 70;
   if (KEYWORD_IMPORTANCE.test(t)) score += 50;
 
-  // hard boosts
   if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
   if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 110;
   if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 90;
@@ -210,22 +198,19 @@ function pagePriorityScore(url, title = "", text = "") {
 
   if (isUselessUrl(u)) score -= 999;
 
-  // prefer pages with real content length
   score += Math.min(Math.floor((text || "").length / 1500) * 6, 36);
-
   return score;
 }
 
 async function safeClick(el) {
   try {
-    await el.click({ timeout: 800, force: true });
+    await el.click({ timeout: 900, force: true });
     return true;
   } catch {
     return false;
   }
 }
 
-// remove popups/cookies + nav/footer before extracting text
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
@@ -234,7 +219,6 @@ async function removeNoiseDom(page) {
       "nav",
       "aside",
 
-      // Cookie banners
       "#onetrust-banner-sdk",
       "#onetrust-consent-sdk",
       ".ot-sdk-container",
@@ -255,14 +239,12 @@ async function removeNoiseDom(page) {
       "[id*='gdpr']",
       "[class*='gdpr']",
 
-      // overlays
       ".modal",
       ".popup",
       ".overlay",
       "[role='dialog']",
       "[aria-modal='true']",
 
-      // chat widgets
       "iframe[src*='tawk']",
       "iframe[src*='intercom']",
       "iframe[src*='crisp']",
@@ -273,55 +255,31 @@ async function removeNoiseDom(page) {
     for (const sel of selectorsToRemove) {
       document.querySelectorAll(sel).forEach((el) => el.remove());
     }
-
-    // try close buttons on overlays
-    const closeSelectors = [
-      "button[aria-label*='close' i]",
-      "button[title*='close' i]",
-      "button:has-text('×')",
-      "button:has-text('Close')",
-      "button:has-text('Затвори')",
-      "button:has-text('Приемам')",
-      "button:has-text('Съгласен')",
-      "button:has-text('OK')",
-    ];
-    for (const sel of closeSelectors) {
-      document.querySelectorAll(sel).forEach((el) => {
-        try { el.click(); } catch {}
-      });
-    }
   });
 }
 
-// click-expand + scroll for dynamic content
 async function autoExpand(page) {
-  // initial scroll
-  for (let i = 0; i < 6; i++) {
-    await page.mouse.wheel(0, 1500);
-    await page.waitForTimeout(600);
+  for (let i = 0; i < 5; i++) {
+    await page.mouse.wheel(0, 1400);
+    await page.waitForTimeout(500);
   }
 
-  // click common UI elements
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
-      for (let i = 0; i < Math.min(nodes.length, 50); i++) {
+      for (let i = 0; i < Math.min(nodes.length, 70); i++) {
         const ok = await safeClick(nodes[i]);
-        if (ok) await page.waitForTimeout(140);
+        if (ok) await page.waitForTimeout(120);
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
-  // final scroll
   for (let i = 0; i < 4; i++) {
-    await page.mouse.wheel(0, 1700);
-    await page.waitForTimeout(550);
+    await page.mouse.wheel(0, 1600);
+    await page.waitForTimeout(450);
   }
 }
 
-// extract main content only
 async function extractMainText(page) {
   const raw = await page.evaluate(() => {
     const candidates = [
@@ -342,8 +300,8 @@ async function extractMainText(page) {
   const cleaned = cleanText(raw);
   const stripped = stripBoilerplate(cleaned);
 
-  // HARD clamp to avoid 1007 later
-  return clamp(stripped, MAX_CHARS_PER_PAGE);
+  const best = stripped.length >= 120 ? stripped : cleaned;
+  return clamp(best, MAX_CHARS_PER_PAGE);
 }
 
 async function collectLinks(page) {
@@ -372,11 +330,10 @@ function pickInternalLinks(allLinks, rootUrl) {
 
   const unique = Array.from(new Set(sameOrigin));
 
-  // prioritize keywords in url
   const sorted = unique
     .map((l) => ({
       url: l,
-      score: (KEYWORD_IMPORTANCE.test(l) ? 80 : 0) + (l.length < 120 ? 10 : 0),
+      score: (KEYWORD_IMPORTANCE.test(l) ? 80 : 0) + (l.length < 140 ? 10 : 0),
     }))
     .sort((a, b) => b.score - a.score)
     .map((x) => x.url);
@@ -420,50 +377,48 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
       let page;
       try {
         page = await context.newPage();
-        page.setDefaultTimeout(45000);
+        page.setDefaultTimeout(60000);
 
-        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 45000 });
-        await page.waitForTimeout(1200);
+        // networkidle дава повече шанс да се зареди реалното съдържание
+        await page.goto(norm, { waitUntil: "networkidle", timeout: 60000 });
+        await page.waitForTimeout(900);
 
-        await autoExpand(page);
         await removeNoiseDom(page);
+        await autoExpand(page);
 
         const title = cleanText(await page.title());
         const text = await extractMainText(page);
 
-        // Skip short garbage pages
-        if (text && text.length > 450) {
+        // ✅ keep even smaller pages now
+        if (text && text.length >= MIN_PAGE_CHARS) {
           const remaining = MAX_TOTAL_CHARS - totalChars;
           const finalText = clamp(text, Math.max(0, remaining));
-          const item = { url: norm, title, text: finalText };
-
-          pages.push(item);
+          pages.push({ url: norm, title, text: finalText });
           totalChars += finalText.length;
         }
 
-        // expand link graph
+        // ✅ always collect links even if text is small
         const links = await collectLinks(page);
         const internalLinks = pickInternalLinks(links, url);
 
-        // enqueue next pages (priority order)
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
-          if (queue.length > 400) break; // safety for huge sites
+          if (queue.length > 900) break;
           queue.push(ln);
         }
-      } catch {
-        // ignore
+      } catch (err) {
+        // ✅ DO NOT ignore anymore
+        console.log("[CRAWL PAGE ERROR]", norm, String(err?.message || err));
       } finally {
-        try { if (page) await page.close(); } catch {}
+        try {
+          if (page) await page.close();
+        } catch {}
       }
     }
 
-    // sort by business importance
     pages.sort((a, b) => pagePriorityScore(b.url, b.title, b.text) - pagePriorityScore(a.url, a.title, a.text));
-
-    // final clamp pages count
     return pages.slice(0, maxPages);
   } finally {
     await browser.close();
@@ -474,7 +429,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 // HTTP SERVER
 // ------------------------------
 const server = http.createServer(async (req, res) => {
-  // CORS preflight
   if (req.method === "OPTIONS") {
     res.writeHead(200, corsHeaders);
     return res.end();
@@ -501,7 +455,6 @@ const server = http.createServer(async (req, res) => {
 
     if (!url) return json(res, 400, { success: false, error: "Missing url" });
 
-    // token auth
     const expectedToken = process.env.CRAWLER_TOKEN;
     if (expectedToken && token !== expectedToken) {
       return json(res, 401, { success: false, error: "Unauthorized" });
@@ -514,6 +467,7 @@ const server = http.createServer(async (req, res) => {
     console.log("[CRAWL] maxPages:", resolvedMaxPages);
     console.log("[LIMITS] MAX_CHARS_PER_PAGE:", MAX_CHARS_PER_PAGE);
     console.log("[LIMITS] MAX_TOTAL_CHARS:", MAX_TOTAL_CHARS);
+    console.log("[LIMITS] MIN_PAGE_CHARS:", MIN_PAGE_CHARS);
     console.log("==================================================");
 
     const pages = await crawlSite(url, resolvedMaxPages);
