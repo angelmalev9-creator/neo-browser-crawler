@@ -12,24 +12,22 @@ const corsHeaders = {
 // ------------------------------
 // CONFIG LIMITS
 // ------------------------------
-const MAX_PAGES_DEFAULT = 60;     // ✅ вместо 30 (по-нормално за production)
-const MAX_PAGES_HARD = 120;       // ✅ беше 60
+const MAX_PAGES_DEFAULT = 30;
+const MAX_PAGES_HARD = 120; // ✅ allow more if site is huge
 
 // hard limits to prevent token overflow later
 const MAX_CHARS_PER_PAGE = 18000;
-const MAX_TOTAL_CHARS = 280000;
+const MAX_TOTAL_CHARS = 420000; // ✅ increased (was 280k) = more pages survive
 
-// ✅ критично: беше 450, което ти реже масово страниците
-const MIN_PAGE_CHARS = 180;
-
-// ✅ safety for huge sites
-const MAX_QUEUE_SIZE = 2500;
+// ✅ allow smaller pages to count too (many sites have thin pages)
+const MIN_PAGE_CHARS = 180; // ✅ was 450 in your original
 
 // ------------------------------
 // Selectors & scoring
 // ------------------------------
 const CLICK_SELECTORS = [
   // generic
+  "a[href]",
   "button",
   "[role='button']",
   "details > summary",
@@ -60,10 +58,18 @@ const CLICK_SELECTORS = [
   "button:has-text('Разгледай')",
   "button:has-text('Read more')",
   "button:has-text('More')",
+
+  // Bulgarian keywords triggers
+  "a:has-text('Цени')",
+  "a:has-text('Услуги')",
+  "a:has-text('Стаи')",
+  "a:has-text('Настаняване')",
+  "a:has-text('Контакт')",
+  "a:has-text('Резервация')",
 ];
 
 const KEYWORD_IMPORTANCE =
-  /rooms|accommodation|suite|deluxe|apart|стаи|настаняване|апартамент|резервац|booking|reservation|pricing|цени|price|tariff|contact|контакт|location|местоположение|how-to-get|spa|restaurant|menu|меню|services|услуги|faq|въпроси|packages|пакети|offers|оферти|conditions|условия/i;
+  /rooms|accommodation|suite|deluxe|apart|стаи|настаняване|апартамент|резервац|booking|reservation|pricing|цени|price|tariff|contact|контакт|location|местоположение|how-to-get|spa|restaurant|menu|меню|services|услуги|faq|въпроси|packages|пакети|offers|оферти|conditions|условия|gallery|галерия|about|за-нас/i;
 
 // ------------------------------
 // Helpers
@@ -116,7 +122,6 @@ function stripBoilerplate(text = "") {
     if (bad) return true;
 
     if (s === "facebook" || s === "instagram" || s === "linkedin") return true;
-
     if (/^(ok|yes|no|close)$/i.test(s)) return true;
 
     return false;
@@ -124,14 +129,16 @@ function stripBoilerplate(text = "") {
 
   for (const l of lines) {
     if (badLine(l)) continue;
+
     const key = l.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
+
     filtered.push(l);
   }
 
   const joined = filtered.join("\n");
-  if (joined.length < 250) return cleanText(text).slice(0, 5000);
+  if (joined.length < 200) return cleanText(text).slice(0, 8000);
 
   return cleanText(joined);
 }
@@ -153,12 +160,20 @@ function normalizeUrl(u) {
     url.hash = "";
 
     const killParams = [
-      "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-      "gclid", "fbclid", "yclid", "mc_cid", "mc_eid"
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "gclid",
+      "fbclid",
+      "yclid",
+      "mc_cid",
+      "mc_eid",
     ];
     killParams.forEach((p) => url.searchParams.delete(p));
 
-    if (url.search && url.search.length > 80) url.search = "";
+    if (url.search && url.search.length > 120) url.search = "";
 
     return url.toString();
   } catch {
@@ -181,7 +196,10 @@ function isUselessUrl(u = "") {
     s.includes("/checkout") ||
     s.includes("/login") ||
     s.includes("/account") ||
-    s.includes("wp-login")
+    s.includes("wp-login") ||
+    s.includes("/wp-admin") ||
+    s.includes("/tag/") ||
+    s.includes("/author/")
   );
 }
 
@@ -189,45 +207,44 @@ function pagePriorityScore(url, title = "", text = "") {
   const u = String(url || "").toLowerCase();
   const t = String(title || "").toLowerCase();
   const c = String(text || "").toLowerCase();
+
   let score = 0;
 
   if (KEYWORD_IMPORTANCE.test(u)) score += 70;
   if (KEYWORD_IMPORTANCE.test(t)) score += 50;
 
-  if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
-  if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 110;
-  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 90;
-  if (u.includes("contact") || u.includes("контакт")) score += 80;
-  if (u.includes("location") || u.includes("местополож")) score += 70;
+  if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 140;
+  if (u.includes("pricing") || u.includes("цени") || u.includes("price")) score += 130;
+  if (u.includes("booking") || u.includes("reservation") || u.includes("резервац")) score += 100;
+  if (u.includes("contact") || u.includes("контакт")) score += 90;
+  if (u.includes("location") || u.includes("местополож")) score += 80;
 
-  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро")) score += 30;
-  if (c.includes("тел") || c.includes("телефон") || c.includes("@")) score += 20;
+  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро"))
+    score += 35;
+
+  if (c.includes("тел") || c.includes("телефон") || c.includes("@")) score += 25;
 
   if (isUselessUrl(u)) score -= 999;
 
-  score += Math.min(Math.floor((text || "").length / 1500) * 6, 36);
+  score += Math.min(Math.floor((text || "").length / 1400) * 6, 60);
 
   return score;
 }
 
 async function safeClick(el) {
   try {
-    await el.click({ timeout: 800, force: true });
+    await el.click({ timeout: 900, force: true });
     return true;
   } catch {
     return false;
   }
 }
 
-// remove popups/cookies + nav/footer before extracting text
+// ✅ Less destructive DOM cleanup
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
-      "header",
-      "footer",
-      "nav",
-      "aside",
-
+      // cookie banners
       "#onetrust-banner-sdk",
       "#onetrust-consent-sdk",
       ".ot-sdk-container",
@@ -248,12 +265,14 @@ async function removeNoiseDom(page) {
       "[id*='gdpr']",
       "[class*='gdpr']",
 
+      // overlays
       ".modal",
       ".popup",
       ".overlay",
       "[role='dialog']",
       "[aria-modal='true']",
 
+      // chat widgets
       "iframe[src*='tawk']",
       "iframe[src*='intercom']",
       "iframe[src*='crisp']",
@@ -271,37 +290,44 @@ async function removeNoiseDom(page) {
       "button:has-text('×')",
       "button:has-text('Close')",
       "button:has-text('Затвори')",
+      "button:has-text('OK')",
       "button:has-text('Приемам')",
       "button:has-text('Съгласен')",
-      "button:has-text('OK')",
     ];
+
     for (const sel of closeSelectors) {
       document.querySelectorAll(sel).forEach((el) => {
-        try { el.click(); } catch {}
+        try {
+          el.click();
+        } catch {}
       });
     }
   });
 }
 
+// ✅ expand dynamic content
 async function autoExpand(page) {
-  for (let i = 0; i < 6; i++) {
-    await page.mouse.wheel(0, 1500);
-    await page.waitForTimeout(600);
+  // scroll
+  for (let i = 0; i < 7; i++) {
+    await page.mouse.wheel(0, 1600);
+    await page.waitForTimeout(550);
   }
 
+  // click common elements
   for (const selector of CLICK_SELECTORS) {
     try {
       const nodes = await page.$$(selector);
-      for (let i = 0; i < Math.min(nodes.length, 50); i++) {
+      for (let i = 0; i < Math.min(nodes.length, 70); i++) {
         const ok = await safeClick(nodes[i]);
-        if (ok) await page.waitForTimeout(140);
+        if (ok) await page.waitForTimeout(120);
       }
     } catch {}
   }
 
-  for (let i = 0; i < 4; i++) {
-    await page.mouse.wheel(0, 1700);
-    await page.waitForTimeout(550);
+  // final scroll
+  for (let i = 0; i < 5; i++) {
+    await page.mouse.wheel(0, 1900);
+    await page.waitForTimeout(520);
   }
 }
 
@@ -325,15 +351,59 @@ async function extractMainText(page) {
   const cleaned = cleanText(raw);
   const stripped = stripBoilerplate(cleaned);
 
-  // clamp
   return clamp(stripped, MAX_CHARS_PER_PAGE);
 }
 
+// ✅ BIG FIX: collect links from more than <a href>
 async function collectLinks(page) {
   return await page.evaluate(() => {
-    return Array.from(document.querySelectorAll("a[href]"))
-      .map((a) => a.href)
-      .filter((h) => typeof h === "string");
+    const out = new Set();
+
+    // <a href>
+    document.querySelectorAll("a[href]").forEach((a) => {
+      try {
+        out.add(a.href);
+      } catch {}
+    });
+
+    // data-href
+    document.querySelectorAll("[data-href]").forEach((el) => {
+      const v = el.getAttribute("data-href");
+      if (v) {
+        try {
+          out.add(new URL(v, location.href).toString());
+        } catch {}
+      }
+    });
+
+    // onclick handlers: location.href='..'
+    document.querySelectorAll("[onclick]").forEach((el) => {
+      const v = el.getAttribute("onclick") || "";
+      const m1 = v.match(/location\.href\s*=\s*['"]([^'"]+)['"]/i);
+      const m2 = v.match(/window\.location\s*=\s*['"]([^'"]+)['"]/i);
+      const m = m1 || m2;
+      if (m?.[1]) {
+        try {
+          out.add(new URL(m[1], location.href).toString());
+        } catch {}
+      }
+    });
+
+    // href-ish attributes
+    const attrNames = ["data-url", "data-link", "data-target", "data-route", "href"];
+    attrNames.forEach((attr) => {
+      document.querySelectorAll(`[${attr}]`).forEach((el) => {
+        const v = el.getAttribute(attr);
+        if (v && typeof v === "string" && v.length > 1) {
+          try {
+            out.add(new URL(v, location.href).toString());
+          } catch {}
+        }
+      });
+    });
+
+    // return
+    return Array.from(out).filter(Boolean);
   });
 }
 
@@ -355,11 +425,13 @@ function pickInternalLinks(allLinks, rootUrl) {
 
   const unique = Array.from(new Set(sameOrigin));
 
+  // keyword priority sort
   const sorted = unique
-    .map((l) => ({
-      url: l,
-      score: (KEYWORD_IMPORTANCE.test(l) ? 80 : 0) + (l.length < 120 ? 10 : 0),
-    }))
+    .map((l) => {
+      const s = l.toLowerCase();
+      const score = (KEYWORD_IMPORTANCE.test(s) ? 90 : 0) + (s.includes(base.hostname) ? 8 : 0) + (s.length < 140 ? 8 : 0);
+      return { url: l, score };
+    })
     .sort((a, b) => b.score - a.score)
     .map((x) => x.url);
 
@@ -402,52 +474,60 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
       let page;
       try {
         page = await context.newPage();
-        page.setDefaultTimeout(45000);
+        page.setDefaultTimeout(60000);
 
-        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 45000 });
-        await page.waitForTimeout(1200);
+        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForTimeout(1400);
 
+        // ✅ important: collect links BEFORE removing dom noise
         await autoExpand(page);
-
-        // ✅ KEY FIX: collect links BEFORE removeNoiseDom()
         const links = await collectLinks(page);
-        const internalLinks = pickInternalLinks(links, url);
 
-        // ✅ now remove noise & extract text
         await removeNoiseDom(page);
 
         const title = cleanText(await page.title());
         const text = await extractMainText(page);
 
-        // ✅ was >450 - too aggressive
-        if (text && text.length >= MIN_PAGE_CHARS) {
+        // ✅ DEBUG logs: show exactly what happens
+        console.log("[PAGE]", norm);
+        console.log("   title:", (title || "").slice(0, 70));
+        console.log("   textLen:", (text || "").length);
+        console.log("   linksFound:", links.length);
+
+        if (!text || text.length < MIN_PAGE_CHARS) {
+          console.log("   SKIP page (too short):", norm, "len=", (text || "").length);
+        } else {
           const remaining = MAX_TOTAL_CHARS - totalChars;
           const finalText = clamp(text, Math.max(0, remaining));
-          const item = { url: norm, title, text: finalText };
 
-          pages.push(item);
+          pages.push({ url: norm, title, text: finalText });
           totalChars += finalText.length;
+
+          console.log("   ✅ ADDED. pages:", pages.length, "totalChars:", totalChars);
         }
 
-        // enqueue next pages (priority order)
+        const internalLinks = pickInternalLinks(links, url);
+        console.log("   internalLinks:", internalLinks.length);
+        console.log("   visited:", visited.size, "queue:", queue.length);
+
+        // enqueue
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
-          if (queue.length > MAX_QUEUE_SIZE) break;
+          if (queue.length > 700) break;
           queue.push(ln);
         }
-
-      } catch {
-        // ignore single page crash
+      } catch (e) {
+        console.log("   ❌ ERROR page:", norm, e?.message || String(e));
       } finally {
-        try { if (page) await page.close(); } catch {}
+        try {
+          if (page) await page.close();
+        } catch {}
       }
     }
 
     pages.sort((a, b) => pagePriorityScore(b.url, b.title, b.text) - pagePriorityScore(a.url, a.title, a.text));
-
-    console.log("[CRAWL DONE] visited:", visited.size, "pages:", pages.length, "queue:", queue.length);
 
     return pages.slice(0, maxPages);
   } finally {
@@ -490,10 +570,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 401, { success: false, error: "Unauthorized" });
     }
 
-    const resolvedMaxPages = Math.min(
-      Math.max(Number(maxPages || MAX_PAGES_DEFAULT), 6),
-      MAX_PAGES_HARD
-    );
+    const resolvedMaxPages = Math.min(Math.max(Number(maxPages || MAX_PAGES_DEFAULT), 6), MAX_PAGES_HARD);
 
     console.log("==================================================");
     console.log("[CRAWL] url:", url);
@@ -501,7 +578,6 @@ const server = http.createServer(async (req, res) => {
     console.log("[LIMITS] MIN_PAGE_CHARS:", MIN_PAGE_CHARS);
     console.log("[LIMITS] MAX_CHARS_PER_PAGE:", MAX_CHARS_PER_PAGE);
     console.log("[LIMITS] MAX_TOTAL_CHARS:", MAX_TOTAL_CHARS);
-    console.log("[LIMITS] MAX_QUEUE_SIZE:", MAX_QUEUE_SIZE);
     console.log("==================================================");
 
     const pages = await crawlSite(url, resolvedMaxPages);
