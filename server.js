@@ -13,7 +13,7 @@ const corsHeaders = {
 // CONFIG LIMITS
 // ------------------------------
 const MAX_PAGES_DEFAULT = 30;
-const MAX_PAGES_HARD = 120;
+const MAX_PAGES_HARD = 150;
 
 const MAX_CHARS_PER_PAGE = 18000;
 const MAX_TOTAL_CHARS = 420000;
@@ -164,7 +164,7 @@ function normalizeUrl(u) {
     ];
     killParams.forEach((p) => url.searchParams.delete(p));
 
-    if (url.search && url.search.length > 120) url.search = "";
+    if (url.search && url.search.length > 140) url.search = "";
 
     return url.toString();
   } catch {
@@ -195,7 +195,23 @@ function isUselessUrl(u = "") {
 }
 
 function normalizeHost(host) {
-  return String(host || "").replace(/^www\./i, "").toLowerCase().trim();
+  let h = String(host || "").trim().toLowerCase();
+  h = h.replace(/^www\./i, "");
+  h = h.replace(/^m\./i, "");
+  return h;
+}
+
+function isSameDomainOrSubdomain(aHost, bHost) {
+  const a = normalizeHost(aHost);
+  const b = normalizeHost(bHost);
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  // subdomain checks
+  if (a.endsWith("." + b)) return true;
+  if (b.endsWith("." + a)) return true;
+
+  return false;
 }
 
 function pagePriorityScore(url, title = "", text = "") {
@@ -235,7 +251,6 @@ async function safeClick(el) {
   }
 }
 
-// ✅ no :has-text() inside evaluate
 async function removeNoiseDom(page) {
   await page.evaluate(() => {
     const selectorsToRemove = [
@@ -336,7 +351,7 @@ async function extractMainText(page) {
   return clamp(stripped, MAX_CHARS_PER_PAGE);
 }
 
-// ✅ FIXED: only collect http/https links
+// ✅ collect only http/https, skip mailto/tel/hash/javascript
 async function collectLinks(page) {
   return await page.evaluate(() => {
     const out = new Set();
@@ -351,26 +366,14 @@ async function collectLinks(page) {
     document.querySelectorAll("a[href]").forEach((a) => {
       const href = a.getAttribute("href");
       if (!href) return;
-      if (href.startsWith("#")) return;
-      if (href.toLowerCase().startsWith("javascript:")) return;
-      if (href.toLowerCase().startsWith("mailto:")) return;
-      if (href.toLowerCase().startsWith("tel:")) return;
-      add(href);
-    });
-
-    // data-href / custom routers
-    document.querySelectorAll("[data-href]").forEach((el) => {
-      const v = el.getAttribute("data-href");
-      if (v) add(v);
-    });
-
-    // onclick router patterns
-    document.querySelectorAll("[onclick]").forEach((el) => {
-      const v = el.getAttribute("onclick") || "";
-      const m1 = v.match(/location\.href\s*=\s*['"]([^'"]+)['"]/i);
-      const m2 = v.match(/window\.location\s*=\s*['"]([^'"]+)['"]/i);
-      const m = m1 || m2;
-      if (m?.[1]) add(m[1]);
+      const h = href.trim();
+      const hl = h.toLowerCase();
+      if (!h) return;
+      if (h.startsWith("#")) return;
+      if (hl.startsWith("javascript:")) return;
+      if (hl.startsWith("mailto:")) return;
+      if (hl.startsWith("tel:")) return;
+      add(h);
     });
 
     return Array.from(out);
@@ -388,13 +391,11 @@ function pickInternalLinks(allLinks, rootUrl) {
       try {
         const u = new URL(l);
 
-        // ✅ accept either same origin OR same hostname (www mismatch)
-        const sameHost = normalizeHost(u.hostname) === baseHost;
-        const sameOrigin = u.origin === base.origin;
-
-        if (!sameHost && !sameOrigin) return false;
         if (!(u.protocol === "http:" || u.protocol === "https:")) return false;
         if (isUselessUrl(u.toString())) return false;
+
+        // ✅ SMART INTERNAL CHECK
+        if (!isSameDomainOrSubdomain(u.hostname, baseHost)) return false;
 
         return true;
       } catch {
@@ -461,19 +462,17 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 
         await autoExpand(page);
 
-        // collect links first
         const links = await collectLinks(page);
 
-        // DEBUG: show what links we got
-        console.log("   rawLinksSample:", links.slice(0, 20));
+        console.log("[PAGE]", norm);
+        console.log("   rawLinksSample:", links.slice(0, 25));
 
         await removeNoiseDom(page);
 
         const title = cleanText(await page.title());
         const text = await extractMainText(page);
 
-        console.log("[PAGE]", norm);
-        console.log("   title:", (title || "").slice(0, 70));
+        console.log("   title:", (title || "").slice(0, 80));
         console.log("   textLen:", (text || "").length);
         console.log("   linksFound:", links.length);
 
@@ -491,13 +490,14 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
 
         const internalLinks = pickInternalLinks(links, url);
         console.log("   internalLinks:", internalLinks.length);
+        console.log("   internalLinksSample:", internalLinks.slice(0, 20));
         console.log("   visited:", visited.size, "queue:", queue.length);
 
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
-          if (queue.length > 900) break;
+          if (queue.length > 1200) break;
           queue.push(ln);
         }
       } catch (e) {
