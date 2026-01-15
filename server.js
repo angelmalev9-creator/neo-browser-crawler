@@ -19,19 +19,30 @@ const MAX_CHARS_PER_PAGE = 16000;
 const MAX_TOTAL_CHARS = 320000;
 const MIN_PAGE_CHARS = 180;
 
-const MAX_QUEUE = 600;
+const MAX_QUEUE = 800;
+
+// ------------------------------
+// HARD BLOCK: non-html resources
+// ------------------------------
+const BLOCK_EXT_REGEX =
+  /\.(?:jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|mp3|wav|ogg|mp4|m4v|mov|avi|webm|css|js|json|xml|txt|woff|woff2|ttf|eot)(?:\?.*)?$/i;
+
+// Some WP urls can be attachments without extension in query (rare)
+const BLOCK_PATH_HINTS = [
+  "/wp-content/uploads/",
+  "/wp-includes/",
+  "/wp-json/",
+  "/feed/",
+  "/xmlrpc.php",
+];
 
 // ------------------------------
 // Safe selectors ONLY
-// (NO :has-text, because it breaks querySelectorAll in evaluate)
 // ------------------------------
 const CLICK_SELECTORS = [
-  // generic
   "button",
   "[role='button']",
   "details > summary",
-
-  // accordion/dropdowns
   "[aria-expanded='false']",
   "[data-bs-toggle]",
   ".accordion button",
@@ -40,8 +51,6 @@ const CLICK_SELECTORS = [
   ".dropdown-toggle",
   ".menu-toggle",
   ".navbar-toggler",
-
-  // tabs
   "[role='tab']",
   "[aria-controls]",
   ".tabs button",
@@ -107,11 +116,9 @@ function stripBoilerplate(text = "") {
 
   for (const l of lines) {
     if (badLine(l)) continue;
-
     const key = l.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-
     filtered.push(l);
   }
 
@@ -170,14 +177,31 @@ function normalizeUrl(u) {
 
     if (url.search && url.search.length > 140) url.search = "";
 
-    return url.toString();
+    const final = url.toString();
+
+    // 🚫 hard drop if it looks like asset
+    if (BLOCK_EXT_REGEX.test(final)) return null;
+
+    return final;
   } catch {
     return null;
   }
 }
 
+function looksLikeAsset(url) {
+  const s = String(url || "").toLowerCase();
+  if (BLOCK_EXT_REGEX.test(s)) return true;
+  for (const hint of BLOCK_PATH_HINTS) {
+    if (s.includes(hint)) return true;
+  }
+  return false;
+}
+
 function isUselessUrl(u = "") {
   const s = String(u).toLowerCase();
+
+  if (looksLikeAsset(s)) return true;
+
   return (
     s.includes("privacy") ||
     s.includes("cookies") ||
@@ -194,8 +218,7 @@ function isUselessUrl(u = "") {
     s.includes("wp-login") ||
     s.includes("/wp-admin") ||
     s.includes("/tag/") ||
-    s.includes("/author/") ||
-    s.includes("/feed")
+    s.includes("/author/")
   );
 }
 
@@ -214,8 +237,7 @@ function pagePriorityScore(url, title = "", text = "") {
   if (u.includes("contact") || u.includes("контакт")) score += 100;
   if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
 
-  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро"))
-    score += 35;
+  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро")) score += 35;
 
   if (isUselessUrl(u)) score -= 999;
 
@@ -292,7 +314,6 @@ async function removeNoiseDom(page) {
 }
 
 async function autoExpand(page) {
-  // safer scroll (no mouse wheel - that throws if page closes)
   for (let i = 0; i < 4; i++) {
     await safeScroll(page);
     await safeWait(page, 600);
@@ -355,10 +376,16 @@ async function collectLinks(page) {
         const h = href.trim();
         const hl = h.toLowerCase();
         if (!h) return;
+
         if (h.startsWith("#")) return;
         if (hl.startsWith("javascript:")) return;
         if (hl.startsWith("mailto:")) return;
         if (hl.startsWith("tel:")) return;
+
+        // 🚫 ignore obvious assets early
+        if (/\.(jpg|jpeg|png|gif|webp|svg|pdf|zip|rar|7z|mp3|mp4|css|js)(\?.*)?$/i.test(h)) return;
+        if (hl.includes("/wp-content/uploads/")) return;
+
         add(h);
       });
 
@@ -445,6 +472,7 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
     while (queue.length && pages.length < maxPages && totalChars < MAX_TOTAL_CHARS) {
       const link = queue.shift();
       const norm = normalizeUrl(link);
+
       if (!norm) continue;
       if (visited.has(norm)) continue;
       if (isUselessUrl(norm)) continue;
@@ -462,11 +490,14 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
           await launch();
         }
 
-        page = await context.newPage();
-        page.setDefaultTimeout(60000);
+        // 🚫 last-line protection
+        if (looksLikeAsset(norm)) continue;
 
-        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await safeWait(page, 1200);
+        page = await context.newPage();
+        page.setDefaultTimeout(65000);
+
+        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 65000 });
+        await safeWait(page, 1100);
 
         await autoExpand(page);
 
@@ -495,10 +526,12 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
           console.log("   SKIP (too short)");
         }
 
+        // enqueue next pages
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
           if (visited.has(ln)) continue;
+          if (isUselessUrl(ln)) continue;
           if (queue.length >= MAX_QUEUE) break;
           queue.push(ln);
         }
@@ -506,7 +539,6 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
         const msg = e?.message || String(e);
         console.log("   ❌ ERROR page:", norm, msg);
 
-        // ✅ if browser/context died -> restart and continue
         if (msg.includes("Target page") || msg.includes("browser has been closed") || msg.includes("context")) {
           console.log("   🔁 Restarting browser/context...");
           await closeAll();
@@ -569,6 +601,7 @@ const server = http.createServer(async (req, res) => {
     console.log("[LIMITS] MIN_PAGE_CHARS:", MIN_PAGE_CHARS);
     console.log("[LIMITS] MAX_CHARS_PER_PAGE:", MAX_CHARS_PER_PAGE);
     console.log("[LIMITS] MAX_TOTAL_CHARS:", MAX_TOTAL_CHARS);
+    console.log("[LIMITS] MAX_QUEUE:", MAX_QUEUE);
     console.log("==================================================");
 
     const pages = await crawlSite(url, resolvedMaxPages);
