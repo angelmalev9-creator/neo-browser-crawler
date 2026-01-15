@@ -16,25 +16,19 @@ const MAX_PAGES_DEFAULT = 30;
 const MAX_PAGES_HARD = 100;
 
 const MAX_CHARS_PER_PAGE = 16000;
-const MAX_TOTAL_CHARS = 320000;
+const MAX_TOTAL_CHARS = 360000;
 const MIN_PAGE_CHARS = 180;
 
-const MAX_QUEUE = 800;
+const MAX_QUEUE = 900;
 
 // ------------------------------
-// HARD BLOCK: non-html resources
+// IMPORTANT: FILTER MEDIA URLs
 // ------------------------------
-const BLOCK_EXT_REGEX =
-  /\.(?:jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|mp3|wav|ogg|mp4|m4v|mov|avi|webm|css|js|json|xml|txt|woff|woff2|ttf|eot)(?:\?.*)?$/i;
+const BLOCKED_EXTENSIONS_REGEX =
+  /\.(jpg|jpeg|png|gif|webp|svg|ico|pdf|zip|rar|7z|mp4|mp3|wav|avi|mov|css|js|json|xml|woff|woff2|ttf|eot)(\?.*)?$/i;
 
-// Some WP urls can be attachments without extension in query (rare)
-const BLOCK_PATH_HINTS = [
-  "/wp-content/uploads/",
-  "/wp-includes/",
-  "/wp-json/",
-  "/feed/",
-  "/xmlrpc.php",
-];
+const BLOCKED_PATH_REGEX =
+  /(\/wp-content\/uploads\/|\/wp-includes\/|\/feed\/|\/rss\/)/i;
 
 // ------------------------------
 // Safe selectors ONLY
@@ -43,6 +37,7 @@ const CLICK_SELECTORS = [
   "button",
   "[role='button']",
   "details > summary",
+
   "[aria-expanded='false']",
   "[data-bs-toggle]",
   ".accordion button",
@@ -51,6 +46,7 @@ const CLICK_SELECTORS = [
   ".dropdown-toggle",
   ".menu-toggle",
   ".navbar-toggler",
+
   "[role='tab']",
   "[aria-controls]",
   ".tabs button",
@@ -108,6 +104,7 @@ function stripBoilerplate(text = "") {
       s.includes("правата са запазени");
 
     if (bad) return true;
+
     if (s === "facebook" || s === "instagram" || s === "linkedin") return true;
     if (/^(ok|yes|no|close)$/i.test(s)) return true;
 
@@ -116,9 +113,11 @@ function stripBoilerplate(text = "") {
 
   for (const l of lines) {
     if (badLine(l)) continue;
+
     const key = l.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
+
     filtered.push(l);
   }
 
@@ -146,13 +145,12 @@ function normalizeHost(host) {
   return h;
 }
 
-function isSameDomainOrSubdomain(aHost, bHost) {
+function isSameDomainOrSubdomain(aHost, baseHost) {
   const a = normalizeHost(aHost);
-  const b = normalizeHost(bHost);
+  const b = normalizeHost(baseHost);
   if (!a || !b) return false;
   if (a === b) return true;
   if (a.endsWith("." + b)) return true;
-  if (b.endsWith("." + a)) return true;
   return false;
 }
 
@@ -162,46 +160,27 @@ function normalizeUrl(u) {
     url.hash = "";
 
     const killParams = [
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-      "utm_term",
-      "utm_content",
-      "gclid",
-      "fbclid",
-      "yclid",
-      "mc_cid",
-      "mc_eid",
+      "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+      "gclid","fbclid","yclid","mc_cid","mc_eid",
     ];
     killParams.forEach((p) => url.searchParams.delete(p));
 
     if (url.search && url.search.length > 140) url.search = "";
 
-    const final = url.toString();
-
-    // 🚫 hard drop if it looks like asset
-    if (BLOCK_EXT_REGEX.test(final)) return null;
-
-    return final;
+    return url.toString();
   } catch {
     return null;
   }
 }
 
-function looksLikeAsset(url) {
-  const s = String(url || "").toLowerCase();
-  if (BLOCK_EXT_REGEX.test(s)) return true;
-  for (const hint of BLOCK_PATH_HINTS) {
-    if (s.includes(hint)) return true;
-  }
-  return false;
-}
-
 function isUselessUrl(u = "") {
   const s = String(u).toLowerCase();
 
-  if (looksLikeAsset(s)) return true;
+  // media / assets
+  if (BLOCKED_EXTENSIONS_REGEX.test(s)) return true;
+  if (BLOCKED_PATH_REGEX.test(s)) return true;
 
+  // legal/auth/checkout junk
   return (
     s.includes("privacy") ||
     s.includes("cookies") ||
@@ -228,7 +207,6 @@ function pagePriorityScore(url, title = "", text = "") {
   const c = String(text || "").toLowerCase();
 
   let score = 0;
-
   if (KEYWORD_IMPORTANCE.test(u)) score += 70;
   if (KEYWORD_IMPORTANCE.test(t)) score += 50;
 
@@ -237,7 +215,8 @@ function pagePriorityScore(url, title = "", text = "") {
   if (u.includes("contact") || u.includes("контакт")) score += 100;
   if (u.includes("rooms") || u.includes("accommodation") || u.includes("настан") || u.includes("стаи")) score += 120;
 
-  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро")) score += 35;
+  if (c.includes("лв") || c.includes("лева") || c.includes("bgn") || c.includes("eur") || c.includes("евро"))
+    score += 35;
 
   if (isUselessUrl(u)) score -= 999;
 
@@ -249,15 +228,11 @@ function pagePriorityScore(url, title = "", text = "") {
 // Safe DOM helpers
 // ------------------------------
 async function safeWait(page, ms) {
-  try {
-    await page.waitForTimeout(ms);
-  } catch {}
+  try { await page.waitForTimeout(ms); } catch {}
 }
 
 async function safeScroll(page) {
-  try {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  } catch {}
+  try { await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); } catch {}
 }
 
 async function safeClick(el) {
@@ -273,6 +248,8 @@ async function removeNoiseDom(page) {
   try {
     await page.evaluate(() => {
       const selectorsToRemove = [
+        "header","footer","nav","aside",
+
         "#onetrust-banner-sdk",
         "#onetrust-consent-sdk",
         ".ot-sdk-container",
@@ -293,9 +270,7 @@ async function removeNoiseDom(page) {
         "[id*='gdpr']",
         "[class*='gdpr']",
 
-        ".modal",
-        ".popup",
-        ".overlay",
+        ".modal",".popup",".overlay",
         "[role='dialog']",
         "[aria-modal='true']",
 
@@ -382,10 +357,6 @@ async function collectLinks(page) {
         if (hl.startsWith("mailto:")) return;
         if (hl.startsWith("tel:")) return;
 
-        // 🚫 ignore obvious assets early
-        if (/\.(jpg|jpeg|png|gif|webp|svg|pdf|zip|rar|7z|mp3|mp4|css|js)(\?.*)?$/i.test(h)) return;
-        if (hl.includes("/wp-content/uploads/")) return;
-
         add(h);
       });
 
@@ -406,9 +377,17 @@ function pickInternalLinks(allLinks, rootUrl) {
     .filter((l) => {
       try {
         const u = new URL(l);
+
         if (!(u.protocol === "http:" || u.protocol === "https:")) return false;
-        if (isUselessUrl(u.toString())) return false;
         if (!isSameDomainOrSubdomain(u.hostname, baseHost)) return false;
+
+        const full = u.toString().toLowerCase();
+        if (isUselessUrl(full)) return false;
+
+        // block assets
+        if (BLOCKED_EXTENSIONS_REGEX.test(full)) return false;
+        if (BLOCKED_PATH_REGEX.test(full)) return false;
+
         return true;
       } catch {
         return false;
@@ -417,15 +396,14 @@ function pickInternalLinks(allLinks, rootUrl) {
 
   const unique = Array.from(new Set(internal));
 
-  const sorted = unique
+  // prioritize keywords
+  return unique
     .map((l) => ({
       url: l,
       score: (KEYWORD_IMPORTANCE.test(l) ? 90 : 0) + (l.length < 160 ? 10 : 0),
     }))
     .sort((a, b) => b.score - a.score)
     .map((x) => x.url);
-
-  return sorted;
 }
 
 // ------------------------------
@@ -456,12 +434,8 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
   };
 
   const closeAll = async () => {
-    try {
-      if (context) await context.close();
-    } catch {}
-    try {
-      if (browser) await browser.close();
-    } catch {}
+    try { if (context) await context.close(); } catch {}
+    try { if (browser) await browser.close(); } catch {}
     context = null;
     browser = null;
   };
@@ -472,14 +446,14 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
     while (queue.length && pages.length < maxPages && totalChars < MAX_TOTAL_CHARS) {
       const link = queue.shift();
       const norm = normalizeUrl(link);
-
       if (!norm) continue;
-      if (visited.has(norm)) continue;
-      if (isUselessUrl(norm)) continue;
 
-      visited.add(norm);
+      const normLower = norm.toLowerCase();
+      if (visited.has(normLower)) continue;
+      if (isUselessUrl(normLower)) continue;
 
-      // prevent queue explosion
+      visited.add(normLower);
+
       if (queue.length > MAX_QUEUE) queue.length = MAX_QUEUE;
 
       let page = null;
@@ -490,14 +464,11 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
           await launch();
         }
 
-        // 🚫 last-line protection
-        if (looksLikeAsset(norm)) continue;
-
         page = await context.newPage();
-        page.setDefaultTimeout(65000);
+        page.setDefaultTimeout(60000);
 
-        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 65000 });
-        await safeWait(page, 1100);
+        await page.goto(norm, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await safeWait(page, 1200);
 
         await autoExpand(page);
 
@@ -526,12 +497,12 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
           console.log("   SKIP (too short)");
         }
 
-        // enqueue next pages
         for (const l of internalLinks) {
           const ln = normalizeUrl(l);
           if (!ln) continue;
-          if (visited.has(ln)) continue;
-          if (isUselessUrl(ln)) continue;
+
+          const lnLower = ln.toLowerCase();
+          if (visited.has(lnLower)) continue;
           if (queue.length >= MAX_QUEUE) break;
           queue.push(ln);
         }
@@ -539,15 +510,17 @@ async function crawlSite(url, maxPages = MAX_PAGES_DEFAULT) {
         const msg = e?.message || String(e);
         console.log("   ❌ ERROR page:", norm, msg);
 
-        if (msg.includes("Target page") || msg.includes("browser has been closed") || msg.includes("context")) {
+        if (
+          msg.includes("Target page") ||
+          msg.includes("browser has been closed") ||
+          msg.includes("context")
+        ) {
           console.log("   🔁 Restarting browser/context...");
           await closeAll();
           await launch();
         }
       } finally {
-        try {
-          if (page) await page.close();
-        } catch {}
+        try { if (page) await page.close(); } catch {}
       }
     }
 
