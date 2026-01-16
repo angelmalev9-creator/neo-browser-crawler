@@ -1,5 +1,4 @@
 FROM node:20-slim
-ARG CACHE_BUST=1
 
 WORKDIR /app
 
@@ -20,5 +19,4 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-CMD ["node", "server.js"] # CACHE_BUST
-
+CMD ["node", "server.js"]
