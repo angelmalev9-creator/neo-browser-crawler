@@ -1,20 +1,21 @@
 import http from "http";
 import { chromium } from "playwright";
-import { createClient } from "@supabase/supabase-js";
 
 const PORT = Number(process.env.PORT || 10000);
 const POLL_INTERVAL_MS = 8000;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-);
+// 🔴 EDGE FUNCTION ENDPOINT
+const EDGE_URL = process.env.EDGE_FUNCTION_URL;
+// пример:
+// https://lvcxmcdbopxxfuoaqgze.supabase.co/functions/v1/scrape-website
+
+if (!EDGE_URL) {
+  throw new Error("EDGE_FUNCTION_URL env var is required");
+}
 
 /* ================= LIMITS ================= */
-const MAX_PAGES = 40;
 const MAX_CHARS_PER_PAGE = 16000;
 const MIN_PAGE_CHARS = 180;
-const MAX_TOTAL_CHARS = 360000;
 
 /* ================= UTILS ================= */
 const cleanText = (t = "") =>
@@ -29,9 +30,6 @@ const clamp = (s, m) => (s.length <= m ? s : s.slice(0, m));
 
 /* ================= CRAWLER ================= */
 async function crawlSite(url) {
-  const pages = [];
-  let totalChars = 0;
-
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -48,16 +46,18 @@ async function crawlSite(url) {
       await page.evaluate(() => document.body?.innerText || "")
     );
 
-    if (text.length >= MIN_PAGE_CHARS) {
-      pages.push({
+    if (text.length < MIN_PAGE_CHARS) {
+      throw new Error("Content too short");
+    }
+
+    return [
+      {
         url,
         title: cleanText(await page.title()),
         content: clamp(text, MAX_CHARS_PER_PAGE),
         category: "general",
-      });
-    }
-
-    return pages;
+      },
+    ];
   } finally {
     await browser.close();
   }
@@ -65,47 +65,49 @@ async function crawlSite(url) {
 
 /* ================= JOB LOOP ================= */
 async function pollJobs() {
-  const { data: job } = await supabase
-    .from("demo_sessions")
-    .select("*")
-    .eq("status", "queued")
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  if (!job) return;
-
-  console.log("▶️ Processing job:", job.id);
-
-  await supabase
-    .from("demo_sessions")
-    .update({ status: "scraping" })
-    .eq("id", job.id);
-
   try {
-    const pages = await crawlSite(job.url);
+    // 1️⃣ ask edge for next job
+    const jobResp = await fetch(EDGE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "next-job" }),
+    });
 
-    if (!pages.length) throw new Error("No usable content");
+    const jobData = await jobResp.json();
+    if (!jobData?.job) return;
 
-    await supabase
-      .from("demo_sessions")
-      .update({
-        status: "ready",
-        scraped_content: pages,
-        language: "bg",
-        error_message: null,
-      })
-      .eq("id", job.id);
+    const { id, url } = jobData.job;
+    console.log("▶️ Processing job:", id);
 
-    console.log("✅ Done:", job.id);
+    try {
+      const pages = await crawlSite(url);
+
+      // 2️⃣ send result back
+      await fetch(EDGE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "complete-job",
+          id,
+          pages,
+          language: "bg",
+        }),
+      });
+
+      console.log("✅ Done:", id);
+    } catch (e) {
+      await fetch(EDGE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "fail-job",
+          id,
+          error: e.message || "Crawler error",
+        }),
+      });
+    }
   } catch (e) {
-    await supabase
-      .from("demo_sessions")
-      .update({
-        status: "error",
-        error_message: e.message || "Crawler error",
-      })
-      .eq("id", job.id);
+    console.error("pollJobs error:", e);
   }
 }
 
