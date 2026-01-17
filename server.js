@@ -10,8 +10,7 @@ const MIN_WORDS = 10;
 const SKIP_URL_RE =
   /\/(wp-content|uploads|media|images|gallery|video|photo|attachment)/i;
 
-const clean = (t = "") =>
-  t.replace(/\s+/g, " ").trim();
+const clean = (t = "") => t.replace(/\s+/g, " ").trim();
 
 function countWords(text) {
   return text.split(" ").filter(w => w.length > 2).length;
@@ -21,18 +20,20 @@ function countWords(text) {
    PAGE CONTENT EXTRACTOR
 ========================= */
 async function extractVisibleText(page) {
-  return clean(await page.evaluate(() => {
-    const selectors = [
-      "main p", "main li", "main h1", "main h2", "main h3", "main h4",
-      "article p", "article li", "article h1", "article h2", "article h3"
-    ];
+  return clean(
+    await page.evaluate(() => {
+      const selectors = [
+        "main p", "main li", "main h1", "main h2", "main h3", "main h4",
+        "article p", "article li", "article h1", "article h2", "article h3"
+      ];
 
-    const nodes = document.querySelectorAll(selectors.join(","));
-    return Array.from(nodes)
-      .filter(el => el.offsetParent !== null)
-      .map(el => el.innerText)
-      .join(" ");
-  }));
+      const nodes = document.querySelectorAll(selectors.join(","));
+      return Array.from(nodes)
+        .filter(el => el.offsetParent !== null)
+        .map(el => el.innerText)
+        .join(" ");
+    })
+  );
 }
 
 /* =========================
@@ -59,8 +60,9 @@ async function crawlSite(startUrl) {
   await page.goto(startUrl, { timeout: PAGE_TIMEOUT });
 
   const base = new URL(page.url()).origin;
-  const visited = new Set([page.url()]);
-  const queue = [page.url()];
+
+  const visited = new Set();          // ❗ празно
+  const queue = [page.url()];         // стартов URL
   const pages = [];
 
   console.log(`[CRAWL] Start from ${page.url()}`);
@@ -69,12 +71,13 @@ async function crawlSite(startUrl) {
     const url = queue.shift();
     if (!url || visited.has(url)) continue;
 
-    visited.add(url);
+    visited.add(url); // ✅ маркираме ТУК
 
     try {
       await page.goto(url, { timeout: PAGE_TIMEOUT });
 
       const text = await extractVisibleText(page);
+
       if (countWords(text) >= MIN_WORDS) {
         pages.push({
           url,
@@ -82,6 +85,8 @@ async function crawlSite(startUrl) {
           content: text,
         });
         console.log(`[SAVE] ${pages.length}: ${url}`);
+      } else {
+        console.log(`[SKIP] no text: ${url}`);
       }
 
       // collect clickable targets
@@ -110,7 +115,8 @@ async function crawlSite(startUrl) {
         } catch {}
       }
 
-    } catch {
+    } catch (e) {
+      console.log(`[ERROR] ${url}`);
       continue;
     }
   }
