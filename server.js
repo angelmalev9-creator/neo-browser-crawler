@@ -7,7 +7,6 @@ const PORT = Number(process.env.PORT || 10000);
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
 
-// режем галерии, медии, wp боклуци
 const SKIP_RE =
   /gallery|portfolio|projects|images|media|photo|video|work|album|wp-content|uploads/i;
 
@@ -15,28 +14,44 @@ const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
 /* =========================
+   URL NORMALIZATION (KEY FIX)
+========================= */
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    u.search = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function sameDomain(a, b) {
+  return (
+    a.replace(/^https?:\/\/(www\.)?/, "") ===
+    b.replace(/^https?:\/\/(www\.)?/, "")
+  );
+}
+
+/* =========================
    SITEMAP
 ========================= */
 async function getSitemapUrls(origin) {
   try {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 15000);
-
-    const res = await fetch(`${origin}/sitemap.xml`, {
-      signal: controller.signal,
-    });
-
+    const res = await fetch(`${origin}/sitemap.xml`, { timeout: 15000 });
     if (!res.ok) return [];
 
     const xml = await res.text();
     const parsed = await parseStringPromise(xml);
 
-    return (
-      parsed?.urlset?.url
-        ?.map((u) => u.loc?.[0])
-        .filter(Boolean) || []
-    );
+    const urls =
+      parsed?.urlset?.url?.map((u) => u.loc?.[0]).filter(Boolean) || [];
+
+    console.log(`[SITEMAP] Found ${urls.length} urls`);
+    return urls.map(normalizeUrl).filter(Boolean);
   } catch {
+    console.log("[SITEMAP] No sitemap");
     return [];
   }
 }
@@ -49,7 +64,6 @@ async function scrapePage(context, url) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // scroll за lazy text
     for (let i = 0; i < 3; i++) {
       await page.evaluate(() => window.scrollBy(0, 1500));
       await page.waitForTimeout(300);
@@ -71,7 +85,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN CRAWL
+   MAIN CRAWL (FIXED)
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -80,20 +94,24 @@ async function crawlSite(startUrl) {
   });
 
   const context = await browser.newContext();
-  const origin = new URL(startUrl).origin;
 
+  const start = normalizeUrl(startUrl);
   const visited = new Set();
   const pages = [];
 
-  // 1️⃣ sitemap first
-  let queue = await getSitemapUrls(origin);
-  if (!queue.length) queue = [startUrl];
+  const sitemapUrls = await getSitemapUrls(start);
+  const queue = [...new Set([start, ...sitemapUrls])];
 
-  for (const url of queue) {
+  console.log(`[CRAWL] Queue size: ${queue.length}`);
+
+  for (const rawUrl of queue) {
     if (pages.length >= MAX_PAGES) break;
-    if (!url.startsWith(origin)) continue;
+
+    const url = normalizeUrl(rawUrl);
+    if (!url) continue;
     if (visited.has(url)) continue;
     if (SKIP_RE.test(url)) continue;
+    if (!sameDomain(url, start)) continue;
 
     visited.add(url);
 
@@ -104,10 +122,12 @@ async function crawlSite(startUrl) {
     console.log(`[CRAWL] +${pages.length}: ${url}`);
   }
 
-  // 2️⃣ BFS fallback ако sitemap е слаб
+  /* BFS fallback – реални линкове */
   if (pages.length < 10) {
+    console.log("[CRAWL] BFS fallback");
+
     const page = await context.newPage();
-    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(start, { waitUntil: "domcontentloaded", timeout: 30000 });
 
     const links = await page.evaluate(() =>
       Array.from(document.querySelectorAll("a[href]"))
@@ -116,19 +136,22 @@ async function crawlSite(startUrl) {
     );
     await page.close();
 
-    for (const link of links) {
+    for (const l of links) {
       if (pages.length >= MAX_PAGES) break;
-      if (!link.startsWith(origin)) continue;
-      if (visited.has(link)) continue;
-      if (SKIP_RE.test(link)) continue;
 
-      visited.add(link);
+      const url = normalizeUrl(l);
+      if (!url) continue;
+      if (visited.has(url)) continue;
+      if (!sameDomain(url, start)) continue;
+      if (SKIP_RE.test(url)) continue;
 
-      const data = await scrapePage(context, link);
+      visited.add(url);
+
+      const data = await scrapePage(context, url);
       if (!data) continue;
 
       pages.push(data);
-      console.log(`[CRAWL] +${pages.length}: ${link}`);
+      console.log(`[CRAWL] +${pages.length}: ${url}`);
     }
   }
 
