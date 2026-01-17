@@ -1,7 +1,6 @@
 import http from "http";
 import { chromium } from "playwright";
 import { parseStringPromise } from "xml2js";
-import fetch from "node-fetch";
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -15,16 +14,14 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
 
-const SKIP_RE = /gallery|portfolio|projects|images|media|photo|video|work|album/i;
+const SKIP_RE =
+  /gallery|portfolio|projects|images|media|photo|video|work|album|wp-content|uploads/i;
 
 const clean = (t = "") =>
-  t
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
 /* =========================
-   SUPABASE HELPERS
+   SUPABASE
 ========================= */
 async function updateSession(sessionId, data) {
   await fetch(`${SUPABASE_URL}/rest/v1/demo_sessions?id=eq.${sessionId}`, {
@@ -44,7 +41,13 @@ async function updateSession(sessionId, data) {
 ========================= */
 async function getSitemapUrls(baseUrl) {
   try {
-    const res = await fetch(`${baseUrl}/sitemap.xml`, { timeout: 15000 });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(`${baseUrl}/sitemap.xml`, {
+      signal: controller.signal,
+    });
+
     if (!res.ok) return [];
 
     const xml = await res.text();
@@ -56,6 +59,7 @@ async function getSitemapUrls(baseUrl) {
     console.log(`[SITEMAP] Found ${urls.length} urls`);
     return urls;
   } catch {
+    console.log("[SITEMAP] No sitemap or failed");
     return [];
   }
 }
@@ -68,10 +72,9 @@ async function scrapePage(context, url) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // scroll for SPA / lazy text
-    for (let i = 0; i < 4; i++) {
-      await page.evaluate(() => window.scrollBy(0, 1600));
-      await page.waitForTimeout(400);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1500));
+      await page.waitForTimeout(300);
     }
 
     const title = clean(await page.title());
@@ -90,7 +93,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN CRAWL
+   CRAWLER
 ========================= */
 async function crawlSite(startUrl, sessionId) {
   const browser = await chromium.launch({
@@ -104,28 +107,25 @@ async function crawlSite(startUrl, sessionId) {
   const visited = new Set();
   const pages = [];
 
-  /* 1️⃣ sitemap first */
   let queue = await getSitemapUrls(baseOrigin);
-
-  /* 2️⃣ fallback */
   if (!queue.length) queue = [startUrl];
 
   for (const url of queue) {
     if (pages.length >= MAX_PAGES) break;
     if (visited.has(url)) continue;
+    if (!url.startsWith(baseOrigin)) continue;
     if (SKIP_RE.test(url)) continue;
 
     visited.add(url);
 
-    const pageData = await scrapePage(context, url);
-    if (!pageData) continue;
+    const data = await scrapePage(context, url);
+    if (!data) continue;
 
-    pages.push(pageData);
-    console.log(`[CRAWL] Added ${pages.length}: ${url}`);
+    pages.push(data);
+    console.log(`[CRAWL] +${pages.length}: ${url}`);
   }
 
-  /* 3️⃣ BFS fallback if sitemap was weak */
-  if (pages.length < 10) {
+  if (pages.length < 8) {
     console.log("[CRAWL] Sitemap weak → BFS fallback");
 
     const page = await context.newPage();
@@ -146,11 +146,11 @@ async function crawlSite(startUrl, sessionId) {
 
       visited.add(link);
 
-      const pageData = await scrapePage(context, link);
-      if (!pageData) continue;
+      const data = await scrapePage(context, link);
+      if (!data) continue;
 
-      pages.push(pageData);
-      console.log(`[CRAWL] Added ${pages.length}: ${link}`);
+      pages.push(data);
+      console.log(`[CRAWL] +${pages.length}: ${link}`);
     }
   }
 
@@ -163,11 +163,11 @@ async function crawlSite(startUrl, sessionId) {
     updated_at: new Date().toISOString(),
   });
 
-  console.log(`[DONE] Total pages: ${pages.length}`);
+  console.log(`[DONE] Pages scraped: ${pages.length}`);
 }
 
 /* =========================
-   HTTP SERVER
+   SERVER
 ========================= */
 http
   .createServer((req, res) => {
@@ -183,9 +183,10 @@ http
         const { url, sessionId } = JSON.parse(body || "{}");
         if (!url || !sessionId) throw new Error("Missing data");
 
-        console.log(`[CRAWL] Start: ${url}`);
+        console.log(`[CRAWL] Start ${url}`);
 
         crawlSite(url, sessionId).catch(async (e) => {
+          console.error("[CRAWL ERROR]", e.message);
           await updateSession(sessionId, {
             status: "error",
             error_message: e.message || "Crawler failed",
