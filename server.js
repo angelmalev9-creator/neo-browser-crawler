@@ -5,31 +5,53 @@ const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 50;
 const PAGE_TIMEOUT = 15000;
-const MIN_WORDS = 50; // ⬅️ ВАЖНО: минимум 50 думи
+const MIN_WORDS = 100; // ⬅️ ВАЖНО: минимум 100 думи
 
 const SKIP_URL_RE =
   /\/(wp-content|uploads|media|images|gallery|video|photo|attachment)/i;
 
-const clean = (t = "") => t.replace(/\s+/g, " ").trim();
+const clean = (t = "") =>
+  t.replace(/\s+/g, " ").trim();
 
 function countWords(text) {
   return text.split(" ").filter(w => w.length > 2).length;
 }
 
 /* =========================
-   PAGE CONTENT EXTRACTOR
+   ELEMENTOR-AWARE TEXT EXTRACTOR
 ========================= */
 async function extractVisibleText(page) {
   return clean(
     await page.evaluate(() => {
+      const badParents = ["header", "footer", "nav", "aside"];
+
+      function isVisible(el) {
+        if (!el || !el.offsetParent) return false;
+        const style = window.getComputedStyle(el);
+        return style.display !== "none" && style.visibility !== "hidden";
+      }
+
       const selectors = [
-        "main p", "main li", "main h1", "main h2", "main h3", "main h4",
-        "article p", "article li", "article h1", "article h2", "article h3"
+        // Standard content
+        "main p", "main li",
+        "article p", "article li",
+
+        // Elementor
+        ".elementor-widget-text-editor",
+        ".elementor-text-editor",
+        "[data-widget_type='text-editor.default']",
+
+        // Fallback for real sections
+        "section div"
       ];
 
       const nodes = document.querySelectorAll(selectors.join(","));
+
       return Array.from(nodes)
-        .filter(el => el.offsetParent !== null)
+        .filter(el =>
+          isVisible(el) &&
+          !el.closest(badParents.join(","))
+        )
         .map(el => el.innerText)
         .join(" ");
     })
@@ -92,14 +114,10 @@ async function crawlSite(startUrl) {
 
       // collect clickable targets
       const links = await page.evaluate(() => {
-        const els = [
-          ...document.querySelectorAll("a[href]"),
-          ...document.querySelectorAll("button"),
-          ...document.querySelectorAll("[role='button']")
-        ];
-
-        return els
-          .map(el => el.href || el.getAttribute("data-href"))
+        return Array.from(
+          document.querySelectorAll("a[href], button, [role='button']")
+        )
+          .map(el => el.href)
           .filter(Boolean);
       });
 
@@ -118,7 +136,6 @@ async function crawlSite(startUrl) {
 
     } catch {
       console.log(`[ERROR] ${url}`);
-      continue;
     }
   }
 
