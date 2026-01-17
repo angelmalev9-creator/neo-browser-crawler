@@ -2,80 +2,69 @@ import http from "http";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
-const MAX_PAGES = 40;
-const MIN_TEXT_LEN = 180;
+const MAX_PAGES_DEFAULT = 40;
 
-/* ================= UTILS ================= */
-const cleanText = (t = "") =>
-  String(t)
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+const IMPORTANT_RE =
+  /about|за-нас|services|услуги|pricing|цени|price|contact|контакти|menu|меню|booking|reservation|appointment|запази/i;
 
-const sameOrigin = (base, link) => {
-  try {
-    return new URL(link).origin === new URL(base).origin;
-  } catch {
-    return false;
-  }
-};
+const clean = (t = "") =>
+  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
-/* ================= CRAWLER ================= */
-async function crawlSite(startUrl) {
+async function crawl(url, maxPages) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
-  const context = await browser.newContext();
-  const visited = new Set();
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForTimeout(1500);
+
+  const base = new URL(url).origin;
+
   const pages = [];
 
-  async function crawlPage(url) {
-    if (visited.has(url)) return;
-    if (pages.length >= MAX_PAGES) return;
+  const title = clean(await page.title());
+  const text = clean(await page.evaluate(() => document.body?.innerText || ""));
+  pages.push({ url, title, content: text });
 
-    visited.add(url);
+  const links = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("a[href]"))
+      .map((a) => a.href)
+      .filter(Boolean)
+  );
 
-    const page = await context.newPage();
+  const importantLinks = Array.from(
+    new Set(
+      links.filter(
+        (l) =>
+          l.startsWith(base) &&
+          IMPORTANT_RE.test(l)
+      )
+    )
+  ).slice(0, maxPages - 1);
+
+  for (const link of importantLinks) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(800);
+      const p = await browser.newPage();
+      await p.goto(link, { waitUntil: "domcontentloaded", timeout: 25000 });
+      await p.waitForTimeout(1200);
 
-      const title = cleanText(await page.title());
-      const text = cleanText(
-        await page.evaluate(() => document.body?.innerText || "")
-      );
+      const t = clean(await p.title());
+      const c = clean(await p.evaluate(() => document.body?.innerText || ""));
 
-      if (text.length >= MIN_TEXT_LEN) {
-        pages.push({ url, title, content: text });
+      if (c.length > 200) {
+        pages.push({ url: link, title: t, content: c });
       }
 
-      const links = await page.evaluate(() =>
-        Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => a.href)
-          .filter(Boolean)
-      );
-
-      for (const link of links) {
-        if (pages.length >= MAX_PAGES) break;
-        if (sameOrigin(startUrl, link)) {
-          await crawlPage(link);
-        }
-      }
+      await p.close();
     } catch {}
-    finally {
-      await page.close();
-    }
   }
 
-  await crawlPage(startUrl);
   await browser.close();
-
   return pages;
 }
 
-/* ================= SERVER ================= */
 http
   .createServer((req, res) => {
     if (req.method !== "POST") {
@@ -90,11 +79,10 @@ http
         const { url, maxPages } = JSON.parse(body);
         if (!url) throw new Error("Missing url");
 
-        if (typeof maxPages === "number" && maxPages > 0) {
-          globalThis.MAX_PAGES = Math.min(maxPages, 120);
-        }
-
-        const pages = await crawlSite(url);
+        const pages = await crawl(
+          url,
+          Math.min(Number(maxPages) || MAX_PAGES_DEFAULT, 120)
+        );
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
@@ -111,5 +99,5 @@ http
     });
   })
   .listen(PORT, () => {
-    console.log("Crawler running on port", PORT);
+    console.log("Crawler running on", PORT);
   });
