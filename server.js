@@ -3,24 +3,37 @@ import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 
-// SPEED-FIRST LIMITS
 const MAX_SECONDS = 25;
 const MIN_WORDS = 30;
 
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
 
-const clean = (t = "") => t.replace(/\s+/g, " ").trim();
-const countWords = (t) => t.split(" ").filter(w => w.length > 2).length;
+const clean = (t = "") =>
+  t.replace(/\s+/g, " ").trim();
+
+const countWords = (t = "") =>
+  t.split(" ").filter(w => w.length > 2).length;
 
 /* =========================
-   TEXT EXTRACTOR (FAST + CLEAN)
+   EXTRACT TEXT (ROBUST)
 ========================= */
 async function extractText(page) {
+  // 1️⃣ изчакваме реален content (Elementor или basic HTML)
+  try {
+    await page.waitForSelector(
+      ".elementor-text-editor, p, h1",
+      { timeout: 3000 }
+    );
+  } catch {
+    // няма selector – продължаваме с fallback
+  }
+
   return clean(
     await page.evaluate(() => {
       const bad = ["header", "footer", "nav", "aside"];
 
+      // опит 1: Elementor + semantic tags
       const nodes = document.querySelectorAll(
         ".elementor-text-editor, " +
         ".elementor-widget-text-editor, " +
@@ -29,54 +42,24 @@ async function extractText(page) {
         "article p, article h1, article h2, article h3, article li"
       );
 
-      return Array.from(nodes)
+      let text = Array.from(nodes)
         .filter(el =>
           el.offsetParent !== null &&
           !el.closest(bad.join(","))
         )
         .map(el => el.innerText)
         .join(" ");
+
+      // опит 2: fallback – body text без header/footer/nav
+      if (text.trim().length < 50) {
+        const clone = document.body.cloneNode(true);
+        clone.querySelectorAll("header, footer, nav, aside").forEach(n => n.remove());
+        text = clone.innerText || "";
+      }
+
+      return text;
     })
   );
-}
-
-/* =========================
-   COLLECT NAV LINKS
-========================= */
-async function collectNavLinks(page, base) {
-  return await page.evaluate((base) => {
-    const urls = new Set();
-
-    // HEADER NAV
-    document.querySelectorAll("header a[href], nav a[href]").forEach(a => {
-      try {
-        const u = new URL(a.href, base).href;
-        urls.add(u);
-      } catch {}
-    });
-
-    // FOOTER (LIMITED)
-    document.querySelectorAll("footer a[href]").forEach(a => {
-      const text = a.innerText?.toLowerCase() || "";
-      if (
-        text.includes("about") ||
-        text.includes("services") ||
-        text.includes("contact") ||
-        text.includes("projects") ||
-        text.includes("за нас") ||
-        text.includes("контакти") ||
-        text.includes("услуги") ||
-        text.includes("проекти")
-      ) {
-        try {
-          const u = new URL(a.href, base).href;
-          urls.add(u);
-        } catch {}
-      }
-    });
-
-    return Array.from(urls);
-  }, base);
 }
 
 /* =========================
@@ -110,22 +93,28 @@ async function crawlFastNav(startUrl) {
 
   console.log(`[CRAWL] Start from ${page.url()}`);
 
-  // 1️⃣ Collect important links
-  let links = await collectNavLinks(page, base);
+  // collect nav links
+  const links = await page.evaluate((base) => {
+    const urls = new Set();
 
-  links = links.filter(u =>
-    u.startsWith(base) &&
-    !SKIP_URL_RE.test(u)
-  );
+    document.querySelectorAll("header a[href], nav a[href], footer a[href]").forEach(a => {
+      try {
+        const u = new URL(a.href, base).href;
+        urls.add(u);
+      } catch {}
+    });
 
-  // always include homepage
-  links.unshift(page.url());
+    return Array.from(urls);
+  }, base);
 
-  // 2️⃣ Visit them fast
-  for (const url of links) {
+  const targets = [
+    page.url(),
+    ...links.filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u))
+  ];
+
+  for (const url of targets) {
     if (Date.now() > deadline) break;
     if (visited.has(url)) continue;
-
     visited.add(url);
 
     try {
@@ -134,18 +123,20 @@ async function crawlFastNav(startUrl) {
       const text = await extractText(page);
       const words = countWords(text);
 
+      console.log(`[DEBUG] ${url} → ${text.length} chars / ${words} words`);
+
       if (words >= MIN_WORDS) {
         pages.push({
           url,
           title: clean(await page.title()),
           content: text,
         });
-        console.log(`[SAVE] ${url} (${words} words)`);
+        console.log(`[SAVE] ${url}`);
       } else {
         console.log(`[SKIP] ${url} (${words} words)`);
       }
 
-    } catch {
+    } catch (e) {
       console.log(`[ERROR] ${url}`);
     }
   }
