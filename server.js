@@ -5,23 +5,55 @@ const PORT = Number(process.env.PORT || 10000);
 const MAX_PAGES_DEFAULT = 40;
 const MAX_PAGES_HARD = 120;
 
-const BLOCK_RE =
-  /privacy|policy|cookies|cookie|terms|gdpr|consent|login|register|account|cart|checkout|wishlist|compare|admin|wp-admin/i;
+const SKIP_RE =
+  /cookie|privacy|policy|terms|login|register|cart|checkout|account|wishlist|#|javascript:/i;
 
-const PRIORITY_RE =
-  /price|pricing|цени|services|услуги|products|product|shop|menu|меню|booking|reservation|appointment|contact|about|за-нас/i;
+const IMPORTANT_RE =
+  /about|за-нас|services|услуги|pricing|цени|price|contact|контакти|menu|меню|booking|reservation|appointment|запази/i;
 
 const clean = (t = "") =>
-  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  t
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-function normalizeUrl(u) {
-  try {
-    const url = new URL(u);
-    url.hash = "";
-    return url.toString().replace(/\/$/, "");
-  } catch {
-    return null;
+async function preparePage(page) {
+  await page.waitForLoadState("networkidle");
+
+  // aggressive scroll for SPA
+  for (let i = 0; i < 8; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await page.waitForTimeout(500);
   }
+
+  // click expandable elements
+  await page.evaluate(() => {
+    document.querySelectorAll("button, summary, [role='button']").forEach((el) => {
+      try {
+        const txt = el.innerText?.toLowerCase() || "";
+        if (txt.match(/menu|услуг|цени|about|contact|о нас/)) {
+          el.click();
+        }
+      } catch {}
+    });
+  });
+
+  await page.waitForTimeout(1200);
+}
+
+async function extractLinks(page, baseOrigin) {
+  return await page.evaluate((baseOrigin) => {
+    return Array.from(document.querySelectorAll("a[href]"))
+      .map((a) => a.href)
+      .filter((h) => {
+        try {
+          const u = new URL(h);
+          return u.origin === baseOrigin;
+        } catch {
+          return false;
+        }
+      });
+  }, baseOrigin);
 }
 
 async function crawl(startUrl, maxPages) {
@@ -31,78 +63,63 @@ async function crawl(startUrl, maxPages) {
   });
 
   const context = await browser.newContext();
-  const baseOrigin = new URL(startUrl).origin;
-
   const visited = new Set();
   const queue = [startUrl];
   const pages = [];
 
-  console.log("[CRAWLER] start:", startUrl);
+  const baseOrigin = new URL(startUrl).origin;
 
   while (queue.length && pages.length < maxPages) {
-    const rawUrl = queue.shift();
-    const url = normalizeUrl(rawUrl);
+    const url = queue.shift();
     if (!url || visited.has(url)) continue;
+    if (SKIP_RE.test(url)) continue;
+
     visited.add(url);
+    console.log("[CRAWL] Visiting:", url);
 
     let page;
     try {
       page = await context.newPage();
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-      await page.goto(url, {
-        waitUntil: "networkidle",
-        timeout: 45000,
-      });
-
-      // force SPA render
-      for (let i = 0; i < 5; i++) {
-        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-        await page.waitForTimeout(600);
-      }
+      await preparePage(page);
 
       const title = clean(await page.title());
-      const text = clean(
+      const content = clean(
         await page.evaluate(() => document.body?.innerText || "")
       );
 
-      if (text.length > 400) {
-        pages.push({ url, title, content: text.slice(0, 16000) });
-        console.log("[CRAWLED]", pages.length, url);
+      if (content.length > 400) {
+        pages.push({ url, title, content });
+        console.log("[CRAWL] ✔ Added page:", pages.length);
       }
 
-      // extract links AFTER render
-      const links = await page.evaluate(() =>
-        Array.from(document.links).map((a) => a.href)
-      );
-
-      console.log("[LINKS FOUND]", links.length, "on", url);
+      const links = await extractLinks(page, baseOrigin);
 
       for (const l of links) {
-        const n = normalizeUrl(l);
-        if (!n) continue;
-
-        try {
-          const u = new URL(n);
-          if (u.origin !== baseOrigin) continue;
-          if (BLOCK_RE.test(n)) continue;
-          if (visited.has(n)) continue;
-
-          if (PRIORITY_RE.test(n)) {
-            queue.unshift(n);
-          } else if (queue.length < maxPages * 3) {
-            queue.push(n);
-          }
-        } catch {}
+        if (
+          !visited.has(l) &&
+          !SKIP_RE.test(l) &&
+          (IMPORTANT_RE.test(l) || pages.length < 5)
+        ) {
+          queue.push(l);
+        }
       }
+
+      console.log(
+        "[CRAWL] Queue:",
+        queue.length,
+        "| Visited:",
+        visited.size
+      );
     } catch (e) {
-      console.log("[SKIP]", url);
+      console.log("[CRAWL] ❌ Failed:", url);
     } finally {
       if (page) await page.close();
     }
   }
 
   await browser.close();
-  console.log("[DONE] pages:", pages.length);
   return pages;
 }
 
@@ -117,7 +134,7 @@ http
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       try {
-        const { url, maxPages } = JSON.parse(body || {});
+        const { url, maxPages } = JSON.parse(body || "{}");
         if (!url) throw new Error("Missing url");
 
         const limit = Math.min(
@@ -128,13 +145,24 @@ http
         const pages = await crawl(url, limit);
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
+        res.end(
+          JSON.stringify({
+            success: true,
+            pagesCount: pages.length,
+            pages,
+          })
+        );
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: e.message }));
+        res.end(
+          JSON.stringify({
+            success: false,
+            error: e.message || "Crawler error",
+          })
+        );
       }
     });
   })
   .listen(PORT, () => {
-    console.log("Crawler running on", PORT);
+    console.log("🚀 Smart crawler running on", PORT);
   });
