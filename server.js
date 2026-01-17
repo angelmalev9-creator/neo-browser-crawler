@@ -15,32 +15,58 @@ const clean = (t = "") => t.replace(/\s+/g, " ").trim();
 const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 
 /* =========================
-   PAGE TYPE DETECTOR (SAFE)
+   SAFE GOTO (NO SILENT FAIL)
+========================= */
+async function safeGoto(page, url, timeout = 12000) {
+  try {
+    await page.goto(url, {
+      timeout,
+      waitUntil: "domcontentloaded",
+    });
+    return true;
+  } catch (e) {
+    console.error("[GOTO FAIL]", url, e.message);
+    return false;
+  }
+}
+
+/* =========================
+   PAGE TYPE DETECTOR
 ========================= */
 function detectPageType(url = "", title = "") {
-  const u = url.toLowerCase();
-  const t = title.toLowerCase();
-
-  if (/za-nas|about/.test(u + t)) return "about";
-  if (/uslugi|services/.test(u + t)) return "services";
-  if (/kontakti|contact/.test(u + t)) return "contact";
-  if (/blog|news|articles/.test(u + t)) return "blog";
+  const s = (url + " " + title).toLowerCase();
+  if (/za-nas|about/.test(s)) return "about";
+  if (/uslugi|services/.test(s)) return "services";
+  if (/kontakti|contact/.test(s)) return "contact";
+  if (/blog|news|article/.test(s)) return "blog";
   return "general";
 }
 
 /* =========================
-   STRUCTURED EXTRACTOR
+   STRUCTURED EXTRACTOR (ROBUST)
 ========================= */
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("main, article, p", { timeout: 3000 });
+    await page.waitForSelector("body", { timeout: 3000 });
   } catch {}
 
   return await page.evaluate(() => {
-    const bad = ["header", "footer", "nav", "aside"];
-
-    bad.forEach(sel => {
+    // remove noisy containers
+    ["header", "footer", "nav", "aside"].forEach(sel => {
       document.querySelectorAll(sel).forEach(n => n.remove());
+    });
+
+    // accept cookies / consent (best effort)
+    document.querySelectorAll("button").forEach(b => {
+      const t = (b.innerText || "").toLowerCase();
+      if (
+        t.includes("accept") ||
+        t.includes("agree") ||
+        t.includes("allow") ||
+        t.includes("прием")
+      ) {
+        b.click();
+      }
     });
 
     const headings = Array.from(
@@ -63,7 +89,14 @@ async function extractStructured(page) {
         }
       });
 
-    const content = document.body.innerText || "";
+    let content = "";
+    if (document.querySelector("main")) {
+      content = document.querySelector("main").innerText;
+    } else if (document.querySelector("article")) {
+      content = document.querySelector("article").innerText;
+    } else {
+      content = document.body.innerText || "";
+    }
 
     const summary = [];
     document.querySelectorAll("p, li").forEach(el => {
@@ -86,7 +119,7 @@ async function extractStructured(page) {
 }
 
 /* =========================
-   COLLECT NAV LINKS
+   LINK COLLECTORS
 ========================= */
 async function collectNavLinks(page, base) {
   return await page.evaluate((base) => {
@@ -102,9 +135,6 @@ async function collectNavLinks(page, base) {
   }, base);
 }
 
-/* =========================
-   COLLECT CONTENT LINKS
-========================= */
 async function collectContentLinks(page, base) {
   return await page.evaluate((base) => {
     const urls = new Set();
@@ -120,7 +150,7 @@ async function collectContentLinks(page, base) {
 }
 
 /* =========================
-   SMART DETAIL CRAWLER
+   SMART CRAWLER
 ========================= */
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
@@ -141,13 +171,16 @@ async function crawlSmart(startUrl) {
   });
 
   const page = await context.newPage();
-  await page.goto(startUrl, { timeout: 15000 });
+  if (!(await safeGoto(page, startUrl, 15000))) {
+    await browser.close();
+    throw new Error("Failed to load start URL");
+  }
 
   const base = new URL(page.url()).origin;
   const visited = new Set();
   const pages = [];
 
-  console.log(`[CRAWL] Start from ${page.url()}`);
+  console.log("[CRAWL] Start", page.url());
 
   let targets = await collectNavLinks(page, base);
   targets.unshift(page.url());
@@ -159,17 +192,19 @@ async function crawlSmart(startUrl) {
   for (const url of targets) {
     if (Date.now() > deadline) break;
     if (visited.has(url)) continue;
-
     visited.add(url);
 
     try {
-      await page.goto(url, { timeout: 12000 });
+      if (!(await safeGoto(page, url))) continue;
 
       const title = clean(await page.title());
       const data = await extractStructured(page);
       const words = countWords(data.content);
 
-      if (words < MIN_WORDS) continue;
+      if (words < MIN_WORDS) {
+        console.log("[SKIP] Thin page", url);
+        continue;
+      }
 
       pages.push({
         url,
@@ -180,9 +215,10 @@ async function crawlSmart(startUrl) {
         summary: data.summary,
         content: clean(data.content),
         wordCount: words,
+        status: "ok",
       });
 
-      console.log(`[SAVE] ${url} (${words} words)`);
+      console.log("[SAVE]", url, words);
 
       const children = await collectContentLinks(page, base);
       let taken = 0;
@@ -197,7 +233,7 @@ async function crawlSmart(startUrl) {
         taken++;
 
         try {
-          await page.goto(child, { timeout: 10000 });
+          if (!(await safeGoto(page, child, 10000))) continue;
 
           const cTitle = clean(await page.title());
           const cData = await extractStructured(page);
@@ -214,17 +250,24 @@ async function crawlSmart(startUrl) {
             summary: cData.summary,
             content: clean(cData.content),
             wordCount: cWords,
+            status: "ok",
           });
 
-          console.log(`[DETAIL] ${child} (${cWords} words)`);
-        } catch {}
+          console.log("[DETAIL]", child, cWords);
+        } catch (e) {
+          console.error("[DETAIL FAIL]", child, e.message);
+          pages.push({ url: child, status: "failed" });
+        }
       }
 
-    } catch {}
+    } catch (e) {
+      console.error("[PAGE FAIL]", url, e.message);
+      pages.push({ url, status: "failed" });
+    }
   }
 
   await browser.close();
-  console.log(`[DONE] Pages saved: ${pages.length}`);
+  console.log("[DONE] Pages:", pages.length);
   return pages;
 }
 
@@ -253,6 +296,7 @@ http.createServer((req, res) => {
         pages,
       }));
     } catch (e) {
+      console.error("[CRAWL ERROR]", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
