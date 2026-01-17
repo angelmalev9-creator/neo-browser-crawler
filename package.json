@@ -1,8 +1,1 @@
-{
-  "name": "neo-browser-crawler",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "playwright": "^1.41.0"
-  }
-}
+{ "name": "neo-browser-crawler", "private": true, "type": "module", "dependencies": { "playwright": "^1.41.0", "xml2js": "^0.6.2" } }
