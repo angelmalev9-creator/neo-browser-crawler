@@ -36,7 +36,7 @@ async function fetchText(url, timeout = 15000) {
 }
 
 /* =========================
-   SITEMAPS (robots + fallback)
+   SITEMAPS
 ========================= */
 async function getSitemaps(base) {
   const robots = await fetchText(`${base}/robots.txt`);
@@ -77,9 +77,6 @@ async function getSitemaps(base) {
   return valid;
 }
 
-/* =========================
-   SITEMAP PARSER
-========================= */
 async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
   if (depth > MAX_SITEMAP_DEPTH) return [];
   if (seen.has(url)) return [];
@@ -114,7 +111,7 @@ async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
 }
 
 /* =========================
-   PAGE SCRAPE (TEXT-ONLY)
+   PAGE SCRAPE (REAL CONTENT ONLY)
 ========================= */
 async function scrapePage(context, url) {
   const page = await context.newPage();
@@ -124,17 +121,27 @@ async function scrapePage(context, url) {
       timeout: PAGE_TIMEOUT,
     });
 
-    // взимаме текст БЕЗ scroll
-    const text = clean(
-      await page.evaluate(() => document.body?.innerText || "")
+    // Взимаме САМО смислен content
+    const contentText = clean(
+      await page.evaluate(() => {
+        const blocks = Array.from(
+          document.querySelectorAll(
+            "main article p, main article h1, main article h2, main article h3, " +
+            "main p, main h1, main h2, main h3, " +
+            "article p, article h1, article h2, article h3"
+          )
+        );
+
+        return blocks.map(b => b.innerText).join(" ");
+      })
     );
 
-    if (countWords(text) < MIN_WORDS) {
+    if (countWords(contentText) < MIN_WORDS) {
       return null;
     }
 
     const title = clean(await page.title());
-    return { url, title, content: text };
+    return { url, title, content: contentText };
   } catch {
     return null;
   } finally {
@@ -143,7 +150,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN CRAWLER
+   MAIN
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -214,7 +221,7 @@ async function crawlSite(startUrl) {
 }
 
 /* =========================
-   HTTP SERVER
+   HTTP
 ========================= */
 http.createServer((req, res) => {
   if (req.method !== "POST") {
