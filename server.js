@@ -6,10 +6,13 @@ const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
+const FAST_TEXT_THRESHOLD = 120;
+const PAGE_TIMEOUT = 15000;
 const MAX_SITEMAP_DEPTH = 3;
 
+// режем image/media URL-и още от sitemap
 const SKIP_PATH_RE =
-  /gallery|portfolio|projects|images|media|photo|video|album|wp-content|uploads/i;
+  /gallery|portfolio|projects|images|media|photo|video|album|attachment|wp-content|uploads/i;
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
@@ -32,36 +35,32 @@ async function fetchText(url, timeout = 15000) {
 }
 
 /* =========================
-   ROBOTS → SITEMAPS
+   ROBOTS + FALLBACK
 ========================= */
-async function getSitemapsFromRobots(base) {
-  const txt = await fetchText(`${base}/robots.txt`);
-  if (!txt) return [];
+async function getSitemaps(base) {
+  const robots = await fetchText(`${base}/robots.txt`);
+  let found = [];
 
-  const sitemaps = txt
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l.toLowerCase().startsWith("sitemap:"))
-    .map(l => l.split(":").slice(1).join(":").trim());
+  if (robots) {
+    found = robots
+      .split("\n")
+      .map(l => l.trim())
+      .filter(l => l.toLowerCase().startsWith("sitemap:"))
+      .map(l => l.split(":").slice(1).join(":").trim());
+  }
 
-  console.log(`[ROBOTS] Found ${sitemaps.length} sitemaps`);
-  return sitemaps;
-}
+  if (found.length) {
+    console.log(`[ROBOTS] Found ${found.length} sitemaps`);
+    return found;
+  }
 
-/* =========================
-   SITEMAP FALLBACK
-========================= */
-async function discoverSitemaps(base) {
-  const fromRobots = await getSitemapsFromRobots(base);
-  if (fromRobots.length) return fromRobots;
+  console.log("[SITEMAP] Robots empty → trying fallbacks");
 
   const candidates = [
     "/sitemap.xml",
     "/sitemap_index.xml",
-    "/wp-sitemap.xml"
+    "/wp-sitemap.xml",
   ].map(p => `${base}${p}`);
-
-  console.log("[SITEMAP] Robots empty → trying fallbacks");
 
   const valid = [];
   for (const url of candidates) {
@@ -78,7 +77,7 @@ async function discoverSitemaps(base) {
 }
 
 /* =========================
-   SITEMAP PARSER (recursive)
+   SITEMAP PARSER
 ========================= */
 async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
   if (depth > MAX_SITEMAP_DEPTH) return [];
@@ -115,25 +114,38 @@ async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
 }
 
 /* =========================
-   PAGE SCRAPE
+   PAGE SCRAPE (FAST EXIT)
 ========================= */
 async function scrapePage(context, url) {
   const page = await context.newPage();
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: PAGE_TIMEOUT,
+    });
 
-    for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollBy(0, 1500));
-      await page.waitForTimeout(400);
+    // ⚡ бърз check без scroll
+    const initialText = clean(
+      await page.evaluate(() => document.body?.innerText || "")
+    );
+
+    if (initialText.length < FAST_TEXT_THRESHOLD) {
+      return null;
     }
 
-    const title = clean(await page.title());
+    // scroll само ако има смисъл
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await page.waitForTimeout(300);
+    }
+
     const text = clean(
       await page.evaluate(() => document.body?.innerText || "")
     );
 
     if (text.length < MIN_TEXT_CHARS) return null;
 
+    const title = clean(await page.title());
     return { url, title, content: text };
   } catch {
     return null;
@@ -143,7 +155,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN CRAWLER
+   MAIN
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -163,24 +175,21 @@ async function crawlSite(startUrl) {
   const visited = new Set();
   const pages = [];
 
-  const sitemaps = await discoverSitemaps(base);
+  const sitemaps = await getSitemaps(base);
   if (!sitemaps.length) {
-    console.log("[SITEMAP] No sitemap found at all");
     await browser.close();
     return [];
   }
 
   let urls = [];
   for (const sm of sitemaps) {
-    const extracted = await extractUrlsFromSitemap(sm);
-    urls.push(...extracted);
+    urls.push(...await extractUrlsFromSitemap(sm));
   }
 
   urls = urls.filter(u => {
     try {
-      const o = new URL(u).origin;
       return (
-        o === base &&
+        new URL(u).origin === base &&
         !SKIP_PATH_RE.test(u)
       );
     } catch {
@@ -208,7 +217,7 @@ async function crawlSite(startUrl) {
 }
 
 /* =========================
-   HTTP SERVER
+   HTTP
 ========================= */
 http.createServer((req, res) => {
   if (req.method !== "POST") {
