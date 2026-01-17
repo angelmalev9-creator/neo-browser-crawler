@@ -5,17 +5,18 @@ import { parseStringPromise } from "xml2js";
 const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 70;
-const MIN_TEXT_CHARS = 300;
-const FAST_TEXT_THRESHOLD = 120;
 const PAGE_TIMEOUT = 15000;
+const MIN_WORDS = 10;
 const MAX_SITEMAP_DEPTH = 3;
 
-// режем image/media URL-и още от sitemap
 const SKIP_PATH_RE =
   /gallery|portfolio|projects|images|media|photo|video|album|attachment|wp-content|uploads/i;
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+
+const countWords = (text) =>
+  text.split(/\s+/).filter(w => w.length > 2).length;
 
 /* =========================
    FETCH
@@ -35,7 +36,7 @@ async function fetchText(url, timeout = 15000) {
 }
 
 /* =========================
-   ROBOTS + FALLBACK
+   SITEMAPS (robots + fallback)
 ========================= */
 async function getSitemaps(base) {
   const robots = await fetchText(`${base}/robots.txt`);
@@ -95,8 +96,7 @@ async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
       for (const sm of parsed.sitemapindex.sitemap) {
         const loc = sm.loc?.[0];
         if (!loc) continue;
-        const urls = await extractUrlsFromSitemap(loc, depth + 1, seen);
-        all.push(...urls);
+        all.push(...await extractUrlsFromSitemap(loc, depth + 1, seen));
       }
       return all;
     }
@@ -114,7 +114,7 @@ async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
 }
 
 /* =========================
-   PAGE SCRAPE (FAST EXIT)
+   PAGE SCRAPE (TEXT-ONLY)
 ========================= */
 async function scrapePage(context, url) {
   const page = await context.newPage();
@@ -124,26 +124,14 @@ async function scrapePage(context, url) {
       timeout: PAGE_TIMEOUT,
     });
 
-    // ⚡ бърз check без scroll
-    const initialText = clean(
-      await page.evaluate(() => document.body?.innerText || "")
-    );
-
-    if (initialText.length < FAST_TEXT_THRESHOLD) {
-      return null;
-    }
-
-    // scroll само ако има смисъл
-    for (let i = 0; i < 2; i++) {
-      await page.evaluate(() => window.scrollBy(0, 1200));
-      await page.waitForTimeout(300);
-    }
-
+    // взимаме текст БЕЗ scroll
     const text = clean(
       await page.evaluate(() => document.body?.innerText || "")
     );
 
-    if (text.length < MIN_TEXT_CHARS) return null;
+    if (countWords(text) < MIN_WORDS) {
+      return null;
+    }
 
     const title = clean(await page.title());
     return { url, title, content: text };
@@ -155,7 +143,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN
+   MAIN CRAWLER
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -164,6 +152,15 @@ async function crawlSite(startUrl) {
   });
 
   const context = await browser.newContext();
+
+  // 🚫 BLOCK IMAGES / MEDIA / FONTS
+  await context.route("**/*", route => {
+    const type = route.request().resourceType();
+    if (type === "image" || type === "media" || type === "font") {
+      return route.abort();
+    }
+    route.continue();
+  });
 
   const tmp = await context.newPage();
   await tmp.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -217,7 +214,7 @@ async function crawlSite(startUrl) {
 }
 
 /* =========================
-   HTTP
+   HTTP SERVER
 ========================= */
 http.createServer((req, res) => {
   if (req.method !== "POST") {
