@@ -7,51 +7,56 @@ const PORT = Number(process.env.PORT || 10000);
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
 
-const SKIP_RE =
-  /gallery|portfolio|projects|images|media|photo|video|work|album|wp-content|uploads/i;
+const SKIP_PATH_RE =
+  /gallery|portfolio|projects|images|media|photo|video|album|wp-content|uploads/i;
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
 /* =========================
-   URL NORMALIZATION (KEY FIX)
+   FETCH HELPERS
 ========================= */
-function normalizeUrl(url) {
+async function fetchText(url, timeout = 15000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
   try {
-    const u = new URL(url);
-    u.hash = "";
-    u.search = "";
-    return u.toString().replace(/\/$/, "");
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.text();
   } catch {
     return null;
+  } finally {
+    clearTimeout(id);
   }
 }
 
-function sameDomain(a, b) {
-  return (
-    a.replace(/^https?:\/\/(www\.)?/, "") ===
-    b.replace(/^https?:\/\/(www\.)?/, "")
-  );
+/* =========================
+   ROBOTS → SITEMAPS
+========================= */
+async function getSitemapsFromRobots(base) {
+  const txt = await fetchText(`${base}/robots.txt`);
+  if (!txt) return [];
+
+  const lines = txt.split("\n");
+  const sitemaps = lines
+    .map((l) => l.trim())
+    .filter((l) => l.toLowerCase().startsWith("sitemap:"))
+    .map((l) => l.split(":").slice(1).join(":").trim());
+
+  console.log(`[ROBOTS] Found ${sitemaps.length} sitemaps`);
+  return sitemaps;
 }
 
-/* =========================
-   SITEMAP
-========================= */
-async function getSitemapUrls(origin) {
+async function extractUrlsFromSitemap(sitemapUrl) {
+  const xml = await fetchText(sitemapUrl);
+  if (!xml) return [];
+
   try {
-    const res = await fetch(`${origin}/sitemap.xml`, { timeout: 15000 });
-    if (!res.ok) return [];
-
-    const xml = await res.text();
     const parsed = await parseStringPromise(xml);
-
     const urls =
       parsed?.urlset?.url?.map((u) => u.loc?.[0]).filter(Boolean) || [];
-
-    console.log(`[SITEMAP] Found ${urls.length} urls`);
-    return urls.map(normalizeUrl).filter(Boolean);
+    return urls;
   } catch {
-    console.log("[SITEMAP] No sitemap");
     return [];
   }
 }
@@ -66,7 +71,7 @@ async function scrapePage(context, url) {
 
     for (let i = 0; i < 3; i++) {
       await page.evaluate(() => window.scrollBy(0, 1500));
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(400);
     }
 
     const title = clean(await page.title());
@@ -85,7 +90,7 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   MAIN CRAWL (FIXED)
+   MAIN CRAWLER
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -95,26 +100,40 @@ async function crawlSite(startUrl) {
 
   const context = await browser.newContext();
 
-  const start = normalizeUrl(startUrl);
+  // normalize canonical domain
+  const tmp = await context.newPage();
+  await tmp.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  const base = new URL(tmp.url()).origin;
+  await tmp.close();
+
+  console.log(`[CRAWL] Canonical base: ${base}`);
+
   const visited = new Set();
   const pages = [];
 
-  const sitemapUrls = await getSitemapUrls(start);
-  const queue = [...new Set([start, ...sitemapUrls])];
+  // 1️⃣ robots.txt → sitemaps
+  const sitemapIndexes = await getSitemapsFromRobots(base);
 
-  console.log(`[CRAWL] Queue size: ${queue.length}`);
+  let sitemapUrls = [];
+  for (const sm of sitemapIndexes) {
+    const urls = await extractUrlsFromSitemap(sm);
+    sitemapUrls.push(...urls);
+  }
 
-  for (const rawUrl of queue) {
+  sitemapUrls = sitemapUrls.filter(
+    (u) =>
+      u.startsWith(base) &&
+      !SKIP_PATH_RE.test(u)
+  );
+
+  console.log(`[SITEMAP] URLs after filter: ${sitemapUrls.length}`);
+
+  // 2️⃣ scrape sitemap urls first
+  for (const url of sitemapUrls) {
     if (pages.length >= MAX_PAGES) break;
-
-    const url = normalizeUrl(rawUrl);
-    if (!url) continue;
     if (visited.has(url)) continue;
-    if (SKIP_RE.test(url)) continue;
-    if (!sameDomain(url, start)) continue;
 
     visited.add(url);
-
     const data = await scrapePage(context, url);
     if (!data) continue;
 
@@ -122,40 +141,9 @@ async function crawlSite(startUrl) {
     console.log(`[CRAWL] +${pages.length}: ${url}`);
   }
 
-  /* BFS fallback – реални линкове */
-  if (pages.length < 10) {
-    console.log("[CRAWL] BFS fallback");
-
-    const page = await context.newPage();
-    await page.goto(start, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    const links = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("a[href]"))
-        .map((a) => a.href)
-        .filter(Boolean)
-    );
-    await page.close();
-
-    for (const l of links) {
-      if (pages.length >= MAX_PAGES) break;
-
-      const url = normalizeUrl(l);
-      if (!url) continue;
-      if (visited.has(url)) continue;
-      if (!sameDomain(url, start)) continue;
-      if (SKIP_RE.test(url)) continue;
-
-      visited.add(url);
-
-      const data = await scrapePage(context, url);
-      if (!data) continue;
-
-      pages.push(data);
-      console.log(`[CRAWL] +${pages.length}: ${url}`);
-    }
-  }
-
   await browser.close();
+
+  console.log(`[DONE] Total pages scraped: ${pages.length}`);
   return pages;
 }
 
@@ -177,7 +165,6 @@ http
         if (!url) throw new Error("Missing url");
 
         console.log(`[CRAWL] Start ${url}`);
-
         const pages = await crawlSite(url);
 
         res.writeHead(200, { "Content-Type": "application/json" });
