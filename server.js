@@ -5,7 +5,7 @@ const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 50;
 const PAGE_TIMEOUT = 15000;
-const MIN_WORDS = 10;
+const MIN_WORDS = 50; // ⬅️ ВАЖНО: минимум 50 думи
 
 const SKIP_URL_RE =
   /\/(wp-content|uploads|media|images|gallery|video|photo|attachment)/i;
@@ -37,7 +37,7 @@ async function extractVisibleText(page) {
 }
 
 /* =========================
-   MAIN CRAWLER
+   MAIN CRAWLER (CLICK-BASED)
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -47,7 +47,7 @@ async function crawlSite(startUrl) {
 
   const context = await browser.newContext();
 
-  // 🚫 BLOCK MEDIA
+  // 🚫 BLOCK IMAGES / MEDIA / FONTS
   await context.route("**/*", route => {
     const type = route.request().resourceType();
     if (["image", "media", "font"].includes(type)) {
@@ -61,8 +61,8 @@ async function crawlSite(startUrl) {
 
   const base = new URL(page.url()).origin;
 
-  const visited = new Set();          // ❗ празно
-  const queue = [page.url()];         // стартов URL
+  const visited = new Set();
+  const queue = [page.url()];
   const pages = [];
 
   console.log(`[CRAWL] Start from ${page.url()}`);
@@ -71,22 +71,23 @@ async function crawlSite(startUrl) {
     const url = queue.shift();
     if (!url || visited.has(url)) continue;
 
-    visited.add(url); // ✅ маркираме ТУК
+    visited.add(url);
 
     try {
       await page.goto(url, { timeout: PAGE_TIMEOUT });
 
       const text = await extractVisibleText(page);
+      const words = countWords(text);
 
-      if (countWords(text) >= MIN_WORDS) {
+      if (words >= MIN_WORDS) {
         pages.push({
           url,
           title: clean(await page.title()),
           content: text,
         });
-        console.log(`[SAVE] ${pages.length}: ${url}`);
+        console.log(`[SAVE] ${pages.length}: ${url} (${words} words)`);
       } else {
-        console.log(`[SKIP] no text: ${url}`);
+        console.log(`[SKIP] ${url} (${words} words)`);
       }
 
       // collect clickable targets
@@ -115,7 +116,7 @@ async function crawlSite(startUrl) {
         } catch {}
       }
 
-    } catch (e) {
+    } catch {
       console.log(`[ERROR] ${url}`);
       continue;
     }
