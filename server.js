@@ -6,6 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
+const MAX_SITEMAP_DEPTH = 3;
 
 const SKIP_PATH_RE =
   /gallery|portfolio|projects|images|media|photo|video|album|wp-content|uploads/i;
@@ -14,7 +15,7 @@ const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
 /* =========================
-   FETCH HELPERS
+   FETCH
 ========================= */
 async function fetchText(url, timeout = 15000) {
   const controller = new AbortController();
@@ -37,25 +38,52 @@ async function getSitemapsFromRobots(base) {
   const txt = await fetchText(`${base}/robots.txt`);
   if (!txt) return [];
 
-  const lines = txt.split("\n");
-  const sitemaps = lines
-    .map((l) => l.trim())
-    .filter((l) => l.toLowerCase().startsWith("sitemap:"))
-    .map((l) => l.split(":").slice(1).join(":").trim());
+  const sitemaps = txt
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.toLowerCase().startsWith("sitemap:"))
+    .map(l => l.split(":").slice(1).join(":").trim());
 
   console.log(`[ROBOTS] Found ${sitemaps.length} sitemaps`);
   return sitemaps;
 }
 
-async function extractUrlsFromSitemap(sitemapUrl) {
-  const xml = await fetchText(sitemapUrl);
+/* =========================
+   SITEMAP PARSER (recursive)
+========================= */
+async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
+  if (depth > MAX_SITEMAP_DEPTH) return [];
+  if (seen.has(url)) return [];
+  seen.add(url);
+
+  const xml = await fetchText(url);
   if (!xml) return [];
 
   try {
     const parsed = await parseStringPromise(xml);
-    const urls =
-      parsed?.urlset?.url?.map((u) => u.loc?.[0]).filter(Boolean) || [];
-    return urls;
+
+    // sitemapindex → recurse
+    if (parsed?.sitemapindex?.sitemap) {
+      const nested = parsed.sitemapindex.sitemap
+        .map(s => s.loc?.[0])
+        .filter(Boolean);
+
+      let all = [];
+      for (const sm of nested) {
+        const urls = await extractUrlsFromSitemap(sm, depth + 1, seen);
+        all.push(...urls);
+      }
+      return all;
+    }
+
+    // urlset → actual pages
+    if (parsed?.urlset?.url) {
+      return parsed.urlset.url
+        .map(u => u.loc?.[0])
+        .filter(Boolean);
+    }
+
+    return [];
   } catch {
     return [];
   }
@@ -100,7 +128,6 @@ async function crawlSite(startUrl) {
 
   const context = await browser.newContext();
 
-  // normalize canonical domain
   const tmp = await context.newPage();
   await tmp.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   const base = new URL(tmp.url()).origin;
@@ -108,10 +135,11 @@ async function crawlSite(startUrl) {
 
   console.log(`[CRAWL] Canonical base: ${base}`);
 
+  const baseOrigin = new URL(base).origin;
+
   const visited = new Set();
   const pages = [];
 
-  // 1️⃣ robots.txt → sitemaps
   const sitemapIndexes = await getSitemapsFromRobots(base);
 
   let sitemapUrls = [];
@@ -120,15 +148,20 @@ async function crawlSite(startUrl) {
     sitemapUrls.push(...urls);
   }
 
-  sitemapUrls = sitemapUrls.filter(
-    (u) =>
-      u.startsWith(base) &&
-      !SKIP_PATH_RE.test(u)
-  );
+  sitemapUrls = sitemapUrls.filter(u => {
+    try {
+      const o = new URL(u).origin;
+      return (
+        o === baseOrigin &&
+        !SKIP_PATH_RE.test(u)
+      );
+    } catch {
+      return false;
+    }
+  });
 
   console.log(`[SITEMAP] URLs after filter: ${sitemapUrls.length}`);
 
-  // 2️⃣ scrape sitemap urls first
   for (const url of sitemapUrls) {
     if (pages.length >= MAX_PAGES) break;
     if (visited.has(url)) continue;
@@ -158,7 +191,7 @@ http
     }
 
     let body = "";
-    req.on("data", (c) => (body += c));
+    req.on("data", c => (body += c));
     req.on("end", async () => {
       try {
         const { url } = JSON.parse(body || "{}");
@@ -168,13 +201,11 @@ http
         const pages = await crawlSite(url);
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: true,
-            pagesCount: pages.length,
-            pages,
-          })
-        );
+        res.end(JSON.stringify({
+          success: true,
+          pagesCount: pages.length,
+          pages,
+        }));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: false, error: e.message }));
