@@ -4,9 +4,9 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // DETAIL-FIRST LIMITS
-const MAX_SECONDS = 45;            // ⬅️ увеличен hard deadline
+const MAX_SECONDS = 45;
 const MIN_WORDS = 30;
-const MAX_CHILD_PER_PAGE = 4;      // ⬅️ повече детайли на страница
+const MAX_CHILD_PER_PAGE = 4;
 
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
@@ -15,48 +15,74 @@ const clean = (t = "") => t.replace(/\s+/g, " ").trim();
 const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 
 /* =========================
-   TEXT EXTRACTOR (ROBUST)
+   PAGE TYPE DETECTOR (SAFE)
 ========================= */
-async function extractText(page) {
+function detectPageType(url = "", title = "") {
+  const u = url.toLowerCase();
+  const t = title.toLowerCase();
+
+  if (/za-nas|about/.test(u + t)) return "about";
+  if (/uslugi|services/.test(u + t)) return "services";
+  if (/kontakti|contact/.test(u + t)) return "contact";
+  if (/blog|news|articles/.test(u + t)) return "blog";
+  return "general";
+}
+
+/* =========================
+   STRUCTURED EXTRACTOR
+========================= */
+async function extractStructured(page) {
   try {
-    await page.waitForSelector(
-      ".elementor-text-editor, p, h1",
-      { timeout: 3000 }
-    );
+    await page.waitForSelector("main, article, p", { timeout: 3000 });
   } catch {}
 
-  return clean(
-    await page.evaluate(() => {
-      const bad = ["header", "footer", "nav", "aside"];
+  return await page.evaluate(() => {
+    const bad = ["header", "footer", "nav", "aside"];
 
-      const nodes = document.querySelectorAll(
-        ".elementor-text-editor, " +
-        ".elementor-widget-text-editor, " +
-        "[data-widget_type='text-editor.default'], " +
-        "main p, main h1, main h2, main h3, main li, " +
-        "article p, article h1, article h2, article h3, article li"
-      );
+    bad.forEach(sel => {
+      document.querySelectorAll(sel).forEach(n => n.remove());
+    });
 
-      let text = Array.from(nodes)
-        .filter(el =>
-          el.offsetParent !== null &&
-          !el.closest(bad.join(","))
-        )
-        .map(el => el.innerText)
-        .join(" ");
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3")
+    )
+      .filter(h => h.offsetParent !== null)
+      .map(h => h.innerText.trim());
 
-      // fallback ако Elementor още не е хидратирал
-      if (text.length < 120) {
-        const clone = document.body.cloneNode(true);
-        clone
-          .querySelectorAll("header, footer, nav, aside")
-          .forEach(n => n.remove());
-        text = clone.innerText || "";
+    const sections = [];
+    let current = null;
+
+    document
+      .querySelectorAll("h1, h2, h3, p, li")
+      .forEach(el => {
+        if (el.tagName.startsWith("H")) {
+          current = { heading: el.innerText.trim(), text: "" };
+          sections.push(current);
+        } else if (current) {
+          current.text += " " + el.innerText;
+        }
+      });
+
+    const content = document.body.innerText || "";
+
+    const summary = [];
+    document.querySelectorAll("p, li").forEach(el => {
+      const t = el.innerText.trim();
+      if (t.length > 60 && summary.length < 5) {
+        summary.push(t);
       }
+    });
 
-      return text;
-    })
-  );
+    return {
+      headings,
+      sections: sections.map(s => ({
+        heading: s.heading,
+        text: s.text.trim(),
+      })),
+      summary,
+      content,
+    };
+  });
 }
 
 /* =========================
@@ -77,7 +103,7 @@ async function collectNavLinks(page, base) {
 }
 
 /* =========================
-   COLLECT CONTENT LINKS (DETAIL)
+   COLLECT CONTENT LINKS
 ========================= */
 async function collectContentLinks(page, base) {
   return await page.evaluate((base) => {
@@ -106,7 +132,6 @@ async function crawlSmart(startUrl) {
 
   const context = await browser.newContext();
 
-  // 🚫 BLOCK HEAVY RESOURCES
   await context.route("**/*", route => {
     const type = route.request().resourceType();
     if (["image", "media", "font"].includes(type)) {
@@ -124,7 +149,6 @@ async function crawlSmart(startUrl) {
 
   console.log(`[CRAWL] Start from ${page.url()}`);
 
-  // STEP 1: NAV PAGES
   let targets = await collectNavLinks(page, base);
   targets.unshift(page.url());
 
@@ -141,19 +165,25 @@ async function crawlSmart(startUrl) {
     try {
       await page.goto(url, { timeout: 12000 });
 
-      const text = await extractText(page);
-      const words = countWords(text);
+      const title = clean(await page.title());
+      const data = await extractStructured(page);
+      const words = countWords(data.content);
 
       if (words < MIN_WORDS) continue;
 
       pages.push({
         url,
-        title: clean(await page.title()),
-        content: text,
+        title,
+        pageType: detectPageType(url, title),
+        headings: data.headings,
+        sections: data.sections,
+        summary: data.summary,
+        content: clean(data.content),
+        wordCount: words,
       });
+
       console.log(`[SAVE] ${url} (${words} words)`);
 
-      // STEP 2: DETAIL PAGES (DEPTH = 2)
       const children = await collectContentLinks(page, base);
       let taken = 0;
 
@@ -169,20 +199,24 @@ async function crawlSmart(startUrl) {
         try {
           await page.goto(child, { timeout: 10000 });
 
-          const childText = await extractText(page);
-          const childWords = countWords(childText);
+          const cTitle = clean(await page.title());
+          const cData = await extractStructured(page);
+          const cWords = countWords(cData.content);
 
-          if (childWords < MIN_WORDS) continue;
+          if (cWords < MIN_WORDS) continue;
 
           pages.push({
             url: child,
-            title: clean(await page.title()),
-            content: childText,
+            title: cTitle,
+            pageType: detectPageType(child, cTitle),
+            headings: cData.headings,
+            sections: cData.sections,
+            summary: cData.summary,
+            content: clean(cData.content),
+            wordCount: cWords,
           });
 
-          console.log(
-            `[DETAIL] ${child} (${childWords} words)`
-          );
+          console.log(`[DETAIL] ${child} (${cWords} words)`);
         } catch {}
       }
 
