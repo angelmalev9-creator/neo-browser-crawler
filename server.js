@@ -9,10 +9,16 @@ const MAX_PAGES_HARD = 120;
 const BLOCK_RE = /privacy|cookie|terms|policy|login|register|gdpr/i;
 
 const clean = (t = "") =>
-  t
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+
+const normalizeHost = (url) => {
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+};
 
 /* =========================
    SITEMAP PARSER
@@ -24,16 +30,14 @@ async function extractUrlsFromSitemap(sitemapUrl) {
     const xml = await res.text();
     const parsed = await xml2js.parseStringPromise(xml);
 
-    const urls = [];
+    let urls = [];
 
-    // normal sitemap
     if (parsed.urlset?.url) {
       for (const u of parsed.urlset.url) {
         if (u.loc?.[0]) urls.push(u.loc[0]);
       }
     }
 
-    // sitemap index (nested)
     if (parsed.sitemapindex?.sitemap) {
       for (const sm of parsed.sitemapindex.sitemap) {
         if (sm.loc?.[0]) {
@@ -63,27 +67,32 @@ async function crawl(startUrl, maxPages) {
   const queue = [];
   const pages = [];
 
-  const origin = new URL(startUrl).origin;
+  const rootHost = normalizeHost(startUrl);
 
   console.log("[CRAWL] Start:", startUrl);
 
-  // 1️⃣ Load sitemap URLs first
-  const sitemapUrls = await extractUrlsFromSitemap(`${origin}/sitemap.xml`);
+  // 1️⃣ Load sitemap
+  const sitemapUrls = await extractUrlsFromSitemap(
+    `${new URL(startUrl).origin}/sitemap.xml`
+  );
+
   console.log("[SITEMAP] Found:", sitemapUrls.length);
 
   for (const u of sitemapUrls) {
-    if (u.startsWith(origin) && !BLOCK_RE.test(u)) {
+    if (
+      normalizeHost(u) === rootHost &&
+      !BLOCK_RE.test(u)
+    ) {
       queue.push(u);
     }
   }
 
-  // fallback: homepage
   if (!queue.length) queue.push(startUrl);
 
-  // 2️⃣ Crawl queue
+  // 2️⃣ Crawl
   while (queue.length && pages.length < maxPages) {
     const url = queue.shift();
-    if (!url || visited.has(url) || BLOCK_RE.test(url)) continue;
+    if (!url || visited.has(url)) continue;
     visited.add(url);
 
     let page;
@@ -91,7 +100,6 @@ async function crawl(startUrl, maxPages) {
       page = await context.newPage();
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-      // scroll for SPA / lazy content
       for (let i = 0; i < 5; i++) {
         await page.evaluate(() => window.scrollBy(0, 1600));
         await page.waitForTimeout(400);
@@ -107,7 +115,6 @@ async function crawl(startUrl, maxPages) {
         console.log("[CRAWL] Added:", pages.length, url);
       }
 
-      // discover internal links dynamically
       const links = await page.evaluate(() =>
         Array.from(document.querySelectorAll("a[href]"))
           .map((a) => a.href)
@@ -116,19 +123,16 @@ async function crawl(startUrl, maxPages) {
 
       for (const l of links) {
         try {
-          const u = new URL(l);
           if (
-            u.origin === origin &&
-            !visited.has(u.href) &&
-            !BLOCK_RE.test(u.href) &&
-            queue.length < maxPages * 2
+            normalizeHost(l) === rootHost &&
+            !visited.has(l) &&
+            !BLOCK_RE.test(l)
           ) {
-            queue.push(u.href);
+            queue.push(l);
           }
         } catch {}
       }
     } catch {
-      // skip broken pages
     } finally {
       if (page) await page.close();
     }
@@ -139,7 +143,7 @@ async function crawl(startUrl, maxPages) {
 }
 
 /* =========================
-   HTTP SERVER
+   SERVER
 ========================= */
 http
   .createServer((req, res) => {
