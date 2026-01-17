@@ -49,6 +49,35 @@ async function getSitemapsFromRobots(base) {
 }
 
 /* =========================
+   SITEMAP FALLBACK
+========================= */
+async function discoverSitemaps(base) {
+  const fromRobots = await getSitemapsFromRobots(base);
+  if (fromRobots.length) return fromRobots;
+
+  const candidates = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/wp-sitemap.xml"
+  ].map(p => `${base}${p}`);
+
+  console.log("[SITEMAP] Robots empty → trying fallbacks");
+
+  const valid = [];
+  for (const url of candidates) {
+    const xml = await fetchText(url);
+    if (!xml) continue;
+    try {
+      await parseStringPromise(xml);
+      console.log(`[SITEMAP] Found via fallback: ${url}`);
+      valid.push(url);
+    } catch {}
+  }
+
+  return valid;
+}
+
+/* =========================
    SITEMAP PARSER (recursive)
 ========================= */
 async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
@@ -62,21 +91,17 @@ async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
   try {
     const parsed = await parseStringPromise(xml);
 
-    // sitemapindex → recurse
     if (parsed?.sitemapindex?.sitemap) {
-      const nested = parsed.sitemapindex.sitemap
-        .map(s => s.loc?.[0])
-        .filter(Boolean);
-
       let all = [];
-      for (const sm of nested) {
-        const urls = await extractUrlsFromSitemap(sm, depth + 1, seen);
+      for (const sm of parsed.sitemapindex.sitemap) {
+        const loc = sm.loc?.[0];
+        if (!loc) continue;
+        const urls = await extractUrlsFromSitemap(loc, depth + 1, seen);
         all.push(...urls);
       }
       return all;
     }
 
-    // urlset → actual pages
     if (parsed?.urlset?.url) {
       return parsed.urlset.url
         .map(u => u.loc?.[0])
@@ -135,24 +160,27 @@ async function crawlSite(startUrl) {
 
   console.log(`[CRAWL] Canonical base: ${base}`);
 
-  const baseOrigin = new URL(base).origin;
-
   const visited = new Set();
   const pages = [];
 
-  const sitemapIndexes = await getSitemapsFromRobots(base);
-
-  let sitemapUrls = [];
-  for (const sm of sitemapIndexes) {
-    const urls = await extractUrlsFromSitemap(sm);
-    sitemapUrls.push(...urls);
+  const sitemaps = await discoverSitemaps(base);
+  if (!sitemaps.length) {
+    console.log("[SITEMAP] No sitemap found at all");
+    await browser.close();
+    return [];
   }
 
-  sitemapUrls = sitemapUrls.filter(u => {
+  let urls = [];
+  for (const sm of sitemaps) {
+    const extracted = await extractUrlsFromSitemap(sm);
+    urls.push(...extracted);
+  }
+
+  urls = urls.filter(u => {
     try {
       const o = new URL(u).origin;
       return (
-        o === baseOrigin &&
+        o === base &&
         !SKIP_PATH_RE.test(u)
       );
     } catch {
@@ -160,9 +188,9 @@ async function crawlSite(startUrl) {
     }
   });
 
-  console.log(`[SITEMAP] URLs after filter: ${sitemapUrls.length}`);
+  console.log(`[SITEMAP] URLs after filter: ${urls.length}`);
 
-  for (const url of sitemapUrls) {
+  for (const url of urls) {
     if (pages.length >= MAX_PAGES) break;
     if (visited.has(url)) continue;
 
@@ -175,7 +203,6 @@ async function crawlSite(startUrl) {
   }
 
   await browser.close();
-
   console.log(`[DONE] Total pages scraped: ${pages.length}`);
   return pages;
 }
@@ -183,35 +210,33 @@ async function crawlSite(startUrl) {
 /* =========================
    HTTP SERVER
 ========================= */
-http
-  .createServer((req, res) => {
-    if (req.method !== "POST") {
-      res.writeHead(405);
-      return res.end();
+http.createServer((req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405);
+    return res.end();
+  }
+
+  let body = "";
+  req.on("data", c => (body += c));
+  req.on("end", async () => {
+    try {
+      const { url } = JSON.parse(body || "{}");
+      if (!url) throw new Error("Missing url");
+
+      console.log(`[CRAWL] Start ${url}`);
+      const pages = await crawlSite(url);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        pagesCount: pages.length,
+        pages,
+      }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: e.message }));
     }
-
-    let body = "";
-    req.on("data", c => (body += c));
-    req.on("end", async () => {
-      try {
-        const { url } = JSON.parse(body || "{}");
-        if (!url) throw new Error("Missing url");
-
-        console.log(`[CRAWL] Start ${url}`);
-        const pages = await crawlSite(url);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: true,
-          pagesCount: pages.length,
-          pages,
-        }));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-  })
-  .listen(PORT, () => {
-    console.log("Crawler running on", PORT);
   });
+}).listen(PORT, () => {
+  console.log("Crawler running on", PORT);
+});
