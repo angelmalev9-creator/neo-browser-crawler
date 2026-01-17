@@ -5,43 +5,25 @@ const PORT = Number(process.env.PORT || 10000);
 const MAX_PAGES_DEFAULT = 40;
 const MAX_PAGES_HARD = 120;
 
-/* =========================
-   URL FILTERS
-========================= */
 const BLOCK_RE =
   /privacy|policy|cookies|cookie|terms|gdpr|consent|login|register|account|cart|checkout|wishlist|compare|admin|wp-admin/i;
 
 const PRIORITY_RE =
   /price|pricing|цени|services|услуги|products|product|shop|menu|меню|booking|reservation|appointment|contact|about|за-нас/i;
 
-/* =========================
-   TEXT CLEAN
-========================= */
-const cleanText = (t = "") =>
-  t
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+const clean = (t = "") =>
+  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
-/* =========================
-   NORMALIZE URL
-========================= */
 function normalizeUrl(u) {
   try {
     const url = new URL(u);
     url.hash = "";
-    if (url.pathname.endsWith("/")) {
-      url.pathname = url.pathname.slice(0, -1);
-    }
-    return url.toString();
+    return url.toString().replace(/\/$/, "");
   } catch {
     return null;
   }
 }
 
-/* =========================
-   MAIN CRAWLER
-========================= */
 async function crawl(startUrl, maxPages) {
   const browser = await chromium.launch({
     headless: true,
@@ -52,52 +34,48 @@ async function crawl(startUrl, maxPages) {
   const baseOrigin = new URL(startUrl).origin;
 
   const visited = new Set();
-  const queue = [];
+  const queue = [startUrl];
   const pages = [];
 
-  queue.push({ url: startUrl, priority: true });
+  console.log("[CRAWLER] start:", startUrl);
 
   while (queue.length && pages.length < maxPages) {
-    const { url } = queue.shift();
-    const normalized = normalizeUrl(url);
-    if (!normalized || visited.has(normalized)) continue;
-
-    visited.add(normalized);
+    const rawUrl = queue.shift();
+    const url = normalizeUrl(rawUrl);
+    if (!url || visited.has(url)) continue;
+    visited.add(url);
 
     let page;
     try {
       page = await context.newPage();
-      await page.goto(normalized, {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
+
+      await page.goto(url, {
+        waitUntil: "networkidle",
+        timeout: 45000,
       });
 
-      // SPA / lazy load
-      for (let i = 0; i < 4; i++) {
-        await page.evaluate(() => window.scrollBy(0, 1600));
-        await page.waitForTimeout(400);
+      // force SPA render
+      for (let i = 0; i < 5; i++) {
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+        await page.waitForTimeout(600);
       }
 
-      const title = cleanText(await page.title());
-      const rawText = cleanText(
+      const title = clean(await page.title());
+      const text = clean(
         await page.evaluate(() => document.body?.innerText || "")
       );
 
-      // skip junk pages
-      if (rawText.length > 400) {
-        pages.push({
-          url: normalized,
-          title,
-          content: rawText.slice(0, 16000),
-        });
+      if (text.length > 400) {
+        pages.push({ url, title, content: text.slice(0, 16000) });
+        console.log("[CRAWLED]", pages.length, url);
       }
 
-      // extract links
+      // extract links AFTER render
       const links = await page.evaluate(() =>
-        Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => a.href)
-          .filter(Boolean)
+        Array.from(document.links).map((a) => a.href)
       );
+
+      console.log("[LINKS FOUND]", links.length, "on", url);
 
       for (const l of links) {
         const n = normalizeUrl(l);
@@ -105,33 +83,29 @@ async function crawl(startUrl, maxPages) {
 
         try {
           const u = new URL(n);
-
           if (u.origin !== baseOrigin) continue;
           if (BLOCK_RE.test(n)) continue;
           if (visited.has(n)) continue;
 
-          // priority links first
           if (PRIORITY_RE.test(n)) {
-            queue.unshift({ url: n, priority: true });
+            queue.unshift(n);
           } else if (queue.length < maxPages * 3) {
-            queue.push({ url: n, priority: false });
+            queue.push(n);
           }
         } catch {}
       }
-    } catch {
-      // skip page errors
+    } catch (e) {
+      console.log("[SKIP]", url);
     } finally {
       if (page) await page.close();
     }
   }
 
   await browser.close();
+  console.log("[DONE] pages:", pages.length);
   return pages;
 }
 
-/* =========================
-   SERVER
-========================= */
 http
   .createServer((req, res) => {
     if (req.method !== "POST") {
@@ -154,21 +128,10 @@ http
         const pages = await crawl(url, limit);
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: true,
-            pagesCount: pages.length,
-            pages,
-          })
-        );
+        res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: false,
-            error: e.message || "Crawler error",
-          })
-        );
+        res.end(JSON.stringify({ success: false, error: e.message }));
       }
     });
   })
