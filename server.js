@@ -1,156 +1,42 @@
 import http from "http";
 import { chromium } from "playwright";
-import { parseStringPromise } from "xml2js";
 
 const PORT = Number(process.env.PORT || 10000);
 
-const MAX_PAGES = 70;
+const MAX_PAGES = 50;
 const PAGE_TIMEOUT = 15000;
 const MIN_WORDS = 10;
-const MAX_SITEMAP_DEPTH = 3;
 
-const SKIP_PATH_RE =
-  /gallery|portfolio|projects|images|media|photo|video|album|attachment|wp-content|uploads/i;
+const SKIP_URL_RE =
+  /\/(wp-content|uploads|media|images|gallery|video|photo|attachment)/i;
 
 const clean = (t = "") =>
-  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  t.replace(/\s+/g, " ").trim();
 
-const countWords = (text) =>
-  text.split(/\s+/).filter(w => w.length > 2).length;
+function countWords(text) {
+  return text.split(" ").filter(w => w.length > 2).length;
+}
 
 /* =========================
-   FETCH
+   PAGE CONTENT EXTRACTOR
 ========================= */
-async function fetchText(url, timeout = 15000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null;
-    return await res.text();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(id);
-  }
+async function extractVisibleText(page) {
+  return clean(await page.evaluate(() => {
+    const selectors = [
+      "main p", "main li", "main h1", "main h2", "main h3", "main h4",
+      "article p", "article li", "article h1", "article h2", "article h3"
+    ];
+
+    const nodes = document.querySelectorAll(selectors.join(","));
+    return Array.from(nodes)
+      .filter(el => el.offsetParent !== null)
+      .map(el => el.innerText)
+      .join(" ");
+  }));
 }
 
 /* =========================
-   SITEMAPS
-========================= */
-async function getSitemaps(base) {
-  const robots = await fetchText(`${base}/robots.txt`);
-  let found = [];
-
-  if (robots) {
-    found = robots
-      .split("\n")
-      .map(l => l.trim())
-      .filter(l => l.toLowerCase().startsWith("sitemap:"))
-      .map(l => l.split(":").slice(1).join(":").trim());
-  }
-
-  if (found.length) {
-    console.log(`[ROBOTS] Found ${found.length} sitemaps`);
-    return found;
-  }
-
-  console.log("[SITEMAP] Robots empty → trying fallbacks");
-
-  const candidates = [
-    "/sitemap.xml",
-    "/sitemap_index.xml",
-    "/wp-sitemap.xml",
-  ].map(p => `${base}${p}`);
-
-  const valid = [];
-  for (const url of candidates) {
-    const xml = await fetchText(url);
-    if (!xml) continue;
-    try {
-      await parseStringPromise(xml);
-      console.log(`[SITEMAP] Found via fallback: ${url}`);
-      valid.push(url);
-    } catch {}
-  }
-
-  return valid;
-}
-
-async function extractUrlsFromSitemap(url, depth = 0, seen = new Set()) {
-  if (depth > MAX_SITEMAP_DEPTH) return [];
-  if (seen.has(url)) return [];
-  seen.add(url);
-
-  const xml = await fetchText(url);
-  if (!xml) return [];
-
-  try {
-    const parsed = await parseStringPromise(xml);
-
-    if (parsed?.sitemapindex?.sitemap) {
-      let all = [];
-      for (const sm of parsed.sitemapindex.sitemap) {
-        const loc = sm.loc?.[0];
-        if (!loc) continue;
-        all.push(...await extractUrlsFromSitemap(loc, depth + 1, seen));
-      }
-      return all;
-    }
-
-    if (parsed?.urlset?.url) {
-      return parsed.urlset.url
-        .map(u => u.loc?.[0])
-        .filter(Boolean);
-    }
-
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-/* =========================
-   PAGE SCRAPE (REAL CONTENT ONLY)
-========================= */
-async function scrapePage(context, url) {
-  const page = await context.newPage();
-  try {
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: PAGE_TIMEOUT,
-    });
-
-    // Взимаме САМО смислен content
-    const contentText = clean(
-      await page.evaluate(() => {
-        const blocks = Array.from(
-          document.querySelectorAll(
-            "main article p, main article h1, main article h2, main article h3, " +
-            "main p, main h1, main h2, main h3, " +
-            "article p, article h1, article h2, article h3"
-          )
-        );
-
-        return blocks.map(b => b.innerText).join(" ");
-      })
-    );
-
-    if (countWords(contentText) < MIN_WORDS) {
-      return null;
-    }
-
-    const title = clean(await page.title());
-    return { url, title, content: contentText };
-  } catch {
-    return null;
-  } finally {
-    await page.close();
-  }
-}
-
-/* =========================
-   MAIN
+   MAIN CRAWLER
 ========================= */
 async function crawlSite(startUrl) {
   const browser = await chromium.launch({
@@ -160,68 +46,82 @@ async function crawlSite(startUrl) {
 
   const context = await browser.newContext();
 
-  // 🚫 BLOCK IMAGES / MEDIA / FONTS
+  // 🚫 BLOCK MEDIA
   await context.route("**/*", route => {
     const type = route.request().resourceType();
-    if (type === "image" || type === "media" || type === "font") {
+    if (["image", "media", "font"].includes(type)) {
       return route.abort();
     }
     route.continue();
   });
 
-  const tmp = await context.newPage();
-  await tmp.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-  const base = new URL(tmp.url()).origin;
-  await tmp.close();
+  const page = await context.newPage();
+  await page.goto(startUrl, { timeout: PAGE_TIMEOUT });
 
-  console.log(`[CRAWL] Canonical base: ${base}`);
-
-  const visited = new Set();
+  const base = new URL(page.url()).origin;
+  const visited = new Set([page.url()]);
+  const queue = [page.url()];
   const pages = [];
 
-  const sitemaps = await getSitemaps(base);
-  if (!sitemaps.length) {
-    await browser.close();
-    return [];
-  }
+  console.log(`[CRAWL] Start from ${page.url()}`);
 
-  let urls = [];
-  for (const sm of sitemaps) {
-    urls.push(...await extractUrlsFromSitemap(sm));
-  }
-
-  urls = urls.filter(u => {
-    try {
-      return (
-        new URL(u).origin === base &&
-        !SKIP_PATH_RE.test(u)
-      );
-    } catch {
-      return false;
-    }
-  });
-
-  console.log(`[SITEMAP] URLs after filter: ${urls.length}`);
-
-  for (const url of urls) {
-    if (pages.length >= MAX_PAGES) break;
-    if (visited.has(url)) continue;
+  while (queue.length && pages.length < MAX_PAGES) {
+    const url = queue.shift();
+    if (!url || visited.has(url)) continue;
 
     visited.add(url);
-    const data = await scrapePage(context, url);
-    if (!data) continue;
 
-    pages.push(data);
-    console.log(`[CRAWL] +${pages.length}: ${url}`);
+    try {
+      await page.goto(url, { timeout: PAGE_TIMEOUT });
+
+      const text = await extractVisibleText(page);
+      if (countWords(text) >= MIN_WORDS) {
+        pages.push({
+          url,
+          title: clean(await page.title()),
+          content: text,
+        });
+        console.log(`[SAVE] ${pages.length}: ${url}`);
+      }
+
+      // collect clickable targets
+      const links = await page.evaluate(() => {
+        const els = [
+          ...document.querySelectorAll("a[href]"),
+          ...document.querySelectorAll("button"),
+          ...document.querySelectorAll("[role='button']")
+        ];
+
+        return els
+          .map(el => el.href || el.getAttribute("data-href"))
+          .filter(Boolean);
+      });
+
+      for (const link of links) {
+        try {
+          const u = new URL(link, base).href;
+          if (
+            u.startsWith(base) &&
+            !visited.has(u) &&
+            !SKIP_URL_RE.test(u)
+          ) {
+            queue.push(u);
+          }
+        } catch {}
+      }
+
+    } catch {
+      continue;
+    }
   }
 
   await browser.close();
-  console.log(`[DONE] Total pages scraped: ${pages.length}`);
+  console.log(`[DONE] Pages saved: ${pages.length}`);
   return pages;
 }
 
 /* =========================
-   HTTP
+   HTTP SERVER
 ========================= */
 http.createServer((req, res) => {
   if (req.method !== "POST") {
@@ -230,13 +130,12 @@ http.createServer((req, res) => {
   }
 
   let body = "";
-  req.on("data", c => (body += c));
+  req.on("data", c => body += c);
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
       if (!url) throw new Error("Missing url");
 
-      console.log(`[CRAWL] Start ${url}`);
       const pages = await crawlSite(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
