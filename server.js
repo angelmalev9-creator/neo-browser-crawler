@@ -1,140 +1,131 @@
 import http from "http";
 import { chromium } from "playwright";
+import { parseStringPromise } from "xml2js";
 
 const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 70;
-const MAX_VISITS = 120;
-const MIN_TEXT_CHARS = 300;
+const MIN_TEXT_CHARS = 400;
 
-// 🔴 Блокирани пътища (галерии, проекти, медии)
-const BLOCK_PATH_RE =
-  /(gallery|portfolio|projects?|media|images?|video|slider|wp-content)/i;
+const ALLOWED_RE =
+  /(about|za-nas|services|uslugi|pricing|prices|ceni|tseni|contact|kontakti)/i;
 
-// 🔴 Блокирани файлове
-const BLOCK_EXT_RE =
-  /\.(jpg|jpeg|png|webp|gif|svg|mp4|pdf|zip)$/i;
-
-// 🟢 Важни бизнес страници – приоритет
-const IMPORTANT_RE =
-  /(about|за-нас|services|услуги|pricing|цени|price|contact|контакти|booking|reservation|appointment)/i;
+const BLOCK_RE =
+  /(gallery|project|portfolio|image|img|photo|media|video)/i;
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
 /* =========================
-   SITEMAP (без xml2js)
+   SITEMAP
 ========================= */
-async function getSitemapUrls(origin) {
+async function loadSitemap(browser, baseUrl) {
+  const urls = [];
+  const page = await browser.newPage();
+
   try {
-    const res = await fetch(`${origin}/sitemap.xml`, { timeout: 8000 });
-    if (!res.ok) return [];
+    await page.goto(`${baseUrl}/sitemap.xml`, { timeout: 15000 });
+    const xml = await page.content();
 
-    const xml = await res.text();
+    const parsed = await parseStringPromise(xml);
+    const locs = parsed?.urlset?.url || [];
 
-    // прост, бърз regex parser
-    const urls = Array.from(
-      xml.matchAll(/<loc>(.*?)<\/loc>/g)
-    ).map((m) => m[1]);
-
-    return urls;
+    for (const u of locs) {
+      const loc = u.loc?.[0];
+      if (
+        loc &&
+        ALLOWED_RE.test(loc) &&
+        !BLOCK_RE.test(loc)
+      ) {
+        urls.push(loc);
+      }
+    }
   } catch {
-    return [];
+    // sitemap missing → fallback later
+  } finally {
+    await page.close();
+  }
+
+  return urls.slice(0, MAX_PAGES);
+}
+
+/* =========================
+   SCRAPE PAGE
+========================= */
+async function scrapePage(context, url) {
+  const page = await context.newPage();
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // scroll for lazy content
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await page.waitForTimeout(400);
+    }
+
+    const title = clean(await page.title());
+    const text = clean(
+      await page.evaluate(() => document.body?.innerText || "")
+    );
+
+    if (text.length < MIN_TEXT_CHARS) return null;
+
+    return { url, title, content: text };
+  } catch {
+    return null;
+  } finally {
+    await page.close();
   }
 }
 
 /* =========================
-   CRAWLER
+   MAIN CRAWL
 ========================= */
-async function crawl(startUrl) {
+async function crawlSite(startUrl) {
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+    args: ["--no-sandbox"],
   });
 
   const context = await browser.newContext();
-  const visited = new Set();
-  const queue = [];
+  const base = new URL(startUrl).origin;
+
   const pages = [];
+  const visited = new Set();
 
-  const origin = new URL(startUrl).origin;
+  // 1️⃣ sitemap
+  let targets = await loadSitemap(browser, base);
 
-  console.log("[CRAWL] Start:", startUrl);
+  // 2️⃣ fallback – home links
+  if (!targets.length) {
+    const home = await scrapePage(context, startUrl);
+    if (home) pages.push(home);
 
-  // 1️⃣ Sitemap first
-  const sitemapUrls = await getSitemapUrls(origin);
-  sitemapUrls.forEach((u) => queue.push(u));
+    const page = await context.newPage();
+    await page.goto(startUrl);
+    const links = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("a[href]"))
+        .map(a => a.href)
+        .filter(Boolean)
+    );
+    await page.close();
 
-  // fallback
-  if (!queue.length) queue.push(startUrl);
+    targets = links.filter(
+      l =>
+        l.startsWith(base) &&
+        ALLOWED_RE.test(l) &&
+        !BLOCK_RE.test(l)
+    );
+  }
 
-  while (
-    queue.length &&
-    pages.length < MAX_PAGES &&
-    visited.size < MAX_VISITS
-  ) {
-    const url = queue.shift();
-    if (!url || visited.has(url)) continue;
+  for (const url of targets) {
+    if (pages.length >= MAX_PAGES) break;
+    if (visited.has(url)) continue;
+
     visited.add(url);
 
-    try {
-      const u = new URL(url);
-      if (u.origin !== origin) continue;
-      if (BLOCK_PATH_RE.test(u.pathname)) continue;
-      if (BLOCK_EXT_RE.test(u.pathname)) continue;
-    } catch {
-      continue;
-    }
-
-    let page;
-    try {
-      page = await context.newPage();
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 15000,
-      });
-
-      await page.evaluate(() => window.scrollBy(0, 1200));
-      await page.waitForTimeout(600);
-
-      const title = clean(await page.title());
-      const text = clean(
-        await page.evaluate(() => document.body?.innerText || "")
-      );
-
-      // ❗ АКО НЯМА ТЕКСТ → ИЗХВЪРЛЯМЕ
-      if (text.length < MIN_TEXT_CHARS) continue;
-
-      pages.push({ url, title, content: text });
-      console.log("[CRAWL] ✔ Added:", pages.length, url);
-
-      // откриване на нови линкове
-      const links = await page.evaluate(() =>
-        Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => a.href)
-          .filter(Boolean)
-      );
-
-      for (const l of links) {
-        try {
-          const lu = new URL(l);
-          if (
-            lu.origin === origin &&
-            !visited.has(lu.href) &&
-            !BLOCK_PATH_RE.test(lu.pathname) &&
-            !BLOCK_EXT_RE.test(lu.pathname)
-          ) {
-            IMPORTANT_RE.test(lu.pathname)
-              ? queue.unshift(lu.href)
-              : queue.push(lu.href);
-          }
-        } catch {}
-      }
-    } catch {
-      // skip
-    } finally {
-      if (page) await page.close();
-    }
+    const data = await scrapePage(context, url);
+    if (data) pages.push(data);
   }
 
   await browser.close();
@@ -142,43 +133,36 @@ async function crawl(startUrl) {
 }
 
 /* =========================
-   SERVER
+   HTTP SERVER
 ========================= */
-http
-  .createServer(async (req, res) => {
-    if (req.method !== "POST") {
-      res.writeHead(405);
-      return res.end();
+http.createServer(async (req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405);
+    return res.end();
+  }
+
+  let body = "";
+  req.on("data", c => (body += c));
+  req.on("end", async () => {
+    try {
+      const { url } = JSON.parse(body || "{}");
+      if (!url) throw new Error("Missing url");
+
+      const pages = await crawlSite(url);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          success: true,
+          pagesCount: pages.length,
+          pages,
+        })
+      );
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: e.message }));
     }
-
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", async () => {
-      try {
-        const { url } = JSON.parse(body || "{}");
-        if (!url) throw new Error("Missing url");
-
-        const pages = await crawl(url);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: true,
-            pagesCount: pages.length,
-            pages,
-          })
-        );
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: false,
-            error: e.message || "Crawler error",
-          })
-        );
-      }
-    });
-  })
-  .listen(PORT, () => {
-    console.log("Crawler running on", PORT);
   });
+}).listen(PORT, () => {
+  console.log("Crawler running on", PORT);
+});
