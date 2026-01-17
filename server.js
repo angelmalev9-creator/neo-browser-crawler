@@ -2,15 +2,12 @@ import http from "http";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
-const POLL_INTERVAL_MS = 8000;
 
-// 🔴 EDGE FUNCTION ENDPOINT
-const EDGE_URL = process.env.EDGE_FUNCTION_URL;
-// пример:
-// https://lvcxmcdbopxxfuoaqgze.supabase.co/functions/v1/scrape-website
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!EDGE_URL) {
-  throw new Error("EDGE_FUNCTION_URL env var is required");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
 
 /* ================= LIMITS ================= */
@@ -28,6 +25,27 @@ const cleanText = (t = "") =>
 
 const clamp = (s, m) => (s.length <= m ? s : s.slice(0, m));
 
+async function updateSession(sessionId, payload) {
+  const resp = await fetch(
+    `${SUPABASE_URL}/rest/v1/demo_sessions?id=eq.${sessionId}`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error("Supabase update failed: " + t.slice(0, 200));
+  }
+}
+
 /* ================= CRAWLER ================= */
 async function crawlSite(url) {
   const browser = await chromium.launch({
@@ -36,11 +54,11 @@ async function crawlSite(url) {
   });
 
   const page = await browser.newPage();
-  page.setDefaultTimeout(25000);
+  page.setDefaultTimeout(30000);
 
   try {
-    await page.goto(url, { waitUntil: "commit", timeout: 25000 });
-    await page.waitForTimeout(800);
+    await page.goto(url, { waitUntil: "commit" });
+    await page.waitForTimeout(1200);
 
     const text = cleanText(
       await page.evaluate(() => document.body?.innerText || "")
@@ -63,62 +81,52 @@ async function crawlSite(url) {
   }
 }
 
-/* ================= JOB LOOP ================= */
-async function pollJobs() {
-  try {
-    // 1️⃣ ask edge for next job
-    const jobResp = await fetch(EDGE_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "next-job" }),
-    });
+/* ================= HTTP API ================= */
+http
+  .createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/crawl") {
+      res.writeHead(404);
+      return res.end("Not found");
+    }
 
-    const jobData = await jobResp.json();
-    if (!jobData?.job) return;
-
-    const { id, url } = jobData.job;
-    console.log("▶️ Processing job:", id);
+    let body = "";
+    for await (const chunk of req) body += chunk;
 
     try {
-      const pages = await crawlSite(url);
+      const { url, sessionId } = JSON.parse(body || "{}");
+      if (!url || !sessionId) {
+        res.writeHead(400);
+        return res.end("Missing url or sessionId");
+      }
 
-      // 2️⃣ send result back
-      await fetch(EDGE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "complete-job",
-          id,
-          pages,
+      await updateSession(sessionId, {
+        status: "scraping",
+        error_message: null,
+      });
+
+      try {
+        const pages = await crawlSite(url);
+
+        await updateSession(sessionId, {
+          status: "ready",
+          scraped_content: pages,
           language: "bg",
-        }),
-      });
+          error_message: null,
+        });
+      } catch (e) {
+        await updateSession(sessionId, {
+          status: "error",
+          error_message: e.message || "Crawler error",
+        });
+      }
 
-      console.log("✅ Done:", id);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
     } catch (e) {
-      await fetch(EDGE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "fail-job",
-          id,
-          error: e.message || "Crawler error",
-        }),
-      });
+      res.writeHead(500);
+      res.end("Server error");
     }
-  } catch (e) {
-    console.error("pollJobs error:", e);
-  }
-}
-
-setInterval(pollJobs, POLL_INTERVAL_MS);
-
-/* ================= HEALTH SERVER ================= */
-http
-  .createServer((_, res) => {
-    res.writeHead(200);
-    res.end("OK");
   })
   .listen(PORT, () => {
-    console.log("Crawler worker running on :" + PORT);
+    console.log("Crawler running on :" + PORT);
   });
