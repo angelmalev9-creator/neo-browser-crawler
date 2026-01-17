@@ -2,125 +2,67 @@ import http from "http";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
-const MAX_PAGES_DEFAULT = 40;
-const MAX_PAGES_HARD = 120;
-
-const SKIP_RE =
-  /cookie|privacy|policy|terms|login|register|cart|checkout|account|wishlist|#|javascript:/i;
-
-const IMPORTANT_RE =
-  /about|за-нас|services|услуги|pricing|цени|price|contact|контакти|menu|меню|booking|reservation|appointment|запази/i;
 
 const clean = (t = "") =>
-  t
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
-async function preparePage(page) {
-  await page.waitForLoadState("networkidle");
-
-  // aggressive scroll for SPA
-  for (let i = 0; i < 8; i++) {
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-    await page.waitForTimeout(500);
-  }
-
-  // click expandable elements
-  await page.evaluate(() => {
-    document.querySelectorAll("button, summary, [role='button']").forEach((el) => {
-      try {
-        const txt = el.innerText?.toLowerCase() || "";
-        if (txt.match(/menu|услуг|цени|about|contact|о нас/)) {
-          el.click();
-        }
-      } catch {}
-    });
-  });
-
-  await page.waitForTimeout(1200);
-}
-
-async function extractLinks(page, baseOrigin) {
-  return await page.evaluate((baseOrigin) => {
-    return Array.from(document.querySelectorAll("a[href]"))
-      .map((a) => a.href)
-      .filter((h) => {
-        try {
-          const u = new URL(h);
-          return u.origin === baseOrigin;
-        } catch {
-          return false;
-        }
-      });
-  }, baseOrigin);
-}
-
-async function crawl(startUrl, maxPages) {
+async function scrapeSections(url) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
-  const context = await browser.newContext();
-  const visited = new Set();
-  const queue = [startUrl];
-  const pages = [];
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
 
-  const baseOrigin = new URL(startUrl).origin;
-
-  while (queue.length && pages.length < maxPages) {
-    const url = queue.shift();
-    if (!url || visited.has(url)) continue;
-    if (SKIP_RE.test(url)) continue;
-
-    visited.add(url);
-    console.log("[CRAWL] Visiting:", url);
-
-    let page;
-    try {
-      page = await context.newPage();
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-
-      await preparePage(page);
-
-      const title = clean(await page.title());
-      const content = clean(
-        await page.evaluate(() => document.body?.innerText || "")
-      );
-
-      if (content.length > 400) {
-        pages.push({ url, title, content });
-        console.log("[CRAWL] ✔ Added page:", pages.length);
-      }
-
-      const links = await extractLinks(page, baseOrigin);
-
-      for (const l of links) {
-        if (
-          !visited.has(l) &&
-          !SKIP_RE.test(l) &&
-          (IMPORTANT_RE.test(l) || pages.length < 5)
-        ) {
-          queue.push(l);
-        }
-      }
-
-      console.log(
-        "[CRAWL] Queue:",
-        queue.length,
-        "| Visited:",
-        visited.size
-      );
-    } catch (e) {
-      console.log("[CRAWL] ❌ Failed:", url);
-    } finally {
-      if (page) await page.close();
-    }
+  // aggressive scroll
+  for (let i = 0; i < 10; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await page.waitForTimeout(400);
   }
 
+  // expand menus / accordions
+  await page.evaluate(() => {
+    document.querySelectorAll("button, summary, [role='button']").forEach((el) => {
+      try {
+        el.click();
+      } catch {}
+    });
+  });
+
+  await page.waitForTimeout(1200);
+
+  const sections = await page.evaluate(() => {
+    const blocks = [];
+    const candidates = document.querySelectorAll(
+      "section, article, main > div, div[class*='section'], div[class*='block']"
+    );
+
+    candidates.forEach((el) => {
+      const text = el.innerText?.trim();
+      if (!text || text.length < 300) return;
+
+      const title =
+        el.querySelector("h1,h2,h3")?.innerText ||
+        el.getAttribute("aria-label") ||
+        "Секция";
+
+      blocks.push({
+        title,
+        content: text,
+      });
+    });
+
+    return blocks;
+  });
+
   await browser.close();
-  return pages;
+
+  return sections.map((s, i) => ({
+    url: `${url}#section-${i + 1}`,
+    title: clean(s.title),
+    content: clean(s.content),
+  }));
 }
 
 http
@@ -134,15 +76,10 @@ http
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       try {
-        const { url, maxPages } = JSON.parse(body || "{}");
+        const { url } = JSON.parse(body || "{}");
         if (!url) throw new Error("Missing url");
 
-        const limit = Math.min(
-          Number(maxPages) || MAX_PAGES_DEFAULT,
-          MAX_PAGES_HARD
-        );
-
-        const pages = await crawl(url, limit);
+        const pages = await scrapeSections(url);
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
@@ -164,5 +101,5 @@ http
     });
   })
   .listen(PORT, () => {
-    console.log("🚀 Smart crawler running on", PORT);
+    console.log("🚀 Section crawler running on", PORT);
   });
