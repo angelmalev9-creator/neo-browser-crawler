@@ -4,13 +4,9 @@ import { parseStringPromise } from "xml2js";
 
 const PORT = Number(process.env.PORT || 10000);
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing SUPABASE envs");
-}
-
+/* =========================
+   LIMITS & FILTERS
+========================= */
 const MAX_PAGES = 70;
 const MIN_TEXT_CHARS = 300;
 
@@ -19,22 +15,6 @@ const SKIP_RE =
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
-
-/* =========================
-   SUPABASE
-========================= */
-async function updateSession(sessionId, data) {
-  await fetch(`${SUPABASE_URL}/rest/v1/demo_sessions?id=eq.${sessionId}`, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify(data),
-  });
-}
 
 /* =========================
    SITEMAP
@@ -59,7 +39,7 @@ async function getSitemapUrls(baseUrl) {
     console.log(`[SITEMAP] Found ${urls.length} urls`);
     return urls;
   } catch {
-    console.log("[SITEMAP] No sitemap or failed");
+    console.log("[SITEMAP] Missing or invalid");
     return [];
   }
 }
@@ -72,6 +52,7 @@ async function scrapePage(context, url) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
+    // scroll for lazy text
     for (let i = 0; i < 3; i++) {
       await page.evaluate(() => window.scrollBy(0, 1500));
       await page.waitForTimeout(300);
@@ -93,9 +74,9 @@ async function scrapePage(context, url) {
 }
 
 /* =========================
-   CRAWLER
+   MAIN CRAWLER
 ========================= */
-async function crawlSite(startUrl, sessionId) {
+async function crawlSite(startUrl) {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -107,6 +88,7 @@ async function crawlSite(startUrl, sessionId) {
   const visited = new Set();
   const pages = [];
 
+  /* 1️⃣ Sitemap first */
   let queue = await getSitemapUrls(baseOrigin);
   if (!queue.length) queue = [startUrl];
 
@@ -125,8 +107,9 @@ async function crawlSite(startUrl, sessionId) {
     console.log(`[CRAWL] +${pages.length}: ${url}`);
   }
 
-  if (pages.length < 8) {
-    console.log("[CRAWL] Sitemap weak → BFS fallback");
+  /* 2️⃣ BFS fallback */
+  if (pages.length < 10) {
+    console.log("[CRAWL] Sitemap weak → BFS");
 
     const page = await context.newPage();
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -155,19 +138,11 @@ async function crawlSite(startUrl, sessionId) {
   }
 
   await browser.close();
-
-  await updateSession(sessionId, {
-    status: "ready",
-    scraped_content: pages,
-    error_message: null,
-    updated_at: new Date().toISOString(),
-  });
-
-  console.log(`[DONE] Pages scraped: ${pages.length}`);
+  return pages;
 }
 
 /* =========================
-   SERVER
+   HTTP SERVER
 ========================= */
 http
   .createServer((req, res) => {
@@ -180,18 +155,40 @@ http
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       try {
-        const { url, sessionId } = JSON.parse(body || "{}");
-        if (!url || !sessionId) throw new Error("Missing data");
+        const { url, sessionId, sessionToken, callbackUrl } = JSON.parse(body || "{}");
+
+        if (!url || !sessionId || !sessionToken || !callbackUrl) {
+          throw new Error("Missing data");
+        }
 
         console.log(`[CRAWL] Start ${url}`);
 
-        crawlSite(url, sessionId).catch(async (e) => {
-          console.error("[CRAWL ERROR]", e.message);
-          await updateSession(sessionId, {
-            status: "error",
-            error_message: e.message || "Crawler failed",
+        // FIRE & FORGET
+        crawlSite(url)
+          .then((pages) => {
+            fetch(callbackUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sessionId,
+                sessionToken,
+                pages,
+                success: true,
+              }),
+            }).catch(() => {});
+          })
+          .catch((e) => {
+            fetch(callbackUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                sessionId,
+                sessionToken,
+                success: false,
+                error: e.message || "Crawler failed",
+              }),
+            }).catch(() => {});
           });
-        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true }));
