@@ -3,37 +3,32 @@ import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 
-const MAX_SECONDS = 25;
+// DETAIL-FIRST LIMITS
+const MAX_SECONDS = 45;            // ⬅️ увеличен hard deadline
 const MIN_WORDS = 30;
+const MAX_CHILD_PER_PAGE = 4;      // ⬅️ повече детайли на страница
 
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
 
-const clean = (t = "") =>
-  t.replace(/\s+/g, " ").trim();
-
-const countWords = (t = "") =>
-  t.split(" ").filter(w => w.length > 2).length;
+const clean = (t = "") => t.replace(/\s+/g, " ").trim();
+const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 
 /* =========================
-   EXTRACT TEXT (ROBUST)
+   TEXT EXTRACTOR (ROBUST)
 ========================= */
 async function extractText(page) {
-  // 1️⃣ изчакваме реален content (Elementor или basic HTML)
   try {
     await page.waitForSelector(
       ".elementor-text-editor, p, h1",
       { timeout: 3000 }
     );
-  } catch {
-    // няма selector – продължаваме с fallback
-  }
+  } catch {}
 
   return clean(
     await page.evaluate(() => {
       const bad = ["header", "footer", "nav", "aside"];
 
-      // опит 1: Elementor + semantic tags
       const nodes = document.querySelectorAll(
         ".elementor-text-editor, " +
         ".elementor-widget-text-editor, " +
@@ -50,10 +45,12 @@ async function extractText(page) {
         .map(el => el.innerText)
         .join(" ");
 
-      // опит 2: fallback – body text без header/footer/nav
-      if (text.trim().length < 50) {
+      // fallback ако Elementor още не е хидратирал
+      if (text.length < 120) {
         const clone = document.body.cloneNode(true);
-        clone.querySelectorAll("header, footer, nav, aside").forEach(n => n.remove());
+        clone
+          .querySelectorAll("header, footer, nav, aside")
+          .forEach(n => n.remove());
         text = clone.innerText || "";
       }
 
@@ -63,9 +60,43 @@ async function extractText(page) {
 }
 
 /* =========================
-   FAST NAV CRAWLER
+   COLLECT NAV LINKS
 ========================= */
-async function crawlFastNav(startUrl) {
+async function collectNavLinks(page, base) {
+  return await page.evaluate((base) => {
+    const urls = new Set();
+    document
+      .querySelectorAll("header a[href], nav a[href], footer a[href]")
+      .forEach(a => {
+        try {
+          urls.add(new URL(a.href, base).href);
+        } catch {}
+      });
+    return Array.from(urls);
+  }, base);
+}
+
+/* =========================
+   COLLECT CONTENT LINKS (DETAIL)
+========================= */
+async function collectContentLinks(page, base) {
+  return await page.evaluate((base) => {
+    const urls = new Set();
+    document
+      .querySelectorAll("main a[href], article a[href]")
+      .forEach(a => {
+        try {
+          urls.add(new URL(a.href, base).href);
+        } catch {}
+      });
+    return Array.from(urls);
+  }, base);
+}
+
+/* =========================
+   SMART DETAIL CRAWLER
+========================= */
+async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
 
   const browser = await chromium.launch({
@@ -93,28 +124,18 @@ async function crawlFastNav(startUrl) {
 
   console.log(`[CRAWL] Start from ${page.url()}`);
 
-  // collect nav links
-  const links = await page.evaluate((base) => {
-    const urls = new Set();
+  // STEP 1: NAV PAGES
+  let targets = await collectNavLinks(page, base);
+  targets.unshift(page.url());
 
-    document.querySelectorAll("header a[href], nav a[href], footer a[href]").forEach(a => {
-      try {
-        const u = new URL(a.href, base).href;
-        urls.add(u);
-      } catch {}
-    });
-
-    return Array.from(urls);
-  }, base);
-
-  const targets = [
-    page.url(),
-    ...links.filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u))
-  ];
+  targets = targets.filter(
+    u => u.startsWith(base) && !SKIP_URL_RE.test(u)
+  );
 
   for (const url of targets) {
     if (Date.now() > deadline) break;
     if (visited.has(url)) continue;
+
     visited.add(url);
 
     try {
@@ -123,22 +144,49 @@ async function crawlFastNav(startUrl) {
       const text = await extractText(page);
       const words = countWords(text);
 
-      console.log(`[DEBUG] ${url} → ${text.length} chars / ${words} words`);
+      if (words < MIN_WORDS) continue;
 
-      if (words >= MIN_WORDS) {
-        pages.push({
-          url,
-          title: clean(await page.title()),
-          content: text,
-        });
-        console.log(`[SAVE] ${url}`);
-      } else {
-        console.log(`[SKIP] ${url} (${words} words)`);
+      pages.push({
+        url,
+        title: clean(await page.title()),
+        content: text,
+      });
+      console.log(`[SAVE] ${url} (${words} words)`);
+
+      // STEP 2: DETAIL PAGES (DEPTH = 2)
+      const children = await collectContentLinks(page, base);
+      let taken = 0;
+
+      for (const child of children) {
+        if (Date.now() > deadline) break;
+        if (taken >= MAX_CHILD_PER_PAGE) break;
+        if (visited.has(child)) continue;
+        if (!child.startsWith(base) || SKIP_URL_RE.test(child)) continue;
+
+        visited.add(child);
+        taken++;
+
+        try {
+          await page.goto(child, { timeout: 10000 });
+
+          const childText = await extractText(page);
+          const childWords = countWords(childText);
+
+          if (childWords < MIN_WORDS) continue;
+
+          pages.push({
+            url: child,
+            title: clean(await page.title()),
+            content: childText,
+          });
+
+          console.log(
+            `[DETAIL] ${child} (${childWords} words)`
+          );
+        } catch {}
       }
 
-    } catch (e) {
-      console.log(`[ERROR] ${url}`);
-    }
+    } catch {}
   }
 
   await browser.close();
@@ -162,7 +210,7 @@ http.createServer((req, res) => {
       const { url } = JSON.parse(body || "{}");
       if (!url) throw new Error("Missing url");
 
-      const pages = await crawlFastNav(url);
+      const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
