@@ -5,7 +5,7 @@ const PORT = Number(process.env.PORT || 10000);
 
 const MAX_PAGES = 50;
 const PAGE_TIMEOUT = 15000;
-const MIN_WORDS = 100; // ⬅️ ВАЖНО: минимум 100 думи
+const MIN_WORDS = 30; // ⬅️ минимум 30 думи
 
 const SKIP_URL_RE =
   /\/(wp-content|uploads|media|images|gallery|video|photo|attachment)/i;
@@ -32,7 +32,7 @@ async function extractVisibleText(page) {
       }
 
       const selectors = [
-        // Standard content
+        // Standard
         "main p", "main li",
         "article p", "article li",
 
@@ -41,7 +41,7 @@ async function extractVisibleText(page) {
         ".elementor-text-editor",
         "[data-widget_type='text-editor.default']",
 
-        // Fallback for real sections
+        // Fallback
         "section div"
       ];
 
