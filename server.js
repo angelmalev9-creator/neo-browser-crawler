@@ -1,65 +1,76 @@
 import http from "http";
 import { chromium } from "playwright";
 import { parseStringPromise } from "xml2js";
+import fetch from "node-fetch";
 
 const PORT = Number(process.env.PORT || 10000);
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE envs");
+}
+
 const MAX_PAGES = 70;
-const MIN_TEXT_CHARS = 400;
+const MIN_TEXT_CHARS = 300;
 
-const ALLOWED_RE =
-  /(about|za-nas|services|uslugi|pricing|prices|ceni|tseni|contact|kontakti)/i;
-
-const BLOCK_RE =
-  /(gallery|project|portfolio|image|img|photo|media|video)/i;
+const SKIP_RE = /gallery|portfolio|projects|images|media|photo|video|work|album/i;
 
 const clean = (t = "") =>
-  t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  t
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/* =========================
+   SUPABASE HELPERS
+========================= */
+async function updateSession(sessionId, data) {
+  await fetch(`${SUPABASE_URL}/rest/v1/demo_sessions?id=eq.${sessionId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(data),
+  });
+}
 
 /* =========================
    SITEMAP
 ========================= */
-async function loadSitemap(browser, baseUrl) {
-  const urls = [];
-  const page = await browser.newPage();
-
+async function getSitemapUrls(baseUrl) {
   try {
-    await page.goto(`${baseUrl}/sitemap.xml`, { timeout: 15000 });
-    const xml = await page.content();
+    const res = await fetch(`${baseUrl}/sitemap.xml`, { timeout: 15000 });
+    if (!res.ok) return [];
 
+    const xml = await res.text();
     const parsed = await parseStringPromise(xml);
-    const locs = parsed?.urlset?.url || [];
 
-    for (const u of locs) {
-      const loc = u.loc?.[0];
-      if (
-        loc &&
-        ALLOWED_RE.test(loc) &&
-        !BLOCK_RE.test(loc)
-      ) {
-        urls.push(loc);
-      }
-    }
+    const urls =
+      parsed?.urlset?.url?.map((u) => u.loc?.[0]).filter(Boolean) || [];
+
+    console.log(`[SITEMAP] Found ${urls.length} urls`);
+    return urls;
   } catch {
-    // sitemap missing → fallback later
-  } finally {
-    await page.close();
+    return [];
   }
-
-  return urls.slice(0, MAX_PAGES);
 }
 
 /* =========================
-   SCRAPE PAGE
+   PAGE SCRAPE
 ========================= */
 async function scrapePage(context, url) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // scroll for lazy content
-    for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollBy(0, 1200));
+    // scroll for SPA / lazy text
+    for (let i = 0; i < 4; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1600));
       await page.waitForTimeout(400);
     }
 
@@ -81,88 +92,114 @@ async function scrapePage(context, url) {
 /* =========================
    MAIN CRAWL
 ========================= */
-async function crawlSite(startUrl) {
+async function crawlSite(startUrl, sessionId) {
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox"],
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
   const context = await browser.newContext();
-  const base = new URL(startUrl).origin;
+  const baseOrigin = new URL(startUrl).origin;
 
-  const pages = [];
   const visited = new Set();
+  const pages = [];
 
-  // 1️⃣ sitemap
-  let targets = await loadSitemap(browser, base);
+  /* 1️⃣ sitemap first */
+  let queue = await getSitemapUrls(baseOrigin);
 
-  // 2️⃣ fallback – home links
-  if (!targets.length) {
-    const home = await scrapePage(context, startUrl);
-    if (home) pages.push(home);
+  /* 2️⃣ fallback */
+  if (!queue.length) queue = [startUrl];
+
+  for (const url of queue) {
+    if (pages.length >= MAX_PAGES) break;
+    if (visited.has(url)) continue;
+    if (SKIP_RE.test(url)) continue;
+
+    visited.add(url);
+
+    const pageData = await scrapePage(context, url);
+    if (!pageData) continue;
+
+    pages.push(pageData);
+    console.log(`[CRAWL] Added ${pages.length}: ${url}`);
+  }
+
+  /* 3️⃣ BFS fallback if sitemap was weak */
+  if (pages.length < 10) {
+    console.log("[CRAWL] Sitemap weak → BFS fallback");
 
     const page = await context.newPage();
-    await page.goto(startUrl);
+    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+
     const links = await page.evaluate(() =>
       Array.from(document.querySelectorAll("a[href]"))
-        .map(a => a.href)
+        .map((a) => a.href)
         .filter(Boolean)
     );
     await page.close();
 
-    targets = links.filter(
-      l =>
-        l.startsWith(base) &&
-        ALLOWED_RE.test(l) &&
-        !BLOCK_RE.test(l)
-    );
-  }
+    for (const link of links) {
+      if (pages.length >= MAX_PAGES) break;
+      if (!link.startsWith(baseOrigin)) continue;
+      if (visited.has(link)) continue;
+      if (SKIP_RE.test(link)) continue;
 
-  for (const url of targets) {
-    if (pages.length >= MAX_PAGES) break;
-    if (visited.has(url)) continue;
+      visited.add(link);
 
-    visited.add(url);
+      const pageData = await scrapePage(context, link);
+      if (!pageData) continue;
 
-    const data = await scrapePage(context, url);
-    if (data) pages.push(data);
+      pages.push(pageData);
+      console.log(`[CRAWL] Added ${pages.length}: ${link}`);
+    }
   }
 
   await browser.close();
-  return pages;
+
+  await updateSession(sessionId, {
+    status: "ready",
+    scraped_content: pages,
+    error_message: null,
+    updated_at: new Date().toISOString(),
+  });
+
+  console.log(`[DONE] Total pages: ${pages.length}`);
 }
 
 /* =========================
    HTTP SERVER
 ========================= */
-http.createServer(async (req, res) => {
-  if (req.method !== "POST") {
-    res.writeHead(405);
-    return res.end();
-  }
-
-  let body = "";
-  req.on("data", c => (body += c));
-  req.on("end", async () => {
-    try {
-      const { url } = JSON.parse(body || "{}");
-      if (!url) throw new Error("Missing url");
-
-      const pages = await crawlSite(url);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          success: true,
-          pagesCount: pages.length,
-          pages,
-        })
-      );
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: e.message }));
+http
+  .createServer((req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(405);
+      return res.end();
     }
+
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      try {
+        const { url, sessionId } = JSON.parse(body || "{}");
+        if (!url || !sessionId) throw new Error("Missing data");
+
+        console.log(`[CRAWL] Start: ${url}`);
+
+        crawlSite(url, sessionId).catch(async (e) => {
+          await updateSession(sessionId, {
+            status: "error",
+            error_message: e.message || "Crawler failed",
+          });
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+  })
+  .listen(PORT, () => {
+    console.log("Crawler running on", PORT);
   });
-}).listen(PORT, () => {
-  console.log("Crawler running on", PORT);
-});
