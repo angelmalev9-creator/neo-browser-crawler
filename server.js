@@ -1,7 +1,5 @@
 import http from "http";
 import { chromium } from "playwright";
-import fetch from "node-fetch";
-import xml2js from "xml2js";
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -9,31 +7,35 @@ const MAX_PAGES = 70;
 const MAX_VISITS = 120;
 const MIN_TEXT_CHARS = 300;
 
+// 🔴 Блокирани пътища (галерии, проекти, медии)
 const BLOCK_PATH_RE =
-  /(gallery|portfolio|projects?|media|images?|video|slider)/i;
+  /(gallery|portfolio|projects?|media|images?|video|slider|wp-content)/i;
 
+// 🔴 Блокирани файлове
 const BLOCK_EXT_RE =
-  /\.(jpg|jpeg|png|webp|gif|svg|mp4|pdf)$/i;
+  /\.(jpg|jpeg|png|webp|gif|svg|mp4|pdf|zip)$/i;
 
+// 🟢 Важни бизнес страници – приоритет
 const IMPORTANT_RE =
   /(about|за-нас|services|услуги|pricing|цени|price|contact|контакти|booking|reservation|appointment)/i;
 
 const clean = (t = "") =>
   t.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
 
-/* =======================
-   SITEMAP PARSER
-======================= */
-async function getSitemapUrls(baseUrl) {
+/* =========================
+   SITEMAP (без xml2js)
+========================= */
+async function getSitemapUrls(origin) {
   try {
-    const res = await fetch(`${baseUrl}/sitemap.xml`, { timeout: 8000 });
+    const res = await fetch(`${origin}/sitemap.xml`, { timeout: 8000 });
     if (!res.ok) return [];
 
     const xml = await res.text();
-    const parsed = await xml2js.parseStringPromise(xml);
 
-    const urls =
-      parsed?.urlset?.url?.map((u) => u.loc?.[0]).filter(Boolean) || [];
+    // прост, бърз regex parser
+    const urls = Array.from(
+      xml.matchAll(/<loc>(.*?)<\/loc>/g)
+    ).map((m) => m[1]);
 
     return urls;
   } catch {
@@ -41,9 +43,9 @@ async function getSitemapUrls(baseUrl) {
   }
 }
 
-/* =======================
+/* =========================
    CRAWLER
-======================= */
+========================= */
 async function crawl(startUrl) {
   const browser = await chromium.launch({
     headless: true,
@@ -57,19 +59,24 @@ async function crawl(startUrl) {
 
   const origin = new URL(startUrl).origin;
 
+  console.log("[CRAWL] Start:", startUrl);
+
   // 1️⃣ Sitemap first
   const sitemapUrls = await getSitemapUrls(origin);
-  for (const u of sitemapUrls) queue.push(u);
+  sitemapUrls.forEach((u) => queue.push(u));
 
   // fallback
   if (!queue.length) queue.push(startUrl);
 
-  while (queue.length && pages.length < MAX_PAGES && visited.size < MAX_VISITS) {
+  while (
+    queue.length &&
+    pages.length < MAX_PAGES &&
+    visited.size < MAX_VISITS
+  ) {
     const url = queue.shift();
     if (!url || visited.has(url)) continue;
     visited.add(url);
 
-    // HARD URL FILTER
     try {
       const u = new URL(url);
       if (u.origin !== origin) continue;
@@ -87,7 +94,6 @@ async function crawl(startUrl) {
         timeout: 15000,
       });
 
-      // small scroll for lazy text
       await page.evaluate(() => window.scrollBy(0, 1200));
       await page.waitForTimeout(600);
 
@@ -96,12 +102,13 @@ async function crawl(startUrl) {
         await page.evaluate(() => document.body?.innerText || "")
       );
 
-      // 🚫 TEXT FILTER
+      // ❗ АКО НЯМА ТЕКСТ → ИЗХВЪРЛЯМЕ
       if (text.length < MIN_TEXT_CHARS) continue;
 
       pages.push({ url, title, content: text });
+      console.log("[CRAWL] ✔ Added:", pages.length, url);
 
-      // discover links
+      // откриване на нови линкове
       const links = await page.evaluate(() =>
         Array.from(document.querySelectorAll("a[href]"))
           .map((a) => a.href)
@@ -117,12 +124,9 @@ async function crawl(startUrl) {
             !BLOCK_PATH_RE.test(lu.pathname) &&
             !BLOCK_EXT_RE.test(lu.pathname)
           ) {
-            // prioritize important pages
-            if (IMPORTANT_RE.test(lu.pathname)) {
-              queue.unshift(lu.href);
-            } else {
-              queue.push(lu.href);
-            }
+            IMPORTANT_RE.test(lu.pathname)
+              ? queue.unshift(lu.href)
+              : queue.push(lu.href);
           }
         } catch {}
       }
@@ -137,9 +141,9 @@ async function crawl(startUrl) {
   return pages;
 }
 
-/* =======================
+/* =========================
    SERVER
-======================= */
+========================= */
 http
   .createServer(async (req, res) => {
     if (req.method !== "POST") {
@@ -154,7 +158,6 @@ http
         const { url } = JSON.parse(body || "{}");
         if (!url) throw new Error("Missing url");
 
-        console.log("[CRAWL] Start:", url);
         const pages = await crawl(url);
 
         res.writeHead(200, { "Content-Type": "application/json" });
