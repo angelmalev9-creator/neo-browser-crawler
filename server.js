@@ -6,7 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 // ================= LIMITS =================
 const MAX_SECONDS = 45;
 const MIN_WORDS = 30;
-const MAX_CHILD_PER_PAGE = 4;
+const MAX_PAGES = 40;
 
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
@@ -31,11 +31,11 @@ async function safeGoto(page, url, timeout = 12000) {
 // ================= PAGE TYPE =================
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
-  if (/za-nas|about/.test(s)) return "about";
-  if (/uslugi|services|pricing|price/.test(s)) return "services";
+  if (/faq|въпроси|questions/.test(s)) return "faq";
+  if (/price|pricing|цени/.test(s)) return "pricing";
+  if (/uslugi|services/.test(s)) return "services";
   if (/kontakti|contact/.test(s)) return "contact";
-  if (/faq|vuprosi|questions/.test(s)) return "faq";
-  if (/blog|news|article/.test(s)) return "blog";
+  if (/za-nas|about/.test(s)) return "about";
   return "general";
 }
 
@@ -46,42 +46,24 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-    // Remove noise
     ["header", "footer", "nav", "aside"].forEach(sel => {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
-    // Accept cookies (best effort)
-    document.querySelectorAll("button").forEach(b => {
-      const t = (b.innerText || "").toLowerCase();
-      if (
-        t.includes("accept") ||
-        t.includes("agree") ||
-        t.includes("allow") ||
-        t.includes("прием")
-      ) {
-        b.click();
-      }
-    });
-
-    // ================= FAQ / ACCORDION (PRIORITY) =================
-    const faqBlocks = [];
+    const faq = [];
     document.querySelectorAll(
-      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
+      '[class*="faq"],[class*="accordion"],[aria-expanded]'
     ).forEach(el => {
       const t = el.innerText?.trim();
-      if (t && t.length > 40) faqBlocks.push(t);
+      if (t && t.length > 40) faq.push(t);
     });
 
-    // ================= HEADINGS =================
     const headings = [...document.querySelectorAll("h1,h2,h3")]
-      .filter(h => h.offsetParent !== null)
-      .map(h => h.innerText.trim());
+      .map(h => h.innerText.trim())
+      .filter(Boolean);
 
-    // ================= SECTIONS =================
     const sections = [];
     let current = null;
-
     document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
       if (el.tagName.startsWith("H")) {
         current = { heading: el.innerText.trim(), text: "" };
@@ -91,61 +73,37 @@ async function extractStructured(page) {
       }
     });
 
-    // ================= MAIN CONTENT =================
-    const mainContent =
+    const main =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    // ================= META / ARIA =================
-    const metaDescription =
-      document.querySelector('meta[name="description"]')?.content || "";
-    const metaKeywords =
-      document.querySelector('meta[name="keywords"]')?.content || "";
-
-    const ariaTexts = [];
-    document.querySelectorAll("[aria-label]").forEach(el => {
-      ariaTexts.push(el.getAttribute("aria-label"));
-    });
-
-    // ================= FINAL PRIORITIZED CONTENT =================
-    const finalContent = [
-      // 1. FAQ first (kills clichés)
-      faqBlocks.join("\n\n"),
-
-      // 2. Structured sections
-      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-
-      // 3. Meta / accessibility
-      metaDescription,
-      metaKeywords,
-      ariaTexts.join(" "),
-
-      // 4. Raw content last
-      mainContent,
-    ].join("\n\n");
-
     return {
+      faq,
       headings,
       sections,
-      summary: faqBlocks.slice(0, 5),
-      content: finalContent,
+      content: clean(
+        [
+          faq.join("\n\n"),
+          sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+          main,
+        ].join("\n\n")
+      ),
     };
   });
 }
 
-// ================= LINK COLLECTORS =================
-async function collectNavLinks(page, base) {
+// ================= LINK COLLECTOR (GLOBAL) =================
+async function collectAllLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
-    document
-      .querySelectorAll("header a[href], nav a[href], footer a[href]")
-      .forEach(a => {
-        try {
-          urls.add(new URL(a.href, base).href);
-        } catch {}
-      });
+    document.querySelectorAll("a[href]").forEach(a => {
+      try {
+        const u = new URL(a.href, base).href;
+        urls.add(u);
+      } catch {}
+    });
     return Array.from(urls);
   }, base);
 }
@@ -154,18 +112,15 @@ async function collectNavLinks(page, base) {
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
 
-  console.log("[CRAWL START]", startUrl);
-
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
 
   const context = await browser.newContext();
-
   await context.route("**/*", route => {
-    const type = route.request().resourceType();
-    if (["image", "media", "font"].includes(type)) return route.abort();
+    if (["image", "media", "font"].includes(route.request().resourceType()))
+      return route.abort();
     route.continue();
   });
 
@@ -176,95 +131,78 @@ async function crawlSmart(startUrl) {
   }
 
   const base = new URL(page.url()).origin;
+
+  const queue = [page.url()];
   const visited = new Set();
   const pages = [];
 
-  let targets = await collectNavLinks(page, base);
-  targets.unshift(page.url());
-  targets = targets.filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u));
-
-  console.log("[TARGETS]", targets.length);
-
-  for (const url of targets) {
-    if (Date.now() > deadline) {
-      console.log("[STOP] Deadline reached");
-      break;
-    }
-
-    if (visited.has(url)) {
-      console.log("[SKIP] Already visited", url);
-      continue;
-    }
+  while (
+    queue.length &&
+    pages.length < MAX_PAGES &&
+    Date.now() < deadline
+  ) {
+    const url = queue.shift();
+    if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
 
     visited.add(url);
 
-    try {
-      if (!(await safeGoto(page, url))) continue;
+    if (!(await safeGoto(page, url))) continue;
 
-      const title = clean(await page.title());
-      const pageType = detectPageType(url, title);
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    const data = await extractStructured(page);
 
-      const data = await extractStructured(page);
-      const words = countWords(data.content);
+    const words = countWords(data.content);
+    console.log("[PAGE]", url, pageType, words);
 
-      console.log("[PAGE]", url, "| type:", pageType, "| words:", words);
-
-      if (words < MIN_WORDS) {
-        console.log("[SKIP] Too few words", url);
-        continue;
-      }
-
+    if (words >= MIN_WORDS) {
       pages.push({
         url,
         title,
         pageType,
         headings: data.headings,
         sections: data.sections,
-        summary: data.summary,
-        content: clean(data.content),
+        faq: data.faq,
+        content: data.content,
         wordCount: words,
         status: "ok",
       });
+    }
 
-      console.log("[SAVE]", url);
-
-    } catch (e) {
-      console.error("[PAGE FAIL]", url, e.message);
-      pages.push({ url, status: "failed" });
+    const links = await collectAllLinks(page, base);
+    for (const l of links) {
+      if (
+        l.startsWith(base) &&
+        !visited.has(l) &&
+        !queue.includes(l)
+      ) {
+        queue.push(l);
+      }
     }
   }
 
   await browser.close();
-  console.log("[CRAWL DONE] Pages saved:", pages.length);
+  console.log("[DONE] Pages:", pages.length);
   return pages;
 }
 
 // ================= HTTP SERVER =================
 http.createServer((req, res) => {
-  console.log("[HTTP]", req.method, req.url);
-
   if (req.method !== "POST") {
     res.writeHead(405);
     return res.end();
   }
 
   let body = "";
-  req.on("data", c => body += c);
+  req.on("data", c => (body += c));
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
-      console.log("[REQUEST]", url);
-
       const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        pagesCount: pages.length,
-        pages,
-      }));
+      res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
     } catch (e) {
-      console.error("[CRAWL ERROR]", e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
