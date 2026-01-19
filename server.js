@@ -243,10 +243,19 @@ async function crawlSmart(startUrl) {
 http.createServer((req, res) => {
   console.log("[HTTP]", req.method, req.url);
 
-  if (req.method !== "POST") {
-    res.writeHead(405);
-    return res.end();
-  }
+if (req.method === "GET") {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    status: "ok",
+    message: "Crawler is running. Use POST with { url } to crawl.",
+  }));
+}
+
+if (req.method !== "POST") {
+  res.writeHead(405);
+  return res.end();
+}
+
 
   let body = "";
   req.on("data", c => body += c);
