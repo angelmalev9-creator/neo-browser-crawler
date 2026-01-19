@@ -46,10 +46,12 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
+    // Remove noise
     ["header", "footer", "nav", "aside"].forEach(sel => {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
+    // Accept cookies (best effort)
     document.querySelectorAll("button").forEach(b => {
       const t = (b.innerText || "").toLowerCase();
       if (
@@ -60,14 +62,6 @@ async function extractStructured(page) {
       ) {
         b.click();
       }
-    });
-
-    const faqBlocks = [];
-    document.querySelectorAll(
-      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
-    ).forEach(el => {
-      const t = el.innerText?.trim();
-      if (t && t.length > 40) faqBlocks.push(t);
     });
 
     const headings = [...document.querySelectorAll("h1,h2,h3")]
@@ -86,36 +80,17 @@ async function extractStructured(page) {
       }
     });
 
-    const mainContent =
+    const content =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    const metaDescription =
-      document.querySelector('meta[name="description"]')?.content || "";
-    const metaKeywords =
-      document.querySelector('meta[name="keywords"]')?.content || "";
-
-    const ariaTexts = [];
-    document.querySelectorAll("[aria-label]").forEach(el => {
-      ariaTexts.push(el.getAttribute("aria-label"));
-    });
-
-    const finalContent = [
-      faqBlocks.join("\n\n"),
-      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-      metaDescription,
-      metaKeywords,
-      ariaTexts.join(" "),
-      mainContent,
-    ].join("\n\n");
-
     return {
       headings,
       sections,
-      summary: faqBlocks.slice(0, 5),
-      content: finalContent,
+      summary: sections.slice(0, 5).map(s => s.text.slice(0, 200)),
+      content,
     };
   });
 }
@@ -171,8 +146,16 @@ async function crawlSmart(startUrl) {
   console.log("[TARGETS]", targets.length);
 
   for (const url of targets) {
-    if (Date.now() > deadline) break;
-    if (visited.has(url)) continue;
+    if (Date.now() > deadline) {
+      console.log("[STOP] Deadline reached");
+      break;
+    }
+
+    if (visited.has(url)) {
+      console.log("[SKIP] Already visited", url);
+      continue;
+    }
+
     visited.add(url);
 
     try {
@@ -180,12 +163,16 @@ async function crawlSmart(startUrl) {
 
       const title = clean(await page.title());
       const pageType = detectPageType(url, title);
+
       const data = await extractStructured(page);
       const words = countWords(data.content);
 
       console.log("[PAGE]", url, "| type:", pageType, "| words:", words);
 
-      if (words < MIN_WORDS) continue;
+      if (words < MIN_WORDS) {
+        console.log("[SKIP] Too few words", url);
+        continue;
+      }
 
       pages.push({
         url,
@@ -200,6 +187,7 @@ async function crawlSmart(startUrl) {
       });
 
       console.log("[SAVE]", url);
+
     } catch (e) {
       console.error("[PAGE FAIL]", url, e.message);
       pages.push({ url, status: "failed" });
@@ -214,6 +202,12 @@ async function crawlSmart(startUrl) {
 // ================= HTTP SERVER =================
 http.createServer((req, res) => {
   console.log("[HTTP]", req.method, req.url);
+
+  // ✅ HEALTH CHECK / BROWSER
+  if (req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("Crawler is running");
+  }
 
   if (req.method !== "POST") {
     res.writeHead(405);
