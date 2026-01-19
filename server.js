@@ -1,6 +1,6 @@
 import http from "http";
 import { chromium } from "playwright";
-import Tesseract from "tesseract.js";
+// ❌ МАХНАТО: import Tesseract from "tesseract.js";
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -45,14 +45,17 @@ function detectPageType(url = "", title = "") {
 }
 
 /* =========================
-   IMAGE OCR EXTRACTOR (REAL)
+   IMAGE OCR EXTRACTOR (LAZY, SAFE)
 ========================= */
 async function extractImageText(page) {
+  // ✅ lazy-load, иначе крашва boot-а
+  const { default: Tesseract } = await import("tesseract.js");
+
   const elements = await page.$$(
     "img, button img, a img, button, a"
   );
 
-  let extracted = [];
+  const extracted = [];
   let taken = 0;
 
   for (const el of elements) {
@@ -185,10 +188,7 @@ async function crawlSmart(startUrl) {
       const data = await extractStructured(page);
       const imageText = await extractImageText(page);
 
-      const mergedContent = clean(
-        data.content + " " + imageText
-      );
-
+      const mergedContent = clean(data.content + " " + imageText);
       const words = countWords(mergedContent);
       if (words < MIN_WORDS) continue;
 
@@ -202,7 +202,7 @@ async function crawlSmart(startUrl) {
         status: "ok",
       });
 
-    } catch (e) {
+    } catch {
       pages.push({ url, status: "failed" });
     }
   }
