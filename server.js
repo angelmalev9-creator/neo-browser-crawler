@@ -19,6 +19,7 @@ const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 ========================= */
 async function safeGoto(page, url, timeout = 12000) {
   try {
+    console.log("[GOTO]", url);
     await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
     return true;
   } catch (e) {
@@ -40,7 +41,7 @@ function detectPageType(url = "", title = "") {
 }
 
 /* =========================
-   STRUCTURED EXTRACTOR (ENRICHED, FAST)
+   STRUCTURED EXTRACTOR
 ========================= */
 async function extractStructured(page) {
   try {
@@ -52,7 +53,6 @@ async function extractStructured(page) {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
-    // accept cookies (best effort)
     document.querySelectorAll("button").forEach(b => {
       const t = (b.innerText || "").toLowerCase();
       if (
@@ -85,20 +85,17 @@ async function extractStructured(page) {
         }
       });
 
-    // MAIN CONTENT
     let content =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    // META TEXT (евтино, но много полезно)
     const metaDescription =
       document.querySelector('meta[name="description"]')?.content || "";
     const metaKeywords =
       document.querySelector('meta[name="keywords"]')?.content || "";
 
-    // ARIA / ACCESSIBILITY TEXT
     const ariaTexts = [];
     document.querySelectorAll("[aria-label]").forEach(el => {
       ariaTexts.push(el.getAttribute("aria-label"));
@@ -146,25 +143,13 @@ async function collectNavLinks(page, base) {
   }, base);
 }
 
-async function collectContentLinks(page, base) {
-  return await page.evaluate((base) => {
-    const urls = new Set();
-    document
-      .querySelectorAll("main a[href], article a[href]")
-      .forEach(a => {
-        try {
-          urls.add(new URL(a.href, base).href);
-        } catch {}
-      });
-    return Array.from(urls);
-  }, base);
-}
-
 /* =========================
    SMART CRAWLER
 ========================= */
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
+
+  console.log("[CRAWL START]", startUrl);
 
   const browser = await chromium.launch({
     headless: true,
@@ -197,9 +182,19 @@ async function crawlSmart(startUrl) {
     u => u.startsWith(base) && !SKIP_URL_RE.test(u)
   );
 
+  console.log("[TARGETS]", targets.length);
+
   for (const url of targets) {
-    if (Date.now() > deadline) break;
-    if (visited.has(url)) continue;
+    if (Date.now() > deadline) {
+      console.log("[STOP] Deadline reached");
+      break;
+    }
+
+    if (visited.has(url)) {
+      console.log("[SKIP] Already visited", url);
+      continue;
+    }
+
     visited.add(url);
 
     try {
@@ -209,7 +204,12 @@ async function crawlSmart(startUrl) {
       const data = await extractStructured(page);
       const words = countWords(data.content);
 
-      if (words < MIN_WORDS) continue;
+      console.log("[PAGE]", url, "| words:", words);
+
+      if (words < MIN_WORDS) {
+        console.log("[SKIP] Too few words", url);
+        continue;
+      }
 
       pages.push({
         url,
@@ -223,12 +223,16 @@ async function crawlSmart(startUrl) {
         status: "ok",
       });
 
-    } catch {
+      console.log("[SAVE]", url);
+
+    } catch (e) {
+      console.error("[PAGE FAIL]", url, e.message);
       pages.push({ url, status: "failed" });
     }
   }
 
   await browser.close();
+  console.log("[CRAWL DONE] Pages saved:", pages.length);
   return pages;
 }
 
@@ -236,6 +240,8 @@ async function crawlSmart(startUrl) {
    HTTP SERVER
 ========================= */
 http.createServer((req, res) => {
+  console.log("[HTTP]", req.method, req.url);
+
   if (req.method !== "POST") {
     res.writeHead(405);
     return res.end();
@@ -246,7 +252,7 @@ http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
-      if (!url) throw new Error("Missing url");
+      console.log("[REQUEST]", url);
 
       const pages = await crawlSmart(url);
 
@@ -257,6 +263,7 @@ http.createServer((req, res) => {
         pages,
       }));
     } catch (e) {
+      console.error("[CRAWL ERROR]", e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
