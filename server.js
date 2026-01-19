@@ -19,10 +19,7 @@ const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 ========================= */
 async function safeGoto(page, url, timeout = 12000) {
   try {
-    await page.goto(url, {
-      timeout,
-      waitUntil: "domcontentloaded",
-    });
+    await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
     return true;
   } catch (e) {
     console.error("[GOTO FAIL]", url, e.message);
@@ -43,25 +40,7 @@ function detectPageType(url = "", title = "") {
 }
 
 /* =========================
-   IMAGE TEXT EXTRACTOR (NO OCR)
-========================= */
-async function extractImageText(page) {
-  return await page.evaluate(() => {
-    const texts = [];
-
-    document.querySelectorAll("img").forEach(img => {
-      if (img.alt) texts.push(img.alt);
-      if (img.title) texts.push(img.title);
-      if (img.getAttribute("aria-label"))
-        texts.push(img.getAttribute("aria-label"));
-    });
-
-    return texts.join(" ");
-  });
-}
-
-/* =========================
-   STRUCTURED EXTRACTOR
+   STRUCTURED EXTRACTOR (ENRICHED, FAST)
 ========================= */
 async function extractStructured(page) {
   try {
@@ -73,6 +52,7 @@ async function extractStructured(page) {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
+    // accept cookies (best effort)
     document.querySelectorAll("button").forEach(b => {
       const t = (b.innerText || "").toLowerCase();
       if (
@@ -85,17 +65,67 @@ async function extractStructured(page) {
       }
     });
 
-    const headings = [...document.querySelectorAll("h1,h2,h3")]
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3")
+    )
       .filter(h => h.offsetParent !== null)
       .map(h => h.innerText.trim());
 
+    const sections = [];
+    let current = null;
+
+    document
+      .querySelectorAll("h1, h2, h3, p, li")
+      .forEach(el => {
+        if (el.tagName.startsWith("H")) {
+          current = { heading: el.innerText.trim(), text: "" };
+          sections.push(current);
+        } else if (current) {
+          current.text += " " + el.innerText;
+        }
+      });
+
+    // MAIN CONTENT
     let content =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    return { headings, content };
+    // META TEXT (евтино, но много полезно)
+    const metaDescription =
+      document.querySelector('meta[name="description"]')?.content || "";
+    const metaKeywords =
+      document.querySelector('meta[name="keywords"]')?.content || "";
+
+    // ARIA / ACCESSIBILITY TEXT
+    const ariaTexts = [];
+    document.querySelectorAll("[aria-label]").forEach(el => {
+      ariaTexts.push(el.getAttribute("aria-label"));
+    });
+
+    const summary = [];
+    document.querySelectorAll("p, li").forEach(el => {
+      const t = el.innerText.trim();
+      if (t.length > 60 && summary.length < 5) {
+        summary.push(t);
+      }
+    });
+
+    return {
+      headings,
+      sections: sections.map(s => ({
+        heading: s.heading,
+        text: s.text.trim(),
+      })),
+      summary,
+      content: [
+        metaDescription,
+        metaKeywords,
+        ariaTexts.join(" "),
+        content,
+      ].join(" "),
+    };
   });
 }
 
@@ -107,6 +137,20 @@ async function collectNavLinks(page, base) {
     const urls = new Set();
     document
       .querySelectorAll("header a[href], nav a[href], footer a[href]")
+      .forEach(a => {
+        try {
+          urls.add(new URL(a.href, base).href);
+        } catch {}
+      });
+    return Array.from(urls);
+  }, base);
+}
+
+async function collectContentLinks(page, base) {
+  return await page.evaluate((base) => {
+    const urls = new Set();
+    document
+      .querySelectorAll("main a[href], article a[href]")
       .forEach(a => {
         try {
           urls.add(new URL(a.href, base).href);
@@ -131,7 +175,7 @@ async function crawlSmart(startUrl) {
 
   await context.route("**/*", route => {
     const type = route.request().resourceType();
-    if (["media", "font"].includes(type)) {
+    if (["image", "media", "font"].includes(type)) {
       return route.abort();
     }
     route.continue();
@@ -149,7 +193,6 @@ async function crawlSmart(startUrl) {
 
   let targets = await collectNavLinks(page, base);
   targets.unshift(page.url());
-
   targets = targets.filter(
     u => u.startsWith(base) && !SKIP_URL_RE.test(u)
   );
@@ -164,26 +207,23 @@ async function crawlSmart(startUrl) {
 
       const title = clean(await page.title());
       const data = await extractStructured(page);
-      const imageText = await extractImageText(page);
+      const words = countWords(data.content);
 
-      const mergedContent = clean(
-        data.content + " " + imageText
-      );
-
-      const words = countWords(mergedContent);
       if (words < MIN_WORDS) continue;
 
       pages.push({
         url,
         title,
         pageType: detectPageType(url, title),
-        content: mergedContent,
-        imageText,
+        headings: data.headings,
+        sections: data.sections,
+        summary: data.summary,
+        content: clean(data.content),
         wordCount: words,
         status: "ok",
       });
 
-    } catch (e) {
+    } catch {
       pages.push({ url, status: "failed" });
     }
   }
@@ -211,7 +251,11 @@ http.createServer((req, res) => {
       const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, pages }));
+      res.end(JSON.stringify({
+        success: true,
+        pagesCount: pages.length,
+        pages,
+      }));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ success: false, error: e.message }));
