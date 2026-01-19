@@ -1,105 +1,92 @@
 import http from "http";
 import { chromium } from "playwright";
+import Tesseract from "tesseract.js";
 
 const PORT = Number(process.env.PORT || 10000);
 
-// ================= LIMITS =================
+// DETAIL-FIRST LIMITS
 const MAX_SECONDS = 45;
 const MIN_WORDS = 30;
 const MAX_CHILD_PER_PAGE = 4;
 
-// OCR limits
-const MAX_OCR_ELEMENTS = 4;
+// OCR LIMITS
+const MAX_OCR_ELEMENTS = 6;
 const MIN_OCR_AREA = 2500; // px²
-const OCR_TIMEOUT_MS = 3000;
 
-// ================= UTILS =================
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
 
 const clean = (t = "") => t.replace(/\s+/g, " ").trim();
 const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("timeout")), ms)
-    ),
-  ]);
-}
-
-// ================= SAFE GOTO =================
+/* =========================
+   SAFE GOTO
+========================= */
 async function safeGoto(page, url, timeout = 12000) {
   try {
     await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
     return true;
   } catch (e) {
-    console.error("[GOTO FAIL]", url);
+    console.error("[GOTO FAIL]", url, e.message);
     return false;
   }
 }
 
-// ================= PAGE TYPE =================
+/* =========================
+   PAGE TYPE DETECTOR
+========================= */
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
   if (/za-nas|about/.test(s)) return "about";
-  if (/uslugi|services|pricing|price/.test(s)) return "services";
+  if (/uslugi|services/.test(s)) return "services";
   if (/kontakti|contact/.test(s)) return "contact";
   if (/blog|news|article/.test(s)) return "blog";
   return "general";
 }
 
-// ================= OCR =================
-async function extractImageText(page, pageType) {
-  // OCR само когато има смисъл
-  if (!["services", "general"].includes(pageType)) return "";
+/* =========================
+   IMAGE OCR EXTRACTOR (REAL)
+========================= */
+async function extractImageText(page) {
+  const elements = await page.$$(
+    "img, button img, a img, button, a"
+  );
 
-  const images = await page.$$("img");
-  if (!images.length) return "";
-
-  let Tesseract;
-  try {
-    ({ default: Tesseract } = await import("tesseract.js"));
-  } catch {
-    return "";
-  }
-
-  const extracted = [];
+  let extracted = [];
   let taken = 0;
 
-  for (const img of images) {
+  for (const el of elements) {
     if (taken >= MAX_OCR_ELEMENTS) break;
 
     try {
-      const box = await img.boundingBox();
+      const box = await el.boundingBox();
       if (!box) continue;
 
-      if (box.width * box.height < MIN_OCR_AREA) continue;
+      const area = box.width * box.height;
+      if (area < MIN_OCR_AREA) continue;
 
-      const buffer = await img.screenshot({ type: "png" });
+      const buffer = await el.screenshot({ type: "png" });
 
-      const result = await withTimeout(
-        Tesseract.recognize(buffer, "eng+bul", {
-          tessedit_pageseg_mode: 6,
-        }),
-        OCR_TIMEOUT_MS
-      );
+      const result = await Tesseract.recognize(buffer, "eng+bul", {
+        tessedit_pageseg_mode: 6,
+      });
 
-      const text = clean(result?.data?.text || "");
+      const text = clean(result.data.text || "");
       if (text.length > 3) {
         extracted.push(text);
         taken++;
       }
     } catch {
-      // OCR fail → skip
+      // silent skip
     }
   }
 
   return extracted.join(" ");
 }
 
-// ================= CONTENT =================
+/* =========================
+   STRUCTURED EXTRACTOR
+========================= */
 async function extractStructured(page) {
   try {
     await page.waitForSelector("body", { timeout: 3000 });
@@ -110,11 +97,23 @@ async function extractStructured(page) {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
+    document.querySelectorAll("button").forEach(b => {
+      const t = (b.innerText || "").toLowerCase();
+      if (
+        t.includes("accept") ||
+        t.includes("agree") ||
+        t.includes("allow") ||
+        t.includes("прием")
+      ) {
+        b.click();
+      }
+    });
+
     const headings = [...document.querySelectorAll("h1,h2,h3")]
       .filter(h => h.offsetParent !== null)
       .map(h => h.innerText.trim());
 
-    const content =
+    let content =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
@@ -124,9 +123,11 @@ async function extractStructured(page) {
   });
 }
 
-// ================= LINKS =================
+/* =========================
+   LINK COLLECTORS
+========================= */
 async function collectNavLinks(page, base) {
-  return await page.evaluate(base => {
+  return await page.evaluate((base) => {
     const urls = new Set();
     document
       .querySelectorAll("header a[href], nav a[href], footer a[href]")
@@ -139,7 +140,9 @@ async function collectNavLinks(page, base) {
   }, base);
 }
 
-// ================= CRAWLER =================
+/* =========================
+   SMART CRAWLER
+========================= */
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
 
@@ -159,7 +162,7 @@ async function crawlSmart(startUrl) {
   const page = await context.newPage();
   if (!(await safeGoto(page, startUrl, 15000))) {
     await browser.close();
-    throw new Error("Start URL failed");
+    throw new Error("Failed to load start URL");
   }
 
   const base = new URL(page.url()).origin;
@@ -175,30 +178,31 @@ async function crawlSmart(startUrl) {
     if (visited.has(url)) continue;
     visited.add(url);
 
-    if (!(await safeGoto(page, url))) continue;
-
     try {
+      if (!(await safeGoto(page, url))) continue;
+
       const title = clean(await page.title());
-      const pageType = detectPageType(url, title);
-
       const data = await extractStructured(page);
-      const imageText = await extractImageText(page, pageType);
+      const imageText = await extractImageText(page);
 
-      const mergedContent = clean(data.content + " " + imageText);
+      const mergedContent = clean(
+        data.content + " " + imageText
+      );
+
       const words = countWords(mergedContent);
       if (words < MIN_WORDS) continue;
 
       pages.push({
         url,
         title,
-        pageType,
+        pageType: detectPageType(url, title),
         content: mergedContent,
         imageText,
         wordCount: words,
         status: "ok",
       });
 
-    } catch {
+    } catch (e) {
       pages.push({ url, status: "failed" });
     }
   }
@@ -207,7 +211,9 @@ async function crawlSmart(startUrl) {
   return pages;
 }
 
-// ================= SERVER =================
+/* =========================
+   HTTP SERVER
+========================= */
 http.createServer((req, res) => {
   if (req.method !== "POST") {
     res.writeHead(405);
@@ -219,8 +225,6 @@ http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
-      if (!url) throw new Error("Missing url");
-
       const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -230,6 +234,4 @@ http.createServer((req, res) => {
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
   });
-}).listen(PORT, () => {
-  console.log("Crawler running on", PORT);
-});
+}).listen(PORT);
