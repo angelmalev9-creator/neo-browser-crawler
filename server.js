@@ -64,10 +64,21 @@ async function extractStructured(page) {
       }
     });
 
+    // ================= FAQ / ACCORDION (PRIORITY) =================
+    const faqBlocks = [];
+    document.querySelectorAll(
+      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
+    ).forEach(el => {
+      const t = el.innerText?.trim();
+      if (t && t.length > 40) faqBlocks.push(t);
+    });
+
+    // ================= HEADINGS =================
     const headings = [...document.querySelectorAll("h1,h2,h3")]
       .filter(h => h.offsetParent !== null)
       .map(h => h.innerText.trim());
 
+    // ================= SECTIONS =================
     const sections = [];
     let current = null;
 
@@ -80,17 +91,46 @@ async function extractStructured(page) {
       }
     });
 
-    const content =
+    // ================= MAIN CONTENT =================
+    const mainContent =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
+    // ================= META / ARIA =================
+    const metaDescription =
+      document.querySelector('meta[name="description"]')?.content || "";
+    const metaKeywords =
+      document.querySelector('meta[name="keywords"]')?.content || "";
+
+    const ariaTexts = [];
+    document.querySelectorAll("[aria-label]").forEach(el => {
+      ariaTexts.push(el.getAttribute("aria-label"));
+    });
+
+    // ================= FINAL PRIORITIZED CONTENT =================
+    const finalContent = [
+      // 1. FAQ first (kills clichés)
+      faqBlocks.join("\n\n"),
+
+      // 2. Structured sections
+      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+
+      // 3. Meta / accessibility
+      metaDescription,
+      metaKeywords,
+      ariaTexts.join(" "),
+
+      // 4. Raw content last
+      mainContent,
+    ].join("\n\n");
+
     return {
       headings,
       sections,
-      summary: sections.slice(0, 5).map(s => s.text.slice(0, 200)),
-      content,
+      summary: faqBlocks.slice(0, 5),
+      content: finalContent,
     };
   });
 }
@@ -202,12 +242,6 @@ async function crawlSmart(startUrl) {
 // ================= HTTP SERVER =================
 http.createServer((req, res) => {
   console.log("[HTTP]", req.method, req.url);
-
-  // ✅ HEALTH CHECK / BROWSER
-  if (req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("Crawler is running");
-  }
 
   if (req.method !== "POST") {
     res.writeHead(405);
