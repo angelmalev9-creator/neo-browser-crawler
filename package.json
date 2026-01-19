@@ -7,8 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "playwright": "^1.41.0",
-    "xml2js": "^0.6.2",
-    "tesseract.js": "^5.0.5"
+    "playwright": "^1.41.0"
   }
 }
