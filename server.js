@@ -1,5 +1,6 @@
 import http from "http";
 import { chromium } from "playwright";
+import Tesseract from "tesseract.js";
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -8,6 +9,10 @@ const MAX_SECONDS = 45;
 const MIN_WORDS = 30;
 const MAX_CHILD_PER_PAGE = 4;
 
+// OCR LIMITS
+const MAX_OCR_ELEMENTS = 6;
+const MIN_OCR_AREA = 2500; // px²
+
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
 
@@ -15,14 +20,11 @@ const clean = (t = "") => t.replace(/\s+/g, " ").trim();
 const countWords = (t = "") => t.split(" ").filter(w => w.length > 2).length;
 
 /* =========================
-   SAFE GOTO (NO SILENT FAIL)
+   SAFE GOTO
 ========================= */
 async function safeGoto(page, url, timeout = 12000) {
   try {
-    await page.goto(url, {
-      timeout,
-      waitUntil: "domcontentloaded",
-    });
+    await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
     return true;
   } catch (e) {
     console.error("[GOTO FAIL]", url, e.message);
@@ -43,28 +45,47 @@ function detectPageType(url = "", title = "") {
 }
 
 /* =========================
-   IMAGE TEXT EXTRACTOR
+   IMAGE OCR EXTRACTOR (REAL)
 ========================= */
 async function extractImageText(page) {
-  return await page.evaluate(() => {
-    const texts = [];
+  const elements = await page.$$(
+    "img, button img, a img, button, a"
+  );
 
-    document.querySelectorAll("img").forEach(img => {
-      if (img.alt) texts.push(img.alt);
-      if (img.title) texts.push(img.title);
-      if (img.getAttribute("aria-label"))
-        texts.push(img.getAttribute("aria-label"));
-    });
+  let extracted = [];
+  let taken = 0;
 
-    // OCR HOOK (placeholder)
-    // тук по-късно се връзва Tesseract / external OCR API
+  for (const el of elements) {
+    if (taken >= MAX_OCR_ELEMENTS) break;
 
-    return texts.join(" ");
-  });
+    try {
+      const box = await el.boundingBox();
+      if (!box) continue;
+
+      const area = box.width * box.height;
+      if (area < MIN_OCR_AREA) continue;
+
+      const buffer = await el.screenshot({ type: "png" });
+
+      const result = await Tesseract.recognize(buffer, "eng+bul", {
+        tessedit_pageseg_mode: 6,
+      });
+
+      const text = clean(result.data.text || "");
+      if (text.length > 3) {
+        extracted.push(text);
+        taken++;
+      }
+    } catch {
+      // silent skip
+    }
+  }
+
+  return extracted.join(" ");
 }
 
 /* =========================
-   STRUCTURED EXTRACTOR (ROBUST)
+   STRUCTURED EXTRACTOR
 ========================= */
 async function extractStructured(page) {
   try {
@@ -88,52 +109,17 @@ async function extractStructured(page) {
       }
     });
 
-    const headings = Array.from(
-      document.querySelectorAll("h1, h2, h3")
-    )
+    const headings = [...document.querySelectorAll("h1,h2,h3")]
       .filter(h => h.offsetParent !== null)
       .map(h => h.innerText.trim());
 
-    const sections = [];
-    let current = null;
+    let content =
+      document.querySelector("main")?.innerText ||
+      document.querySelector("article")?.innerText ||
+      document.body.innerText ||
+      "";
 
-    document
-      .querySelectorAll("h1, h2, h3, p, li")
-      .forEach(el => {
-        if (el.tagName.startsWith("H")) {
-          current = { heading: el.innerText.trim(), text: "" };
-          sections.push(current);
-        } else if (current) {
-          current.text += " " + el.innerText;
-        }
-      });
-
-    let content = "";
-    if (document.querySelector("main")) {
-      content = document.querySelector("main").innerText;
-    } else if (document.querySelector("article")) {
-      content = document.querySelector("article").innerText;
-    } else {
-      content = document.body.innerText || "";
-    }
-
-    const summary = [];
-    document.querySelectorAll("p, li").forEach(el => {
-      const t = el.innerText.trim();
-      if (t.length > 60 && summary.length < 5) {
-        summary.push(t);
-      }
-    });
-
-    return {
-      headings,
-      sections: sections.map(s => ({
-        heading: s.heading,
-        text: s.text.trim(),
-      })),
-      summary,
-      content,
-    };
+    return { headings, content };
   });
 }
 
@@ -145,20 +131,6 @@ async function collectNavLinks(page, base) {
     const urls = new Set();
     document
       .querySelectorAll("header a[href], nav a[href], footer a[href]")
-      .forEach(a => {
-        try {
-          urls.add(new URL(a.href, base).href);
-        } catch {}
-      });
-    return Array.from(urls);
-  }, base);
-}
-
-async function collectContentLinks(page, base) {
-  return await page.evaluate((base) => {
-    const urls = new Set();
-    document
-      .querySelectorAll("main a[href], article a[href]")
       .forEach(a => {
         try {
           urls.add(new URL(a.href, base).href);
@@ -183,9 +155,7 @@ async function crawlSmart(startUrl) {
 
   await context.route("**/*", route => {
     const type = route.request().resourceType();
-    if (["media", "font"].includes(type)) {
-      return route.abort();
-    }
+    if (["media", "font"].includes(type)) return route.abort();
     route.continue();
   });
 
@@ -199,14 +169,9 @@ async function crawlSmart(startUrl) {
   const visited = new Set();
   const pages = [];
 
-  console.log("[CRAWL] Start", page.url());
-
   let targets = await collectNavLinks(page, base);
   targets.unshift(page.url());
-
-  targets = targets.filter(
-    u => u.startsWith(base) && !SKIP_URL_RE.test(u)
-  );
+  targets = targets.filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u));
 
   for (const url of targets) {
     if (Date.now() > deadline) break;
@@ -225,35 +190,24 @@ async function crawlSmart(startUrl) {
       );
 
       const words = countWords(mergedContent);
-
-      if (words < MIN_WORDS) {
-        console.log("[SKIP] Thin page", url);
-        continue;
-      }
+      if (words < MIN_WORDS) continue;
 
       pages.push({
         url,
         title,
         pageType: detectPageType(url, title),
-        headings: data.headings,
-        sections: data.sections,
-        summary: data.summary,
         content: mergedContent,
         imageText,
         wordCount: words,
         status: "ok",
       });
 
-      console.log("[SAVE]", url, words);
-
     } catch (e) {
-      console.error("[PAGE FAIL]", url, e.message);
       pages.push({ url, status: "failed" });
     }
   }
 
   await browser.close();
-  console.log("[DONE] Pages:", pages.length);
   return pages;
 }
 
@@ -271,22 +225,13 @@ http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
-      if (!url) throw new Error("Missing url");
-
       const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        pagesCount: pages.length,
-        pages,
-      }));
+      res.end(JSON.stringify({ success: true, pages }));
     } catch (e) {
-      console.error("[CRAWL ERROR]", e.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
+      res.writeHead(500);
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
   });
-}).listen(PORT, () => {
-  console.log("Crawler running on", PORT);
-});
+}).listen(PORT);
