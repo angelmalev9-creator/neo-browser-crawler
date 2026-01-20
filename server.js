@@ -1,6 +1,5 @@
 import http from "http";
 import { chromium } from "playwright";
-import fetch from "node-fetch";
 
 const PORT = Number(process.env.PORT || 10000);
 
