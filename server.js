@@ -1,15 +1,17 @@
 import http from "http";
 import { chromium } from "playwright";
+import fetch from "node-fetch";
 
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 180; // бавно и стабилно
+const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
+const MAX_OCR_IMAGES = 5;
 
 // режем САМО реален шум
 const SKIP_URL_RE =
-  /(wp-content|uploads|media|images|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
+  /(wp-content|uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
 // ================= UTILS =================
 const clean = (t = "") => t.replace(/\s+/g, " ").trim();
@@ -32,7 +34,7 @@ async function safeGoto(page, url, timeout = 20000) {
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
   if (/za-nas|about/.test(s)) return "about";
-  if (/uslugi|services|pricing|price/.test(s)) return "services";
+  if (/uslugi|services|pricing|price|ceni/.test(s)) return "services";
   if (/kontakti|contact/.test(s)) return "contact";
   if (/faq|vuprosi|questions/.test(s)) return "faq";
   if (/blog|news|article/.test(s)) return "blog";
@@ -45,7 +47,6 @@ async function extractStructured(page) {
     await page.waitForSelector("body", { timeout: 5000 });
   } catch {}
 
-  // ❗ ТУК НЯМА clean(), НЯМА Node функции
   return await page.evaluate(() => {
     const headings = Array.from(document.querySelectorAll("h1,h2,h3"))
       .map(h => h.innerText.trim())
@@ -63,35 +64,85 @@ async function extractStructured(page) {
       }
     });
 
-    const faqBlocks = [];
-    document.querySelectorAll(
-      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
-    ).forEach(el => {
-      const t = el.innerText?.trim();
-      if (t && t.length > 40) faqBlocks.push(t);
-    });
-
     const mainContent =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    const metaDescription =
-      document.querySelector('meta[name="description"]')?.content || "";
-
     return {
       headings,
       sections,
-      summary: faqBlocks.slice(0, 10),
       rawContent: [
-        faqBlocks.join("\n\n"),
         sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-        metaDescription,
         mainContent,
       ].join("\n\n"),
     };
   });
+}
+
+// ================= IMAGE METADATA =================
+async function extractImageCandidates(page) {
+  return await page.evaluate(() => {
+    const imgs = [];
+
+    document.querySelectorAll("img").forEach(img => {
+      const src = img.src;
+      if (!src) return;
+
+      const textHints = [
+        img.alt,
+        img.title,
+        img.getAttribute("aria-label"),
+        img.closest("figure")?.querySelector("figcaption")?.innerText,
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      const rect = img.getBoundingClientRect();
+
+      imgs.push({
+        src,
+        textHints,
+        width: rect.width,
+        height: rect.height,
+      });
+    });
+
+    return imgs;
+  });
+}
+
+// ================= GOOGLE VISION OCR =================
+async function ocrImage(imageUrl) {
+  const apiKey = process.env.GOOGLE_VISION_API_KEY;
+  if (!apiKey) return "";
+
+  try {
+    const res = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [
+            {
+              image: { source: { imageUri: imageUrl } },
+              features: [{ type: "TEXT_DETECTION" }],
+            },
+          ],
+        }),
+      }
+    );
+
+    const json = await res.json();
+    return (
+      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || ""
+    );
+  } catch (e) {
+    console.error("[OCR FAIL]", e.message);
+    return "";
+  }
 }
 
 // ================= LINK DISCOVERY =================
@@ -119,14 +170,8 @@ async function crawlSmart(startUrl) {
   });
 
   const context = await browser.newContext();
-
-  await context.route("**/*", route => {
-    const type = route.request().resourceType();
-    if (["image", "media", "font"].includes(type)) return route.abort();
-    route.continue();
-  });
-
   const page = await context.newPage();
+
   if (!(await safeGoto(page, startUrl))) {
     await browser.close();
     throw new Error("Failed to load start URL");
@@ -137,88 +182,101 @@ async function crawlSmart(startUrl) {
   const queue = [page.url()];
   const pages = [];
 
-  console.log("[QUEUE INIT]", queue.length);
+  const stats = {
+    visited: 0,
+    saved: 0,
+    byType: {},
+    ocrImagesUsed: 0,
+  };
 
   while (queue.length && Date.now() < deadline) {
     const url = queue.shift();
     if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
 
     visited.add(url);
+    stats.visited++;
 
     if (!(await safeGoto(page, url))) continue;
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
+    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     const data = await extractStructured(page);
-    const content = clean(data.rawContent);
-    const words = countWords(content);
 
-    console.log(
-      `[PAGE]\n  url=${url}\n  type=${pageType}\n  words=${words}\n  headings=${data.headings.length}\n  sections=${data.sections.length}\n`
-    );
+    // IMAGE OCR
+    const images = await extractImageCandidates(page);
+    let ocrText = "";
+
+    for (const img of images) {
+      if (stats.ocrImagesUsed >= MAX_OCR_IMAGES) break;
+      if (img.width < 300 || img.height < 300) continue;
+      if (!/price|pricing|ceni|offer|table/i.test(img.textHints)) continue;
+
+      const text = await ocrImage(img.src);
+      if (text) {
+        ocrText += "\n[IMAGE_TEXT]\n" + text;
+        stats.ocrImagesUsed++;
+      }
+    }
+
+    const content = clean(data.rawContent + "\n" + ocrText);
+    const words = countWords(content);
 
     if (words >= MIN_WORDS) {
       pages.push({
         url,
         title,
         pageType,
-        headings: data.headings,
-        sections: data.sections,
-        summary: data.summary,
         content,
         wordCount: words,
         status: "ok",
       });
-      console.log("[SAVE]", url);
-    } else {
-      console.log("[SKIP WORDS]", words);
+      stats.saved++;
     }
 
     const links = await collectAllLinks(page, base);
-    console.log("[LINKS FOUND]", links.length);
-
     links.forEach(l => {
-      if (!visited.has(l) && !SKIP_URL_RE.test(l)) {
-        queue.push(l);
-      }
+      if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
     });
-
-    console.log("[QUEUE SIZE]", queue.length);
   }
 
   await browser.close();
-  console.log("[CRAWL DONE] Pages saved:", pages.length);
-  return pages;
+  return { pages, stats };
 }
 
 // ================= HTTP SERVER =================
-http.createServer((req, res) => {
-  if (req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok" }));
-  }
-
-  if (req.method !== "POST") {
-    res.writeHead(405);
-    return res.end();
-  }
-
-  let body = "";
-  req.on("data", c => (body += c));
-  req.on("end", async () => {
-    try {
-      const { url } = JSON.parse(body || "{}");
-      console.log("\n[REQUEST]", url);
-      const pages = await crawlSmart(url);
+http
+  .createServer((req, res) => {
+    if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
-    } catch (e) {
-      console.error("[CRAWL ERROR]", e.message);
-      res.writeHead(500);
-      res.end(JSON.stringify({ success: false, error: e.message }));
+      return res.end(JSON.stringify({ status: "ok" }));
     }
+
+    if (req.method !== "POST") {
+      res.writeHead(405);
+      return res.end();
+    }
+
+    let body = "";
+    req.on("data", c => (body += c));
+    req.on("end", async () => {
+      try {
+        const { url } = JSON.parse(body || "{}");
+        const result = await crawlSmart(url);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, ...result }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(
+          JSON.stringify({
+            success: false,
+            error: e instanceof Error ? e.message : String(e),
+          })
+        );
+      }
+    });
+  })
+  .listen(PORT, () => {
+    console.log("Crawler running on", PORT);
   });
-}).listen(PORT, () => {
-  console.log("Crawler running on", PORT);
-});
