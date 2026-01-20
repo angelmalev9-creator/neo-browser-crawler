@@ -82,26 +82,16 @@ async function extractStructured(page) {
     const metaDescription =
       document.querySelector('meta[name="description"]')?.content || "";
 
-    const content = [
-      faqBlocks.join("\n\n"),
-      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-      metaDescription,
-      mainContent,
-    ].join("\n\n");
-
     return {
-      faqCount: faqBlocks.length,
-      sectionCount: sections.length,
       headings,
       sections,
       summary: faqBlocks.slice(0, 10),
-      content,
-      breakdown: {
-        faqWords: countWords(faqBlocks.join(" ")),
-        sectionWords: countWords(sections.map(s => s.text).join(" ")),
-        metaWords: countWords(metaDescription),
-        mainWords: countWords(mainContent),
-      },
+      content: [
+        faqBlocks.join("\n\n"),
+        sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+        metaDescription,
+        mainContent,
+      ].join("\n\n"),
     };
   });
 }
@@ -123,7 +113,7 @@ async function collectAllLinks(page, base) {
 // ================= CRAWLER =================
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
-  console.log("[CRAWL START]", startUrl);
+  console.log("\n[CRAWL START]", startUrl);
 
   const browser = await chromium.launch({
     headless: true,
@@ -147,30 +137,42 @@ async function crawlSmart(startUrl) {
   const base = new URL(page.url()).origin;
   const visited = new Set();
   const pages = [];
-  const queue = [page.url()];
+  const queue = [];
+
+  queue.push(page.url());
+  console.log("[QUEUE INIT]", queue.length);
 
   while (queue.length && Date.now() < deadline) {
     const url = queue.shift();
-    if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
+    if (!url) continue;
+
+    if (visited.has(url)) {
+      console.log("[SKIP VISITED]", url);
+      continue;
+    }
+
+    if (SKIP_URL_RE.test(url)) {
+      console.log("[SKIP FILTER]", url);
+      continue;
+    }
+
     visited.add(url);
 
     if (!(await safeGoto(page, url))) continue;
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
+
+    console.log(`[PAGE META] type=${pageType} | title="${title}"`);
+
     const data = await extractStructured(page);
+    const words = countWords(data.content);
 
-    const totalWords = countWords(data.content);
+    console.log(
+      `[EXTRACT] faq=${data.summary.length} | sections=${data.sections.length} | headings=${data.headings.length} | words=${words}`
+    );
 
-    console.log("────────────────────────────");
-    console.log("[PAGE]", url);
-    console.log(" type:", pageType);
-    console.log(" faq blocks:", data.faqCount, "| words:", data.breakdown.faqWords);
-    console.log(" sections:", data.sectionCount, "| words:", data.breakdown.sectionWords);
-    console.log(" main content words:", data.breakdown.mainWords);
-    console.log(" TOTAL WORDS:", totalWords);
-
-    if (totalWords >= MIN_WORDS) {
+    if (words >= MIN_WORDS) {
       pages.push({
         url,
         title,
@@ -179,17 +181,29 @@ async function crawlSmart(startUrl) {
         sections: data.sections,
         summary: data.summary,
         content: clean(data.content),
-        wordCount: totalWords,
-        breakdown: data.breakdown,
+        wordCount: words,
         status: "ok",
       });
-      console.log("[SAVE]");
+      console.log("[SAVE]", url);
+    } else {
+      console.log("[SKIP WORDS]", url, words);
     }
 
     const links = await collectAllLinks(page, base);
+    console.log("[LINKS FOUND]", links.length);
+
     links.forEach(l => {
-      if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
+      if (!visited.has(l) && !SKIP_URL_RE.test(l)) {
+        queue.push(l);
+      }
     });
+
+    console.log("[QUEUE SIZE]", queue.length);
+
+    if (Date.now() > deadline) {
+      console.log("[STOP] DEADLINE REACHED");
+      break;
+    }
   }
 
   await browser.close();
@@ -214,10 +228,12 @@ http.createServer((req, res) => {
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
+      console.log("\n[REQUEST]", url);
       const pages = await crawlSmart(url);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
     } catch (e) {
+      console.error("[CRAWL ERROR]", e.message);
       res.writeHead(500);
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
