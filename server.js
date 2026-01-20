@@ -86,6 +86,8 @@ async function ocrElementScreenshot(page, elementHandle) {
   if (!apiKey) return "";
 
   try {
+    console.log("[OCR] screenshot sent to Vision API");
+
     const buffer = await elementHandle.screenshot();
     const base64 = buffer.toString("base64");
 
@@ -106,6 +108,12 @@ async function ocrElementScreenshot(page, elementHandle) {
     );
 
     const json = await res.json();
+
+    console.log(
+      "[OCR] Vision response chars:",
+      json.responses?.[0]?.fullTextAnnotation?.text?.length || 0
+    );
+
     return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
   } catch (e) {
     console.error("[OCR FAIL]", e.message);
@@ -175,14 +183,20 @@ async function crawlSmart(startUrl) {
     // ===== OCR =====
     let ocrText = "";
 
-    if (pageType === "services") {
-      const blocks = await page.$$("section, div");
+    if (pageType === "services" || pageType === "general") {
+      console.log("[OCR] checking images on page:", url);
 
-      for (const block of blocks) {
+      const images = await page.$$("img");
+
+      for (const img of images) {
         if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-        const text = await ocrElementScreenshot(page, block);
+        const box = await img.boundingBox();
+        if (!box || box.width < 200 || box.height < 200) continue;
+
+        const text = await ocrElementScreenshot(page, img);
         if (text && /\d+\s?(€|лв|eur|bgn|кв\.?|sqm)/i.test(text)) {
+          console.log("[OCR HIT]", text.slice(0, 120));
           ocrText += "\n" + text;
           stats.ocrBlocksUsed++;
         }
