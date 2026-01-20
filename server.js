@@ -4,11 +4,12 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 60;
-const MIN_WORDS = 25;
+const MAX_SECONDS = 180; // 3 минути – вече си на Standard
+const MIN_WORDS = 20;
 
+// махаме category / page / tag – те са РЕАЛНИ страници
 const SKIP_URL_RE =
-  /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/|privacy|terms|cookies|gdpr)/i;
+  /(wp-content|uploads|media|images|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
 // ================= UTILS =================
 const clean = (t = "") => t.replace(/\s+/g, " ").trim();
@@ -16,7 +17,7 @@ const countWords = (t = "") =>
   t.split(/\s+/).filter(w => w.length > 2).length;
 
 // ================= SAFE GOTO =================
-async function safeGoto(page, url, timeout = 12000) {
+async function safeGoto(page, url, timeout = 15000) {
   try {
     console.log("[GOTO]", url);
     await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
@@ -45,9 +46,7 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-    ["header", "footer", "nav", "aside"].forEach(sel => {
-      document.querySelectorAll(sel).forEach(n => n.remove());
-    });
+    // ❗ НЕ махаме nav / footer – нужни са за съдържание
 
     const faqBlocks = [];
     document.querySelectorAll(
@@ -58,8 +57,8 @@ async function extractStructured(page) {
     });
 
     const headings = [...document.querySelectorAll("h1,h2,h3")]
-      .filter(h => h.offsetParent !== null)
-      .map(h => h.innerText.trim());
+      .map(h => h.innerText.trim())
+      .filter(Boolean);
 
     const sections = [];
     let current = null;
@@ -86,24 +85,24 @@ async function extractStructured(page) {
       headings,
       sections,
       summary: faqBlocks.slice(0, 10),
-      content: [
+      content: clean([
         faqBlocks.join("\n\n"),
         sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
         metaDescription,
         mainContent,
-      ].join("\n\n"),
+      ].join("\n\n")),
     };
   });
 }
 
-// ================= LINK DISCOVERY =================
+// ================= LINK DISCOVERY (FULL SITE) =================
 async function collectAllLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
     document.querySelectorAll("a[href]").forEach(a => {
       try {
         const u = new URL(a.href, base);
-        if (u.origin === base) urls.add(u.href);
+        if (u.origin === base) urls.add(u.href.split("#")[0]);
       } catch {}
     });
     return Array.from(urls);
@@ -129,32 +128,21 @@ async function crawlSmart(startUrl) {
   });
 
   const page = await context.newPage();
-  if (!(await safeGoto(page, startUrl, 15000))) {
+  if (!(await safeGoto(page, startUrl))) {
     await browser.close();
     throw new Error("Failed to load start URL");
   }
 
   const base = new URL(page.url()).origin;
   const visited = new Set();
+  const queue = [page.url()];
   const pages = [];
-  const queue = [];
 
-  queue.push(page.url());
   console.log("[QUEUE INIT]", queue.length);
 
   while (queue.length && Date.now() < deadline) {
     const url = queue.shift();
-    if (!url) continue;
-
-    if (visited.has(url)) {
-      console.log("[SKIP VISITED]", url);
-      continue;
-    }
-
-    if (SKIP_URL_RE.test(url)) {
-      console.log("[SKIP FILTER]", url);
-      continue;
-    }
+    if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
 
     visited.add(url);
 
@@ -162,14 +150,11 @@ async function crawlSmart(startUrl) {
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
-
-    console.log(`[PAGE META] type=${pageType} | title="${title}"`);
-
     const data = await extractStructured(page);
     const words = countWords(data.content);
 
     console.log(
-      `[EXTRACT] faq=${data.summary.length} | sections=${data.sections.length} | headings=${data.headings.length} | words=${words}`
+      `[PAGE] ${url}\n  type=${pageType}\n  words=${words}\n  headings=${data.headings.length}\n  sections=${data.sections.length}\n`
     );
 
     if (words >= MIN_WORDS) {
@@ -180,7 +165,7 @@ async function crawlSmart(startUrl) {
         headings: data.headings,
         sections: data.sections,
         summary: data.summary,
-        content: clean(data.content),
+        content: data.content,
         wordCount: words,
         status: "ok",
       });
@@ -199,11 +184,6 @@ async function crawlSmart(startUrl) {
     });
 
     console.log("[QUEUE SIZE]", queue.length);
-
-    if (Date.now() > deadline) {
-      console.log("[STOP] DEADLINE REACHED");
-      break;
-    }
   }
 
   await browser.close();
