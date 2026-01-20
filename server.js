@@ -212,7 +212,7 @@ async function crawlSmart(startUrl) {
   targets = targets
     .filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u))
     .sort((a, b) => {
-      const score = (u: string) => {
+const score = (u) => {
         let s = 0;
         if (/uslugi|services|pricing|price/.test(u)) s += 50;
         if (/kontakt|contact/.test(u)) s += 40;
