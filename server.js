@@ -6,7 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const MAX_OCR_IMAGES = 5;
+const MAX_OCR_BLOCKS = 3;
 
 // режем САМО реален шум
 const SKIP_URL_RE =
@@ -47,10 +47,6 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-    const headings = Array.from(document.querySelectorAll("h1,h2,h3"))
-      .map(h => h.innerText.trim())
-      .filter(Boolean);
-
     const sections = [];
     let current = null;
 
@@ -70,8 +66,6 @@ async function extractStructured(page) {
       "";
 
     return {
-      headings,
-      sections,
       rawContent: [
         sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
         mainContent,
@@ -80,44 +74,15 @@ async function extractStructured(page) {
   });
 }
 
-// ================= IMAGE METADATA =================
-async function extractImageCandidates(page) {
-  return await page.evaluate(() => {
-    const imgs = [];
-
-    document.querySelectorAll("img").forEach(img => {
-      const src = img.src;
-      if (!src) return;
-
-      const textHints = [
-        img.alt,
-        img.title,
-        img.getAttribute("aria-label"),
-        img.closest("figure")?.querySelector("figcaption")?.innerText,
-      ]
-        .filter(Boolean)
-        .join(" ");
-
-      const rect = img.getBoundingClientRect();
-
-      imgs.push({
-        src,
-        textHints,
-        width: rect.width,
-        height: rect.height,
-      });
-    });
-
-    return imgs;
-  });
-}
-
-// ================= GOOGLE VISION OCR =================
-async function ocrImage(imageUrl) {
+// ================= GOOGLE VISION OCR (SCREENSHOT) =================
+async function ocrElementScreenshot(page, elementHandle) {
   const apiKey = process.env.GOOGLE_VISION_API_KEY;
   if (!apiKey) return "";
 
   try {
+    const buffer = await elementHandle.screenshot();
+    const base64 = buffer.toString("base64");
+
     const res = await fetch(
       `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
       {
@@ -126,7 +91,7 @@ async function ocrImage(imageUrl) {
         body: JSON.stringify({
           requests: [
             {
-              image: { source: { imageUri: imageUrl } },
+              image: { content: base64 },
               features: [{ type: "TEXT_DETECTION" }],
             },
           ],
@@ -135,9 +100,7 @@ async function ocrImage(imageUrl) {
     );
 
     const json = await res.json();
-    return (
-      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || ""
-    );
+    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
   } catch (e) {
     console.error("[OCR FAIL]", e.message);
     return "";
@@ -185,7 +148,7 @@ async function crawlSmart(startUrl) {
     visited: 0,
     saved: 0,
     byType: {},
-    ocrImagesUsed: 0,
+    ocrBlocksUsed: 0,
   };
 
   while (queue.length && Date.now() < deadline) {
@@ -202,24 +165,30 @@ async function crawlSmart(startUrl) {
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     const data = await extractStructured(page);
-
-    // IMAGE OCR
-    const images = await extractImageCandidates(page);
     let ocrText = "";
 
-    for (const img of images) {
-      if (stats.ocrImagesUsed >= MAX_OCR_IMAGES) break;
-      if (img.width < 300 || img.height < 300) continue;
-      if (!/price|pricing|ceni|offer|table/i.test(img.textHints)) continue;
+    // ===== AGGRESSIVE OCR FOR SERVICES / PRICING =====
+    if (pageType === "services") {
+      const blocks = await page.$$("section, div");
 
-      const text = await ocrImage(img.src);
-      if (text) {
-        ocrText += "\n[IMAGE_TEXT]\n" + text;
-        stats.ocrImagesUsed++;
+      for (const block of blocks) {
+        if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+
+        const text = await ocrElementScreenshot(page, block);
+        if (text && /\d+\s?(€|лв|eur|bgn|кв\.?|sqm)/i.test(text)) {
+          ocrText += "\n[PRICING_FROM_IMAGE]\n" + text;
+          stats.ocrBlocksUsed++;
+        }
       }
     }
 
-    const content = clean(data.rawContent + "\n" + ocrText);
+    const content = clean(`
+${data.rawContent}
+
+=== VERIFIED PRICING FROM IMAGES ===
+${ocrText}
+`);
+
     const words = countWords(content);
 
     if (words >= MIN_WORDS) {
