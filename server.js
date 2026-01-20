@@ -4,10 +4,10 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 180; // 3 минути – вече си на Standard
+const MAX_SECONDS = 180; // бавно и стабилно
 const MIN_WORDS = 20;
 
-// махаме category / page / tag – те са РЕАЛНИ страници
+// режем САМО реален шум
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
@@ -17,7 +17,7 @@ const countWords = (t = "") =>
   t.split(/\s+/).filter(w => w.length > 2).length;
 
 // ================= SAFE GOTO =================
-async function safeGoto(page, url, timeout = 15000) {
+async function safeGoto(page, url, timeout = 20000) {
   try {
     console.log("[GOTO]", url);
     await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
@@ -42,21 +42,12 @@ function detectPageType(url = "", title = "") {
 // ================= STRUCTURED EXTRACTOR =================
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("body", { timeout: 3000 });
+    await page.waitForSelector("body", { timeout: 5000 });
   } catch {}
 
+  // ❗ ТУК НЯМА clean(), НЯМА Node функции
   return await page.evaluate(() => {
-    // ❗ НЕ махаме nav / footer – нужни са за съдържание
-
-    const faqBlocks = [];
-    document.querySelectorAll(
-      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
-    ).forEach(el => {
-      const t = el.innerText?.trim();
-      if (t && t.length > 40) faqBlocks.push(t);
-    });
-
-    const headings = [...document.querySelectorAll("h1,h2,h3")]
+    const headings = Array.from(document.querySelectorAll("h1,h2,h3"))
       .map(h => h.innerText.trim())
       .filter(Boolean);
 
@@ -72,6 +63,14 @@ async function extractStructured(page) {
       }
     });
 
+    const faqBlocks = [];
+    document.querySelectorAll(
+      '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
+    ).forEach(el => {
+      const t = el.innerText?.trim();
+      if (t && t.length > 40) faqBlocks.push(t);
+    });
+
     const mainContent =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
@@ -85,17 +84,17 @@ async function extractStructured(page) {
       headings,
       sections,
       summary: faqBlocks.slice(0, 10),
-      content: clean([
+      rawContent: [
         faqBlocks.join("\n\n"),
         sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
         metaDescription,
         mainContent,
-      ].join("\n\n")),
+      ].join("\n\n"),
     };
   });
 }
 
-// ================= LINK DISCOVERY (FULL SITE) =================
+// ================= LINK DISCOVERY =================
 async function collectAllLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
@@ -150,11 +149,13 @@ async function crawlSmart(startUrl) {
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
+
     const data = await extractStructured(page);
-    const words = countWords(data.content);
+    const content = clean(data.rawContent);
+    const words = countWords(content);
 
     console.log(
-      `[PAGE] ${url}\n  type=${pageType}\n  words=${words}\n  headings=${data.headings.length}\n  sections=${data.sections.length}\n`
+      `[PAGE]\n  url=${url}\n  type=${pageType}\n  words=${words}\n  headings=${data.headings.length}\n  sections=${data.sections.length}\n`
     );
 
     if (words >= MIN_WORDS) {
@@ -165,13 +166,13 @@ async function crawlSmart(startUrl) {
         headings: data.headings,
         sections: data.sections,
         summary: data.summary,
-        content: data.content,
+        content,
         wordCount: words,
         status: "ok",
       });
       console.log("[SAVE]", url);
     } else {
-      console.log("[SKIP WORDS]", url, words);
+      console.log("[SKIP WORDS]", words);
     }
 
     const links = await collectAllLinks(page, base);
