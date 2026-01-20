@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 60; // повече време, но стабилно
+const MAX_SECONDS = 60;
 const MIN_WORDS = 25;
 
 const SKIP_URL_RE =
@@ -82,21 +82,31 @@ async function extractStructured(page) {
     const metaDescription =
       document.querySelector('meta[name="description"]')?.content || "";
 
+    const content = [
+      faqBlocks.join("\n\n"),
+      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+      metaDescription,
+      mainContent,
+    ].join("\n\n");
+
     return {
+      faqCount: faqBlocks.length,
+      sectionCount: sections.length,
       headings,
       sections,
       summary: faqBlocks.slice(0, 10),
-      content: [
-        faqBlocks.join("\n\n"),
-        sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-        metaDescription,
-        mainContent,
-      ].join("\n\n"),
+      content,
+      breakdown: {
+        faqWords: countWords(faqBlocks.join(" ")),
+        sectionWords: countWords(sections.map(s => s.text).join(" ")),
+        metaWords: countWords(metaDescription),
+        mainWords: countWords(mainContent),
+      },
     };
   });
 }
 
-// ================= LINK DISCOVERY (FULL SITE) =================
+// ================= LINK DISCOVERY =================
 async function collectAllLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
@@ -137,9 +147,7 @@ async function crawlSmart(startUrl) {
   const base = new URL(page.url()).origin;
   const visited = new Set();
   const pages = [];
-  const queue = [];
-
-  queue.push(page.url());
+  const queue = [page.url()];
 
   while (queue.length && Date.now() < deadline) {
     const url = queue.shift();
@@ -151,9 +159,18 @@ async function crawlSmart(startUrl) {
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     const data = await extractStructured(page);
-    const words = countWords(data.content);
 
-    if (words >= MIN_WORDS) {
+    const totalWords = countWords(data.content);
+
+    console.log("────────────────────────────");
+    console.log("[PAGE]", url);
+    console.log(" type:", pageType);
+    console.log(" faq blocks:", data.faqCount, "| words:", data.breakdown.faqWords);
+    console.log(" sections:", data.sectionCount, "| words:", data.breakdown.sectionWords);
+    console.log(" main content words:", data.breakdown.mainWords);
+    console.log(" TOTAL WORDS:", totalWords);
+
+    if (totalWords >= MIN_WORDS) {
       pages.push({
         url,
         title,
@@ -162,10 +179,11 @@ async function crawlSmart(startUrl) {
         sections: data.sections,
         summary: data.summary,
         content: clean(data.content),
-        wordCount: words,
+        wordCount: totalWords,
+        breakdown: data.breakdown,
         status: "ok",
       });
-      console.log("[SAVE]", url);
+      console.log("[SAVE]");
     }
 
     const links = await collectAllLinks(page, base);
@@ -192,7 +210,7 @@ http.createServer((req, res) => {
   }
 
   let body = "";
-  req.on("data", c => body += c);
+  req.on("data", c => (body += c));
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
