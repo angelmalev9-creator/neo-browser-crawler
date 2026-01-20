@@ -4,9 +4,9 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 45;
-const MIN_WORDS = 30;
-const MAX_CHILD_PER_PAGE = 4;
+const MAX_SECONDS = 70;
+const MIN_WORDS = 40;
+const MAX_CHILD_PER_PAGE = 6;
 
 const SKIP_URL_RE =
   /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
@@ -39,6 +39,57 @@ function detectPageType(url = "", title = "") {
   return "general";
 }
 
+// ================= BUSINESS SIGNALS =================
+function extractBusinessSignals(content = "") {
+  const lc = content.toLowerCase();
+
+  const signals = {
+    requires_booking: false,
+    lead_method: "unknown", // booking | email | phone | form
+    primary_cta: null,
+    business_intent: "information", // booking | consultation | sell
+  };
+
+  if (
+    lc.includes("запази час") ||
+    lc.includes("резервира") ||
+    lc.includes("booking") ||
+    lc.includes("appointment")
+  ) {
+    signals.requires_booking = true;
+    signals.lead_method = "booking";
+    signals.business_intent = "booking";
+    signals.primary_cta = "Запазване на час";
+  }
+
+  if (
+    lc.includes("оферта") ||
+    lc.includes("запитване") ||
+    lc.includes("форма") ||
+    lc.includes("свържете се")
+  ) {
+    signals.lead_method = "form";
+    signals.business_intent = "consultation";
+    signals.primary_cta = "Запитване / оферта";
+  }
+
+  if (lc.includes("@") && lc.includes("имейл")) {
+    signals.lead_method = "email";
+  }
+
+  if (
+    lc.includes("тел") ||
+    lc.includes("обадете") ||
+    lc.includes("телефон")
+  ) {
+    if (signals.lead_method === "unknown") {
+      signals.lead_method = "phone";
+    }
+  }
+
+  return signals;
+}
+
 // ================= STRUCTURED EXTRACTOR =================
 async function extractStructured(page) {
   try {
@@ -46,12 +97,10 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-    // Remove noise
     ["header", "footer", "nav", "aside"].forEach(sel => {
       document.querySelectorAll(sel).forEach(n => n.remove());
     });
 
-    // Accept cookies (best effort)
     document.querySelectorAll("button").forEach(b => {
       const t = (b.innerText || "").toLowerCase();
       if (
@@ -64,7 +113,6 @@ async function extractStructured(page) {
       }
     });
 
-    // ================= FAQ / ACCORDION (PRIORITY) =================
     const faqBlocks = [];
     document.querySelectorAll(
       '[class*="faq"], [class*="accordion"], [class*="question"], [class*="answer"], [aria-expanded]'
@@ -73,12 +121,10 @@ async function extractStructured(page) {
       if (t && t.length > 40) faqBlocks.push(t);
     });
 
-    // ================= HEADINGS =================
     const headings = [...document.querySelectorAll("h1,h2,h3")]
       .filter(h => h.offsetParent !== null)
       .map(h => h.innerText.trim());
 
-    // ================= SECTIONS =================
     const sections = [];
     let current = null;
 
@@ -91,38 +137,19 @@ async function extractStructured(page) {
       }
     });
 
-    // ================= MAIN CONTENT =================
     const mainContent =
       document.querySelector("main")?.innerText ||
       document.querySelector("article")?.innerText ||
       document.body.innerText ||
       "";
 
-    // ================= META / ARIA =================
     const metaDescription =
       document.querySelector('meta[name="description"]')?.content || "";
-    const metaKeywords =
-      document.querySelector('meta[name="keywords"]')?.content || "";
 
-    const ariaTexts = [];
-    document.querySelectorAll("[aria-label]").forEach(el => {
-      ariaTexts.push(el.getAttribute("aria-label"));
-    });
-
-    // ================= FINAL PRIORITIZED CONTENT =================
     const finalContent = [
-      // 1. FAQ first (kills clichés)
       faqBlocks.join("\n\n"),
-
-      // 2. Structured sections
       sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-
-      // 3. Meta / accessibility
       metaDescription,
-      metaKeywords,
-      ariaTexts.join(" "),
-
-      // 4. Raw content last
       mainContent,
     ].join("\n\n");
 
@@ -135,7 +162,7 @@ async function extractStructured(page) {
   });
 }
 
-// ================= LINK COLLECTORS =================
+// ================= LINK COLLECTOR =================
 async function collectNavLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
@@ -181,20 +208,27 @@ async function crawlSmart(startUrl) {
 
   let targets = await collectNavLinks(page, base);
   targets.unshift(page.url());
-  targets = targets.filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u));
+
+  targets = targets
+    .filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u))
+    .sort((a, b) => {
+      const score = (u: string) => {
+        let s = 0;
+        if (/uslugi|services|pricing|price/.test(u)) s += 50;
+        if (/kontakt|contact/.test(u)) s += 40;
+        if (/faq|vuprosi/.test(u)) s += 30;
+        if (/za-nas|about/.test(u)) s += 10;
+        if (/blog|news/.test(u)) s -= 20;
+        return s;
+      };
+      return score(b) - score(a);
+    });
 
   console.log("[TARGETS]", targets.length);
 
   for (const url of targets) {
-    if (Date.now() > deadline) {
-      console.log("[STOP] Deadline reached");
-      break;
-    }
-
-    if (visited.has(url)) {
-      console.log("[SKIP] Already visited", url);
-      continue;
-    }
+    if (Date.now() > deadline) break;
+    if (visited.has(url)) continue;
 
     visited.add(url);
 
@@ -203,16 +237,12 @@ async function crawlSmart(startUrl) {
 
       const title = clean(await page.title());
       const pageType = detectPageType(url, title);
-
       const data = await extractStructured(page);
       const words = countWords(data.content);
 
-      console.log("[PAGE]", url, "| type:", pageType, "| words:", words);
+      if (words < MIN_WORDS) continue;
 
-      if (words < MIN_WORDS) {
-        console.log("[SKIP] Too few words", url);
-        continue;
-      }
+      const businessSignals = extractBusinessSignals(data.content);
 
       pages.push({
         url,
@@ -223,13 +253,11 @@ async function crawlSmart(startUrl) {
         summary: data.summary,
         content: clean(data.content),
         wordCount: words,
+        businessSignals,
         status: "ok",
       });
 
-      console.log("[SAVE]", url);
-
-    } catch (e) {
-      console.error("[PAGE FAIL]", url, e.message);
+    } catch {
       pages.push({ url, status: "failed" });
     }
   }
@@ -241,41 +269,28 @@ async function crawlSmart(startUrl) {
 
 // ================= HTTP SERVER =================
 http.createServer((req, res) => {
-  console.log("[HTTP]", req.method, req.url);
+  if (req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ status: "ok" }));
+  }
 
-if (req.method === "GET") {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({
-    status: "ok",
-    message: "Crawler is running. Use POST with { url } to crawl.",
-  }));
-}
-
-if (req.method !== "POST") {
-  res.writeHead(405);
-  return res.end();
-}
-
+  if (req.method !== "POST") {
+    res.writeHead(405);
+    return res.end();
+  }
 
   let body = "";
   req.on("data", c => body += c);
   req.on("end", async () => {
     try {
       const { url } = JSON.parse(body || "{}");
-      console.log("[REQUEST]", url);
-
       const pages = await crawlSmart(url);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        pagesCount: pages.length,
-        pages,
-      }));
+      res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
     } catch (e) {
-      console.error("[CRAWL ERROR]", e.message);
       res.writeHead(500);
-      res.end(JSON.stringify({ success: false, error: e.message }));
+      res.end(JSON.stringify({ success: false, error: String(e) }));
     }
   });
 }).listen(PORT, () => {
