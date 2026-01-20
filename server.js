@@ -13,9 +13,15 @@ const SKIP_URL_RE =
   /(wp-content|uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
 // ================= UTILS =================
-const clean = (t = "") => t.replace(/\s+/g, " ").trim();
-const countWords = (t = "") =>
-  t.split(/\s+/).filter(w => w.length > 2).length;
+const clean = (t = "") =>
+  t
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+const countWordsExact = (t = "") =>
+  t.split(/\s+/).filter(Boolean).length;
 
 // ================= SAFE GOTO =================
 async function safeGoto(page, url, timeout = 20000) {
@@ -67,7 +73,7 @@ async function extractStructured(page) {
 
     return {
       rawContent: [
-        sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+        sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
         mainContent,
       ].join("\n\n"),
     };
@@ -165,9 +171,10 @@ async function crawlSmart(startUrl) {
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     const data = await extractStructured(page);
+
+    // ===== OCR =====
     let ocrText = "";
 
-    // ===== AGGRESSIVE OCR FOR SERVICES / PRICING =====
     if (pageType === "services") {
       const blocks = await page.$$("section, div");
 
@@ -176,32 +183,57 @@ async function crawlSmart(startUrl) {
 
         const text = await ocrElementScreenshot(page, block);
         if (text && /\d+\s?(€|лв|eur|bgn|кв\.?|sqm)/i.test(text)) {
-          ocrText += "\n[PRICING_FROM_IMAGE]\n" + text;
+          ocrText += "\n" + text;
           stats.ocrBlocksUsed++;
         }
       }
     }
 
-    const content = clean(`
-${data.rawContent}
+    const htmlContent = clean(data.rawContent);
+    const ocrContent = clean(ocrText);
 
-=== VERIFIED PRICING FROM IMAGES ===
-${ocrText}
+    const content = `
+=== HTML_CONTENT_START ===
+${htmlContent}
+=== HTML_CONTENT_END ===
+
+=== OCR_CONTENT_START ===
+${ocrContent}
+=== OCR_CONTENT_END ===
+`.trim();
+
+    const htmlWords = countWordsExact(htmlContent);
+    const ocrWords = countWordsExact(ocrContent);
+    const totalWords = countWordsExact(content);
+
+    console.log(`
+[CONTENT STATS]
+url: ${url}
+type: ${pageType}
+htmlWords: ${htmlWords}
+ocrWords: ${ocrWords}
+totalWords: ${totalWords}
 `);
 
-    const words = countWords(content);
-
-    if (words >= MIN_WORDS) {
-      pages.push({
-        url,
-        title,
-        pageType,
-        content,
-        wordCount: words,
-        status: "ok",
-      });
-      stats.saved++;
+    if (pageType !== "services" && totalWords < MIN_WORDS) {
+      console.log("[SKIP] too few words:", totalWords);
+      continue;
     }
+
+    pages.push({
+      url,
+      title,
+      pageType,
+      content,
+      wordCount: totalWords,
+      breakdown: {
+        htmlWords,
+        ocrWords,
+      },
+      status: "ok",
+    });
+
+    stats.saved++;
 
     const links = await collectAllLinks(page, base);
     links.forEach(l => {
