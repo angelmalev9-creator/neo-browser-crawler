@@ -4,12 +4,11 @@ import { chromium } from "playwright";
 const PORT = Number(process.env.PORT || 10000);
 
 // ================= LIMITS =================
-const MAX_SECONDS = 70;
-const MIN_WORDS = 40;
-const MAX_CHILD_PER_PAGE = 6;
+const MAX_SECONDS = 60; // повече време, но стабилно
+const MIN_WORDS = 25;
 
 const SKIP_URL_RE =
-  /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/)/i;
+  /(wp-content|uploads|media|images|gallery|video|photo|attachment|category|tag|page\/|privacy|terms|cookies|gdpr)/i;
 
 // ================= UTILS =================
 const clean = (t = "") => t.replace(/\s+/g, " ").trim();
@@ -39,57 +38,6 @@ function detectPageType(url = "", title = "") {
   return "general";
 }
 
-// ================= BUSINESS SIGNALS =================
-function extractBusinessSignals(content = "") {
-  const lc = content.toLowerCase();
-
-  const signals = {
-    requires_booking: false,
-    lead_method: "unknown", // booking | email | phone | form
-    primary_cta: null,
-    business_intent: "information", // booking | consultation | sell
-  };
-
-  if (
-    lc.includes("запази час") ||
-    lc.includes("резервира") ||
-    lc.includes("booking") ||
-    lc.includes("appointment")
-  ) {
-    signals.requires_booking = true;
-    signals.lead_method = "booking";
-    signals.business_intent = "booking";
-    signals.primary_cta = "Запазване на час";
-  }
-
-  if (
-    lc.includes("оферта") ||
-    lc.includes("запитване") ||
-    lc.includes("форма") ||
-    lc.includes("свържете се")
-  ) {
-    signals.lead_method = "form";
-    signals.business_intent = "consultation";
-    signals.primary_cta = "Запитване / оферта";
-  }
-
-  if (lc.includes("@") && lc.includes("имейл")) {
-    signals.lead_method = "email";
-  }
-
-  if (
-    lc.includes("тел") ||
-    lc.includes("обадете") ||
-    lc.includes("телефон")
-  ) {
-    if (signals.lead_method === "unknown") {
-      signals.lead_method = "phone";
-    }
-  }
-
-  return signals;
-}
-
 // ================= STRUCTURED EXTRACTOR =================
 async function extractStructured(page) {
   try {
@@ -99,18 +47,6 @@ async function extractStructured(page) {
   return await page.evaluate(() => {
     ["header", "footer", "nav", "aside"].forEach(sel => {
       document.querySelectorAll(sel).forEach(n => n.remove());
-    });
-
-    document.querySelectorAll("button").forEach(b => {
-      const t = (b.innerText || "").toLowerCase();
-      if (
-        t.includes("accept") ||
-        t.includes("agree") ||
-        t.includes("allow") ||
-        t.includes("прием")
-      ) {
-        b.click();
-      }
     });
 
     const faqBlocks = [];
@@ -146,33 +82,30 @@ async function extractStructured(page) {
     const metaDescription =
       document.querySelector('meta[name="description"]')?.content || "";
 
-    const finalContent = [
-      faqBlocks.join("\n\n"),
-      sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
-      metaDescription,
-      mainContent,
-    ].join("\n\n");
-
     return {
       headings,
       sections,
-      summary: faqBlocks.slice(0, 5),
-      content: finalContent,
+      summary: faqBlocks.slice(0, 10),
+      content: [
+        faqBlocks.join("\n\n"),
+        sections.map(s => `${s.heading}: ${s.text}`).join("\n\n"),
+        metaDescription,
+        mainContent,
+      ].join("\n\n"),
     };
   });
 }
 
-// ================= LINK COLLECTOR =================
-async function collectNavLinks(page, base) {
+// ================= LINK DISCOVERY (FULL SITE) =================
+async function collectAllLinks(page, base) {
   return await page.evaluate(base => {
     const urls = new Set();
-    document
-      .querySelectorAll("header a[href], nav a[href], footer a[href]")
-      .forEach(a => {
-        try {
-          urls.add(new URL(a.href, base).href);
-        } catch {}
-      });
+    document.querySelectorAll("a[href]").forEach(a => {
+      try {
+        const u = new URL(a.href, base);
+        if (u.origin === base) urls.add(u.href);
+      } catch {}
+    });
     return Array.from(urls);
   }, base);
 }
@@ -180,7 +113,6 @@ async function collectNavLinks(page, base) {
 // ================= CRAWLER =================
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
-
   console.log("[CRAWL START]", startUrl);
 
   const browser = await chromium.launch({
@@ -205,45 +137,23 @@ async function crawlSmart(startUrl) {
   const base = new URL(page.url()).origin;
   const visited = new Set();
   const pages = [];
+  const queue = [];
 
-  let targets = await collectNavLinks(page, base);
-  targets.unshift(page.url());
+  queue.push(page.url());
 
-  targets = targets
-    .filter(u => u.startsWith(base) && !SKIP_URL_RE.test(u))
-    .sort((a, b) => {
-const score = (u) => {
-        let s = 0;
-        if (/uslugi|services|pricing|price/.test(u)) s += 50;
-        if (/kontakt|contact/.test(u)) s += 40;
-        if (/faq|vuprosi/.test(u)) s += 30;
-        if (/za-nas|about/.test(u)) s += 10;
-        if (/blog|news/.test(u)) s -= 20;
-        return s;
-      };
-      return score(b) - score(a);
-    });
-
-  console.log("[TARGETS]", targets.length);
-
-  for (const url of targets) {
-    if (Date.now() > deadline) break;
-    if (visited.has(url)) continue;
-
+  while (queue.length && Date.now() < deadline) {
+    const url = queue.shift();
+    if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
     visited.add(url);
 
-    try {
-      if (!(await safeGoto(page, url))) continue;
+    if (!(await safeGoto(page, url))) continue;
 
-      const title = clean(await page.title());
-      const pageType = detectPageType(url, title);
-      const data = await extractStructured(page);
-      const words = countWords(data.content);
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    const data = await extractStructured(page);
+    const words = countWords(data.content);
 
-      if (words < MIN_WORDS) continue;
-
-      const businessSignals = extractBusinessSignals(data.content);
-
+    if (words >= MIN_WORDS) {
       pages.push({
         url,
         title,
@@ -253,13 +163,15 @@ const score = (u) => {
         summary: data.summary,
         content: clean(data.content),
         wordCount: words,
-        businessSignals,
         status: "ok",
       });
-
-    } catch {
-      pages.push({ url, status: "failed" });
+      console.log("[SAVE]", url);
     }
+
+    const links = await collectAllLinks(page, base);
+    links.forEach(l => {
+      if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
+    });
   }
 
   await browser.close();
@@ -285,12 +197,11 @@ http.createServer((req, res) => {
     try {
       const { url } = JSON.parse(body || "{}");
       const pages = await crawlSmart(url);
-
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true, pagesCount: pages.length, pages }));
     } catch (e) {
       res.writeHead(500);
-      res.end(JSON.stringify({ success: false, error: String(e) }));
+      res.end(JSON.stringify({ success: false, error: e.message }));
     }
   });
 }).listen(PORT, () => {
