@@ -23,6 +23,41 @@ const clean = (t = "") =>
 const countWordsExact = (t = "") =>
   t.split(/\s+/).filter(Boolean).length;
 
+// ================= BG NUMBER NORMALIZER =================
+const BG_0_19 = [
+  "нула","едно","две","три","четири","пет","шест","седем","осем","девет",
+  "десет","единадесет","дванадесет","тринадесет","четиринадесет",
+  "петнадесет","шестнадесет","седемнадесет","осемнадесет","деветнадесет"
+];
+
+const BG_TENS = [
+  "", "", "двадесет","тридесет","четиридесет",
+  "петдесет","шестдесет","седемдесет","осемдесет","деветдесет"
+];
+
+function numberToBgWords(n) {
+  n = Number(n);
+  if (Number.isNaN(n)) return n;
+
+  if (n < 20) return BG_0_19[n];
+
+  if (n < 100) {
+    const t = Math.floor(n / 10);
+    const r = n % 10;
+    return BG_TENS[t] + (r ? " и " + BG_0_19[r] : "");
+  }
+
+  // НЕ пипаме по-големи числа (телефони, години, ID)
+  return String(n);
+}
+
+function normalizeNumbers(text = "") {
+  return text.replace(
+    /(\d+)\s?(лв|лева|€|eur|bgn|стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
+    (_, num, unit) => `${numberToBgWords(num)} ${unit}`
+  );
+}
+
 // ================= SAFE GOTO =================
 async function safeGoto(page, url, timeout = 20000) {
   try {
@@ -203,8 +238,9 @@ async function crawlSmart(startUrl) {
       }
     }
 
-    const htmlContent = clean(data.rawContent);
-    const ocrContent = clean(ocrText);
+   const htmlContent = normalizeNumbers(clean(data.rawContent));
+const ocrContent = normalizeNumbers(clean(ocrText));
+
 
     const content = `
 === HTML_CONTENT_START ===
