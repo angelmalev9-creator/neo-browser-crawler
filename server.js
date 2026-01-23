@@ -224,7 +224,7 @@ async function crawlSmart(startUrl) {
     // const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    const data = await extractStructured(page);
+    // const data = await extractStructured(page);
     // ===== OCR =====
     let ocrText = "";
 
