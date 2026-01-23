@@ -214,7 +214,17 @@ async function crawlSmart(startUrl) {
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     const data = await extractStructured(page);
+    
+ // <<< ADDED: trigger JS-rendered / scroll-based content
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1200);
+    // <<< END ADDED
 
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+
+    const data = await extractStructured(page);
     // ===== OCR =====
     let ocrText = "";
 
