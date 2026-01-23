@@ -221,7 +221,7 @@ async function crawlSmart(startUrl) {
     // <<< END ADDED
 
     // const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
+    // const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     const data = await extractStructured(page);
