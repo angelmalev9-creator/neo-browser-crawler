@@ -207,13 +207,21 @@ async function crawlSmart(startUrl) {
     visited.add(url);
     stats.visited++;
 
-    if (!(await safeGoto(page, url))) continue;
+   if (!(await safeGoto(page, url))) continue;
 
-    const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
-    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+// === PATCH: trigger JS-rendered / scroll-based content ===
+for (let i = 0; i < 4; i++) {
+  await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+  await page.waitForTimeout(500);
+}
+// === END PATCH ===
 
-    const data = await extractStructured(page);
+const title = clean(await page.title());
+const pageType = detectPageType(url, title);
+stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+
+const data = await extractStructured(page);
+
 // <<< ADDED: trigger JS-rendered / scroll-based content
 await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
 await page.waitForTimeout(1200);
