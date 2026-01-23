@@ -220,7 +220,7 @@ async function crawlSmart(startUrl) {
     await page.waitForTimeout(1200);
     // <<< END ADDED
 
-    const title = clean(await page.title());
+    // const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
