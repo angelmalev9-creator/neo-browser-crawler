@@ -142,10 +142,10 @@ async function extractStructured(page) {
   });
 
   const mainContent =
-    document.querySelector("main")?.innerText ||
-    document.querySelector("article")?.innerText ||
-    document.body.innerText ||
-    "";
+  document.querySelector("main")?.innerText ||
+  document.querySelector("article")?.innerText ||
+  "";
+
 
   return {
     rawContent: [
@@ -288,7 +288,10 @@ if (pageType === "services" || pageType === "general") {
   }
 
   // 2️⃣ OCR large sections (pricing tables, materials, packages)
-  const sections = await page.$$("section, article, div");
+  const sections = await page.$$(
+  "section, article, div[style*='background'], div[class*='price'], div[class*='card']"
+);
+
 
   for (const sec of sections) {
     if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
