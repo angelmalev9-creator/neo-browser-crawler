@@ -88,72 +88,71 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-  function isVisible(el) {
-    const style = window.getComputedStyle(el);
-    return (
-      style &&
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
-      style.opacity !== "0"
-    );
-  }
-
-  const textBlocks = [];
-
-  // 1️⃣ Standard visible text
-  document.querySelectorAll(
-    "h1,h2,h3,h4,h5,h6,p,li,span,strong,b,button,a,div"
-  ).forEach(el => {
-    if (!isVisible(el)) return;
-    const text = el.innerText?.trim();
-    if (text && text.length > 2) {
-      textBlocks.push(text);
+    function isVisible(el) {
+      const style = window.getComputedStyle(el);
+      return (
+        style &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0"
+      );
     }
-  });
 
-  // 2️⃣ IMG alt / aria-label
-  document.querySelectorAll("img").forEach(img => {
-    if (img.alt) textBlocks.push(img.alt);
-    if (img.getAttribute("aria-label"))
-      textBlocks.push(img.getAttribute("aria-label"));
-  });
+    const textBlocks = [];
 
-  // 3️⃣ SVG text nodes + titles
-  document.querySelectorAll("svg").forEach(svg => {
-    svg.querySelectorAll("text,title,desc").forEach(node => {
-      const t = node.textContent?.trim();
-      if (t && t.length > 2) {
-        textBlocks.push(t);
+    // 1️⃣ Visible text
+    document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,p,li,span,strong,b,button,a,div"
+    ).forEach(el => {
+      if (!isVisible(el)) return;
+      const text = el.innerText?.trim();
+      if (text && text.length > 2) {
+        textBlocks.push(text);
       }
     });
-  });
 
-  // 4️⃣ data-* attributes (pricing often lives here)
-  document.querySelectorAll("*").forEach(el => {
-    Array.from(el.attributes || []).forEach(attr => {
-      if (
-        attr.name.startsWith("data-") &&
-        typeof attr.value === "string" &&
-        attr.value.length > 2
-      ) {
-        textBlocks.push(attr.value);
-      }
+    // 2️⃣ IMG alt / aria
+    document.querySelectorAll("img").forEach(img => {
+      if (img.alt) textBlocks.push(img.alt);
+      const aria = img.getAttribute("aria-label");
+      if (aria) textBlocks.push(aria);
     });
+
+    // 3️⃣ SVG text
+    document.querySelectorAll("svg").forEach(svg => {
+      svg.querySelectorAll("text,title,desc").forEach(node => {
+        const t = node.textContent?.trim();
+        if (t && t.length > 2) textBlocks.push(t);
+      });
+    });
+
+    // 4️⃣ data-* attrs
+    document.querySelectorAll("*").forEach(el => {
+      Array.from(el.attributes || []).forEach(attr => {
+        if (
+          attr.name.startsWith("data-") &&
+          typeof attr.value === "string" &&
+          attr.value.length > 2
+        ) {
+          textBlocks.push(attr.value);
+        }
+      });
+    });
+
+    const mainContent =
+      document.querySelector("main")?.innerText ||
+      document.querySelector("article")?.innerText ||
+      "";
+
+    return {
+      rawContent: [
+        textBlocks.join("\n"),
+        mainContent,
+      ].join("\n\n"),
+    };
   });
+}
 
-  const mainContent =
-  document.querySelector("main")?.innerText ||
-  document.querySelector("article")?.innerText ||
-  "";
-
-
-  return {
-    rawContent: [
-      textBlocks.join("\n"),
-      mainContent,
-    ].join("\n\n"),
-  };
-});
 
 
 
