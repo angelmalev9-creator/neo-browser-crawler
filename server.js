@@ -58,6 +58,35 @@ function normalizeNumbers(text = "") {
   );
 }
 
+function extractPricing(text = "") {
+  const results = [];
+
+  const patterns = [
+    /(basic|standart|standard|premium)[^\d]{0,40}(\d{2,4})\s?(€|eur|лв|leva|bgn)[^\n]{0,20}(кв\.?\s?м|sqm)?/gi,
+    /(\d{2,4})\s?(€|eur|лв|leva|bgn)[^\n]{0,20}(кв\.?\s?м|sqm)[^\n]{0,40}(basic|standart|standard|premium)/gi
+  ];
+
+  for (const re of patterns) {
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      const pkg = (match[1] || match[4] || "").toLowerCase();
+      const price = Number(match[2] || match[1]);
+      const currency = (match[3] || match[2] || "").toUpperCase();
+
+      if (!Number.isNaN(price)) {
+        results.push({
+          package: pkg,
+          price_per_sqm: price,
+          currency
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+
 // ================= SAFE GOTO =================
 async function safeGoto(page, url, timeout = 20000) {
   try {
@@ -160,6 +189,9 @@ async function extractStructured(page) {
 async function ocrElementScreenshot(page, elementHandle) {
   const apiKey = process.env.GOOGLE_VISION_API_KEY;
   if (!apiKey) return "";
+if (!process.env.GOOGLE_VISION_API_KEY) {
+  console.error("[OCR] NO GOOGLE VISION KEY");
+}
 
   try {
     console.log("[OCR] screenshot sent to Vision API");
@@ -326,7 +358,7 @@ if (pageType === "services" || pageType === "general") {
 // ===== FULL PAGE OCR FALLBACK =====
 if (
   (pageType === "services" || /ceni|pricing/i.test(url)) &&
-  stats.ocrBlocksUsed === 0
+ocrText.trim().length < 50
 ) {
   console.log("[OCR] FULL PAGE fallback triggered:", url);
 
@@ -377,6 +409,12 @@ ${htmlContent}
 ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
+    const pricing = extractPricing(content);
+
+if (pricing.length) {
+  console.log("[PRICING FOUND]", pricing);
+}
+
 
     const htmlWords = countWordsExact(htmlContent);
     const ocrWords = countWordsExact(ocrContent);
@@ -396,18 +434,20 @@ totalWords: ${totalWords}
       continue;
     }
 
-    pages.push({
-      url,
-      title,
-      pageType,
-      content,
-      wordCount: totalWords,
-      breakdown: {
-        htmlWords,
-        ocrWords,
-      },
-      status: "ok",
-    });
+   pages.push({
+  url,
+  title,
+  pageType,
+  content,
+  pricing,
+  wordCount: totalWords,
+  breakdown: {
+    htmlWords,
+    ocrWords,
+  },
+  status: "ok",
+});
+
 
     stats.saved++;
 
