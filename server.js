@@ -323,6 +323,46 @@ if (pageType === "services" || pageType === "general") {
     }
   }
 }
+// ===== FULL PAGE OCR FALLBACK =====
+if (
+  (pageType === "services" || /ceni|pricing/i.test(url)) &&
+  stats.ocrBlocksUsed === 0
+) {
+  console.log("[OCR] FULL PAGE fallback triggered:", url);
+
+  try {
+    const screenshot = await page.screenshot({ fullPage: true });
+    const base64 = screenshot.toString("base64");
+
+    const res = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GOOGLE_VISION_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [
+            {
+              image: { content: base64 },
+              features: [{ type: "TEXT_DETECTION" }],
+            },
+          ],
+        }),
+      }
+    );
+
+    const json = await res.json();
+    const fullText =
+      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+
+    if (fullText.length > 30) {
+      console.log("[OCR FULL PAGE HIT]", fullText.slice(0, 200));
+      ocrText += "\n" + fullText;
+      stats.ocrBlocksUsed++;
+    }
+  } catch (e) {
+    console.error("[OCR FULL PAGE FAIL]", e.message);
+  }
+}
 
    const htmlContent = normalizeNumbers(clean(data.rawContent));
 const ocrContent = normalizeNumbers(clean(ocrText));
