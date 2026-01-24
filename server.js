@@ -88,15 +88,21 @@ async function extractStructured(page) {
   } catch {}
 
   return await page.evaluate(() => {
-    const sections = [];
-    let current = null;
+    function getVisibleText(el) {
+      if (!el || !el.innerText) return "";
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return "";
+      return el.innerText.trim();
+    }
 
-    document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
-      if (el.tagName.startsWith("H")) {
-        current = { heading: el.innerText.trim(), text: "" };
-        sections.push(current);
-      } else if (current) {
-        current.text += " " + el.innerText;
+    const textBlocks = [];
+
+    document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,p,li,span,strong,b,button,a,div"
+    ).forEach(el => {
+      const text = getVisibleText(el);
+      if (text && text.length > 2) {
+        textBlocks.push(text);
       }
     });
 
@@ -108,12 +114,13 @@ async function extractStructured(page) {
 
     return {
       rawContent: [
-        sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
+        textBlocks.join("\n"),
         mainContent,
       ].join("\n\n"),
     };
   });
 }
+
 
 // ================= GOOGLE VISION OCR (SCREENSHOT) =================
 async function ocrElementScreenshot(page, elementHandle) {
