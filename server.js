@@ -6,7 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const MAX_OCR_BLOCKS = 3;
+const MAX_OCR_BLOCKS = 5;
 
 // режем САМО реален шум
 const SKIP_URL_RE =
@@ -222,29 +222,63 @@ stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
 const data = await extractStructured(page);
 
+// ===== OCR =====
+let ocrText = "";
 
-    // ===== OCR =====
-    let ocrText = "";
+if (pageType === "services" || pageType === "general") {
+  console.log("[OCR] checking visual blocks on page:", url);
 
-    if (pageType === "services" || pageType === "general") {
-      console.log("[OCR] checking images on page:", url);
+  // 1️⃣ OCR images
+  const images = await page.$$("img");
 
-      const images = await page.$$("img");
+  for (const img of images) {
+    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-      for (const img of images) {
-        if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+    const box = await img.boundingBox();
+    if (!box || box.width < 200 || box.height < 200) continue;
 
-        const box = await img.boundingBox();
-        if (!box || box.width < 200 || box.height < 200) continue;
-
-        const text = await ocrElementScreenshot(page, img);
-        if (text && /\d+\s?(€|лв|eur|bgn|кв\.?|sqm)/i.test(text)) {
-          console.log("[OCR HIT]", text.slice(0, 120));
-          ocrText += "\n" + text;
-          stats.ocrBlocksUsed++;
-        }
-      }
+    const text = await ocrElementScreenshot(page, img);
+    if (text) {
+      console.log("[OCR IMG HIT]", text.slice(0, 120));
+      ocrText += "\n" + text;
+      stats.ocrBlocksUsed++;
     }
+  }
+
+  // 2️⃣ OCR large sections (pricing tables, materials, packages)
+  const sections = await page.$$("section, article, div");
+
+  for (const sec of sections) {
+    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+
+    const box = await sec.boundingBox();
+    if (!box || box.width < 400 || box.height < 250) continue;
+
+    const text = await ocrElementScreenshot(page, sec);
+    if (text && text.length > 30) {
+      console.log("[OCR SECTION HIT]", text.slice(0, 120));
+      ocrText += "\n" + text;
+      stats.ocrBlocksUsed++;
+    }
+  }
+
+  // 3️⃣ OCR embedded PDFs / iframes
+  const embeds = await page.$$("iframe, embed, object");
+
+  for (const emb of embeds) {
+    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+
+    const box = await emb.boundingBox();
+    if (!box || box.width < 400 || box.height < 300) continue;
+
+    const text = await ocrElementScreenshot(page, emb);
+    if (text && text.length > 30) {
+      console.log("[OCR EMBED HIT]", text.slice(0, 120));
+      ocrText += "\n" + text;
+      stats.ocrBlocksUsed++;
+    }
+  }
+}
 
    const htmlContent = normalizeNumbers(clean(data.rawContent));
 const ocrContent = normalizeNumbers(clean(ocrText));
