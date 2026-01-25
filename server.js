@@ -236,17 +236,17 @@ async function ocrElement(page, element, context = "") {
   try {
     const box = await element.boundingBox();
     if (!box) {
-      console.log("[OCR] Element has no bounding box - skipping");
+      console.log(`[OCR] ${context}: no bounding box - skipping`);
       return "";
     }
 
-    // Минимални размери за OCR
-    if (box.width < 100 || box.height < 50) {
-      console.log(`[OCR] Element too small (${box.width}x${box.height}) - skipping`);
+    // НАМАЛЕНИ минимални размери - хващаме и малки изображения с цени
+    if (box.width < 50 || box.height < 30) {
+      console.log(`[OCR] ${context}: too small (${box.width}x${box.height}) - skipping`);
       return "";
     }
 
-    console.log(`[OCR] Processing ${context}: ${box.width}x${box.height}px`);
+    console.log(`[OCR] Processing ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
 
     const buffer = await element.screenshot({ type: 'png' });
     const base64 = buffer.toString("base64");
@@ -265,7 +265,7 @@ async function ocrElement(page, element, context = "") {
                 { type: "DOCUMENT_TEXT_DETECTION", maxResults: 50 }
               ],
               imageContext: {
-                languageHints: ["bg", "en"]
+                languageHints: ["bg", "en", "ru"]
               }
             },
           ],
@@ -275,27 +275,29 @@ async function ocrElement(page, element, context = "") {
 
     if (!res.ok) {
       const errorText = await res.text();
-      console.error(`[OCR] Vision API error: ${res.status} - ${errorText}`);
+      console.error(`[OCR] ${context}: Vision API error ${res.status} - ${errorText}`);
       return "";
     }
 
     const json = await res.json();
     
     if (json.responses?.[0]?.error) {
-      console.error("[OCR] API returned error:", json.responses[0].error);
+      console.error(`[OCR] ${context}: API error:`, json.responses[0].error);
       return "";
     }
 
     const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
     
-    console.log(`[OCR] Extracted ${text.length} chars from ${context}`);
     if (text) {
-      console.log(`[OCR] Preview: ${text.slice(0, 150)}...`);
+      console.log(`[OCR] ✓ ${context}: extracted ${text.length} chars`);
+      console.log(`[OCR] Preview: "${text.slice(0, 200)}${text.length > 200 ? '...' : ''}"`);
+    } else {
+      console.log(`[OCR] ${context}: no text found`);
     }
 
     return text;
   } catch (e) {
-    console.error(`[OCR FAIL] ${context}:`, e.message);
+    console.error(`[OCR] ${context}: FAIL -`, e.message);
     return "";
   }
 }
@@ -400,68 +402,93 @@ async function crawlSmart(startUrl) {
 
         const data = await extractStructured(page);
 
-        // ===== OCR НА РАЗЛИЧНИ ЕЛЕМЕНТИ =====
+        // ===== OCR НА ВСИЧКИ ЕЛЕМЕНТИ (БЕЗ ЛИМИТ) =====
         let ocrText = "";
+        const ocrTexts = new Set(); // За дедупликация на OCR текстове
 
-        if (stats.ocrElementsProcessed < MAX_OCR_ELEMENTS) {
-          console.log(`[OCR] Scanning page for visual elements: ${url}`);
+        console.log(`[OCR] Scanning ALL visual elements on: ${url}`);
 
-          try {
-            // 1. OCR на изображения с текст
-            const images = await page.$$("img");
-            for (const img of images) {
-              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
-              
-              const text = await ocrElement(page, img, "image");
-              if (text) {
+        try {
+          // 1. OCR на ВСИЧКИ изображения
+          console.log("[OCR] Processing images...");
+          const images = await page.$("img");
+          console.log(`[OCR] Found ${images.length} images`);
+          
+          for (let i = 0; i < images.length; i++) {
+            try {
+              const text = await ocrElement(page, images[i], `image-${i+1}`);
+              if (text && !ocrTexts.has(text)) {
                 ocrText += "\n" + text;
+                ocrTexts.add(text);
                 stats.ocrElementsProcessed++;
                 stats.ocrCharsExtracted += text.length;
               }
+            } catch (e) {
+              console.error(`[OCR] Error processing image ${i+1}:`, e.message);
             }
-
-            // 2. OCR на canvas елементи
-            const canvases = await page.$$("canvas");
-            for (const canvas of canvases) {
-              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
-              
-              const text = await ocrElement(page, canvas, "canvas");
-              if (text) {
-                ocrText += "\n" + text;
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
-              }
-            }
-
-            // 3. OCR на div/section с background images
-            const bgElements = await page.$$('[style*="background-image"], [class*="bg-"], [class*="banner"]');
-            for (const el of bgElements) {
-              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
-              
-              const text = await ocrElement(page, el, "bg-element");
-              if (text) {
-                ocrText += "\n" + text;
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
-              }
-            }
-
-            // 4. OCR на SVG елементи
-            const svgs = await page.$$("svg");
-            for (const svg of svgs) {
-              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
-              
-              const text = await ocrElement(page, svg, "svg");
-              if (text) {
-                ocrText += "\n" + text;
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
-              }
-            }
-
-          } catch (e) {
-            console.error("[OCR EXTRACTION ERROR]", e.message);
           }
+
+          // 2. OCR на canvas елементи
+          console.log("[OCR] Processing canvas elements...");
+          const canvases = await page.$("canvas");
+          console.log(`[OCR] Found ${canvases.length} canvas elements`);
+          
+          for (let i = 0; i < canvases.length; i++) {
+            try {
+              const text = await ocrElement(page, canvases[i], `canvas-${i+1}`);
+              if (text && !ocrTexts.has(text)) {
+                ocrText += "\n" + text;
+                ocrTexts.add(text);
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            } catch (e) {
+              console.error(`[OCR] Error processing canvas ${i+1}:`, e.message);
+            }
+          }
+
+          // 3. OCR на div/section с background images и pricing cards
+          console.log("[OCR] Processing background elements and cards...");
+          const bgElements = await page.$('[style*="background-image"], [class*="bg-"], [class*="banner"], [class*="card"], [class*="price"], [class*="package"]');
+          console.log(`[OCR] Found ${bgElements.length} background/card elements`);
+          
+          for (let i = 0; i < bgElements.length; i++) {
+            try {
+              const text = await ocrElement(page, bgElements[i], `bg-element-${i+1}`);
+              if (text && !ocrTexts.has(text)) {
+                ocrText += "\n" + text;
+                ocrTexts.add(text);
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            } catch (e) {
+              console.error(`[OCR] Error processing bg-element ${i+1}:`, e.message);
+            }
+          }
+
+          // 4. OCR на SVG елементи
+          console.log("[OCR] Processing SVG elements...");
+          const svgs = await page.$("svg");
+          console.log(`[OCR] Found ${svgs.length} SVG elements`);
+          
+          for (let i = 0; i < svgs.length; i++) {
+            try {
+              const text = await ocrElement(page, svgs[i], `svg-${i+1}`);
+              if (text && !ocrTexts.has(text)) {
+                ocrText += "\n" + text;
+                ocrTexts.add(text);
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            } catch (e) {
+              console.error(`[OCR] Error processing SVG ${i+1}:`, e.message);
+            }
+          }
+
+          console.log(`[OCR] Total elements processed: ${stats.ocrElementsProcessed}, Total chars: ${stats.ocrCharsExtracted}`);
+
+        } catch (e) {
+          console.error("[OCR EXTRACTION ERROR]", e.message);
         }
 
         const htmlContent = normalizeNumbers(clean(data.rawContent));
