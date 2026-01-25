@@ -324,30 +324,25 @@ if (
   pageType === "general" ||
   /tseni|pricing|price|ceni/.test(url)
 ) {
-
-
   // 1️⃣ OCR images
-const images = await page.$$("img");
+  const images = await page.$$("img");
+  for (const img of images) {
+    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-for (const img of images) {
-  if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+    const box = await img.boundingBox();
+    if (!box || box.width < 200 || box.height < 200) continue;
 
-  const box = await img.boundingBox();
-  if (!box || box.width < 200 || box.height < 200) continue;
-
-  const text = await ocrElementScreenshot(page, img);
-  if (text) {
-    ocrText += "\n" + text;
-    stats.ocrBlocksUsed++;
+    const text = await ocrElementScreenshot(page, img);
+    if (text) {
+      ocrText += "\n" + text;
+      stats.ocrBlocksUsed++;
+    }
   }
-}
-
 
   // 2️⃣ OCR large sections (pricing tables, materials, packages)
   const sections = await page.$$(
-  "section, article, div[style*='background'], div[class*='price'], div[class*='card']"
-);
-
+    "section, article, div[style*='background'], div[class*='price'], div[class*='card']"
+  );
 
   for (const sec of sections) {
     if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
@@ -357,7 +352,6 @@ for (const img of images) {
 
     const text = await ocrElementScreenshot(page, sec);
     if (text && text.length > 30) {
-      console.log("[OCR SECTION HIT]", text.slice(0, 120));
       ocrText += "\n" + text;
       stats.ocrBlocksUsed++;
     }
@@ -365,106 +359,28 @@ for (const img of images) {
 
   // 3️⃣ OCR embedded PDFs / iframes
   const embeds = await page.$$("iframe, embed, object");
+  for (const emb of embeds) {
+    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-for (const emb of embeds) {
-  if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+    const box = await emb.boundingBox();
+    if (!box || box.width < 400 || box.height < 300) continue;
 
-  const box = await emb.boundingBox();
-  if (!box || box.width < 400 || box.height < 300) continue;
-
-  const text = await ocrElementScreenshot(page, emb);
-  if (text && text.length > 30) {
-    console.log("[OCR EMBED HIT]", text.slice(0, 120));
-    ocrText += "\n" + text;
-    stats.ocrBlocksUsed++;
-  }
-}
-
-
-
-  // 🔥 FALLBACK: OCR WHOLE PAGE (FOR IMAGE-ONLY PRICING)
-if (!ocrText || ocrText.length < 50) {
-  console.log("[OCR FALLBACK] full page OCR");
-  const fullPageText = await ocrFullPage(page);
-  if (fullPageText) {
-    ocrText += "\n" + fullPageText;
-  }
-}
-{}
-
-
-   const htmlContent = normalizeNumbers(clean(data.rawContent));
-const ocrContent = normalizeNumbers(clean(ocrText));
-
-
-    const content = `
-=== HTML_CONTENT_START ===
-${htmlContent}
-=== HTML_CONTENT_END ===
-
-=== OCR_CONTENT_START ===
-${ocrContent}
-=== OCR_CONTENT_END ===
-`.trim();
-   if (ocrText.trim().length < 50) {
-  console.log("[OCR FALLBACK] full page OCR");
-  const fullText = await ocrFullPage(page);
-  if (fullText) {
-    ocrText += "\n" + fullText;
-  }
-}
-
-const pricing = extractPricing(content);
-
-if (pricing.length) {
-  console.log("[PRICING FOUND]", pricing);
-}
-
-
-    const htmlWords = countWordsExact(htmlContent);
-    const ocrWords = countWordsExact(ocrContent);
-    const totalWords = countWordsExact(content);
-
-    console.log(`
-[CONTENT STATS]
-url: ${url}
-type: ${pageType}
-htmlWords: ${htmlWords}
-ocrWords: ${ocrWords}
-totalWords: ${totalWords}
-`);
-
-    if (pageType !== "services" && totalWords < MIN_WORDS) {
-      console.log("[SKIP] too few words:", totalWords);
-      continue;
+    const text = await ocrElementScreenshot(page, emb);
+    if (text && text.length > 30) {
+      ocrText += "\n" + text;
+      stats.ocrBlocksUsed++;
     }
-
-   pages.push({
-  url,
-  title,
-  pageType,
-  content,
-  pricing,
-  wordCount: totalWords,
-  breakdown: {
-    htmlWords,
-    ocrWords,
-  },
-  status: "ok",
-});
-
-
-    stats.saved++;
-
-    const links = await collectAllLinks(page, base);
-    links.forEach(l => {
-      if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
-    });
   }
+
+  // 🔥 FALLBACK: OCR whole page
+  if (!ocrText || ocrText.length < 50) {
+    const fullPageText = await ocrFullPage(page);
+    if (fullPageText) {
+      ocrText += "\n" + fullPageText;
+    }
   }
-  await browser.close();
-  return { pages, stats };
 }
+
 
 // ================= HTTP SERVER =================
 http
