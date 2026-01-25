@@ -461,7 +461,7 @@ totalWords: ${totalWords}
       if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
     });
   }
-
+  }
   await browser.close();
   return { pages, stats };
 }
