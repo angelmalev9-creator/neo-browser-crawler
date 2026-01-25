@@ -6,7 +6,7 @@ const PORT = Number(process.env.PORT || 10000);
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const MAX_OCR_BLOCKS = 3;
+const MAX_OCR_ELEMENTS = 5;
 
 // режем САМО реален шум
 const SKIP_URL_RE =
@@ -91,7 +91,7 @@ function detectPageType(url = "", title = "") {
   }
 }
 
-// ================= STRUCTURED EXTRACTOR =================
+// ================= STRUCTURED EXTRACTOR WITH CSS OVERLAYS =================
 async function extractStructured(page) {
   try {
     await page.waitForSelector("body", { timeout: 5000 });
@@ -104,14 +104,70 @@ async function extractStructured(page) {
       const sections = [];
       let current = null;
 
-      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
+      // Събираме от основни елементи
+      document.querySelectorAll("h1,h2,h3,p,li,span,div").forEach(el => {
+        const text = el.innerText?.trim();
+        if (!text) return;
+
         if (el.tagName.startsWith("H")) {
-          current = { heading: el.innerText.trim(), text: "" };
+          current = { heading: text, text: "" };
           sections.push(current);
-        } else if (current) {
-          current.text += " " + el.innerText;
+        } else if (current && text.length > 5) {
+          current.text += " " + text;
         }
       });
+
+      // Вземаме текст от CSS overlays, modals, popups
+      const overlaySelectors = [
+        '[class*="overlay"]',
+        '[class*="modal"]',
+        '[class*="popup"]',
+        '[class*="tooltip"]',
+        '[class*="banner"]',
+        '[class*="notification"]',
+        '[class*="alert"]',
+        '[style*="position: fixed"]',
+        '[style*="position: absolute"]',
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+      ];
+
+      let overlayText = "";
+      overlaySelectors.forEach(selector => {
+        try {
+          document.querySelectorAll(selector).forEach(el => {
+            const computed = window.getComputedStyle(el);
+            // Взимаме дори скритите overlay-и (може да се покажат с JS)
+            const text = el.innerText?.trim();
+            if (text && text.length > 10) {
+              overlayText += "\n" + text;
+            }
+          });
+        } catch (e) {
+          console.error("Overlay extraction error:", e);
+        }
+      });
+
+      // Вземаме текст от ::before и ::after псевдоелементи
+      let pseudoText = "";
+      try {
+        document.querySelectorAll("*").forEach(el => {
+          const before = window.getComputedStyle(el, "::before").content;
+          const after = window.getComputedStyle(el, "::after").content;
+          
+          if (before && before !== "none" && before !== '""') {
+            const cleaned = before.replace(/^["']|["']$/g, "");
+            if (cleaned.length > 3) pseudoText += " " + cleaned;
+          }
+          
+          if (after && after !== "none" && after !== '""') {
+            const cleaned = after.replace(/^["']|["']$/g, "");
+            if (cleaned.length > 3) pseudoText += " " + cleaned;
+          }
+        });
+      } catch (e) {
+        console.error("Pseudo element extraction error:", e);
+      }
 
       const mainContent =
         document.querySelector("main")?.innerText ||
@@ -123,7 +179,9 @@ async function extractStructured(page) {
         rawContent: [
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
-        ].join("\n\n"),
+          overlayText,
+          pseudoText,
+        ].filter(Boolean).join("\n\n"),
       };
     });
   } catch (e) {
@@ -132,18 +190,30 @@ async function extractStructured(page) {
   }
 }
 
-// ================= GOOGLE VISION OCR (SCREENSHOT) =================
-async function ocrElementScreenshot(page, elementHandle) {
+// ================= GOOGLE VISION OCR (IMPROVED) =================
+async function ocrElement(page, element, context = "") {
   const apiKey = process.env.GOOGLE_VISION_API_KEY;
   if (!apiKey) {
-    console.warn("[OCR] No API key found");
+    console.warn("[OCR] No API key found - skipping");
     return "";
   }
 
   try {
-    console.log("[OCR] screenshot sent to Vision API");
+    const box = await element.boundingBox();
+    if (!box) {
+      console.log("[OCR] Element has no bounding box - skipping");
+      return "";
+    }
 
-    const buffer = await elementHandle.screenshot();
+    // Минимални размери за OCR
+    if (box.width < 100 || box.height < 50) {
+      console.log(`[OCR] Element too small (${box.width}x${box.height}) - skipping`);
+      return "";
+    }
+
+    console.log(`[OCR] Processing ${context}: ${box.width}x${box.height}px`);
+
+    const buffer = await element.screenshot({ type: 'png' });
     const base64 = buffer.toString("base64");
 
     const res = await fetch(
@@ -155,7 +225,13 @@ async function ocrElementScreenshot(page, elementHandle) {
           requests: [
             {
               image: { content: base64 },
-              features: [{ type: "TEXT_DETECTION" }],
+              features: [
+                { type: "TEXT_DETECTION", maxResults: 50 },
+                { type: "DOCUMENT_TEXT_DETECTION", maxResults: 50 }
+              ],
+              imageContext: {
+                languageHints: ["bg", "en"]
+              }
             },
           ],
         }),
@@ -163,19 +239,28 @@ async function ocrElementScreenshot(page, elementHandle) {
     );
 
     if (!res.ok) {
-      throw new Error(`Vision API returned ${res.status}`);
+      const errorText = await res.text();
+      console.error(`[OCR] Vision API error: ${res.status} - ${errorText}`);
+      return "";
     }
 
     const json = await res.json();
+    
+    if (json.responses?.[0]?.error) {
+      console.error("[OCR] API returned error:", json.responses[0].error);
+      return "";
+    }
 
-    console.log(
-      "[OCR] Vision response chars:",
-      json.responses?.[0]?.fullTextAnnotation?.text?.length || 0
-    );
+    const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+    
+    console.log(`[OCR] Extracted ${text.length} chars from ${context}`);
+    if (text) {
+      console.log(`[OCR] Preview: ${text.slice(0, 150)}...`);
+    }
 
-    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+    return text;
   } catch (e) {
-    console.error("[OCR FAIL]", e.message);
+    console.error(`[OCR FAIL] ${context}:`, e.message);
     return "";
   }
 }
@@ -218,7 +303,10 @@ async function crawlSmart(startUrl) {
   let context;
   let page;
   try {
-    context = await browser.newContext();
+    context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    });
     page = await context.newPage();
   } catch (e) {
     await browser.close();
@@ -239,7 +327,8 @@ async function crawlSmart(startUrl) {
       visited: 0,
       saved: 0,
       byType: {},
-      ocrBlocksUsed: 0,
+      ocrElementsProcessed: 0,
+      ocrCharsExtracted: 0,
       errors: 0,
     };
 
@@ -256,12 +345,19 @@ async function crawlSmart(startUrl) {
       }
 
       try {
-        // === PATCH: trigger JS-rendered / scroll-based content ===
+        // Trigger JS-rendered content
         for (let i = 0; i < 4; i++) {
           await page.evaluate(() => window.scrollBy(0, window.innerHeight));
           await page.waitForTimeout(500);
         }
-        // === END PATCH ===
+
+        // Trigger hover states and modals
+        try {
+          await page.mouse.move(100, 100);
+          await page.waitForTimeout(300);
+        } catch (e) {
+          console.log("[MOUSE MOVE ERROR]", e.message);
+        }
 
         const title = clean(await page.title());
         const pageType = detectPageType(url, title);
@@ -269,34 +365,67 @@ async function crawlSmart(startUrl) {
 
         const data = await extractStructured(page);
 
-        // ===== OCR =====
+        // ===== OCR НА РАЗЛИЧНИ ЕЛЕМЕНТИ =====
         let ocrText = "";
 
-        if (pageType === "services" || pageType === "general") {
-          console.log("[OCR] checking images on page:", url);
+        if (stats.ocrElementsProcessed < MAX_OCR_ELEMENTS) {
+          console.log(`[OCR] Scanning page for visual elements: ${url}`);
 
           try {
+            // 1. OCR на изображения с текст
             const images = await page.$$("img");
-
             for (const img of images) {
-              if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
-
-              try {
-                const box = await img.boundingBox();
-                if (!box || box.width < 200 || box.height < 200) continue;
-
-                const text = await ocrElementScreenshot(page, img);
-                if (text && /\d+\s?(€|лв|eur|bgn|кв\.?|sqm)/i.test(text)) {
-                  console.log("[OCR HIT]", text.slice(0, 120));
-                  ocrText += "\n" + text;
-                  stats.ocrBlocksUsed++;
-                }
-              } catch (e) {
-                console.error("[OCR IMAGE ERROR]", e.message);
+              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
+              
+              const text = await ocrElement(page, img, "image");
+              if (text) {
+                ocrText += "\n" + text;
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
               }
             }
+
+            // 2. OCR на canvas елементи
+            const canvases = await page.$$("canvas");
+            for (const canvas of canvases) {
+              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
+              
+              const text = await ocrElement(page, canvas, "canvas");
+              if (text) {
+                ocrText += "\n" + text;
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            }
+
+            // 3. OCR на div/section с background images
+            const bgElements = await page.$$('[style*="background-image"], [class*="bg-"], [class*="banner"]');
+            for (const el of bgElements) {
+              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
+              
+              const text = await ocrElement(page, el, "bg-element");
+              if (text) {
+                ocrText += "\n" + text;
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            }
+
+            // 4. OCR на SVG елементи
+            const svgs = await page.$$("svg");
+            for (const svg of svgs) {
+              if (stats.ocrElementsProcessed >= MAX_OCR_ELEMENTS) break;
+              
+              const text = await ocrElement(page, svg, "svg");
+              if (text) {
+                ocrText += "\n" + text;
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
+              }
+            }
+
           } catch (e) {
-            console.error("[OCR IMAGES SELECTOR ERROR]", e.message);
+            console.error("[OCR EXTRACTION ERROR]", e.message);
           }
         }
 
