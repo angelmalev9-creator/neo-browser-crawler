@@ -192,7 +192,7 @@ async function extractStructured(page) {
 
 // ================= GOOGLE VISION OCR (IMPROVED) =================
 async function ocrElement(page, element, context = "") {
-  const apiKey = process.env.GOOGLE_VISION_API_KEY;
+  const apiKey = process.env.GOOGLE_VISION_API_KEY || "AIzaSyB1g-JZCwk2AuhoGtroF0zurDV9PVHEZq0";
   if (!apiKey) {
     console.warn("[OCR] No API key found - skipping");
     return "";
