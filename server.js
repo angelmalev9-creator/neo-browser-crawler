@@ -219,15 +219,14 @@ async function ocrElement(page, element, context = "") {
   const apiKey = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
   try {
-    // Проверка дали page е затворен
     if (page.isClosed()) {
-      console.log(`[OCR] ${context}: page closed, skipping`);
+      console.log(`[OCR] ${context}: page closed`);
       return "";
     }
 
     const box = await element.boundingBox().catch(() => null);
     if (!box) {
-      console.log(`[OCR] ${context}: no bounding box`);
+      console.log(`[OCR] ${context}: no box`);
       return "";
     }
 
@@ -235,20 +234,17 @@ async function ocrElement(page, element, context = "") {
       return "";
     }
 
-    console.log(`[OCR] ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px - taking screenshot...`);
+    console.log(`[OCR] ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
 
-    // Screenshot с по-кратък timeout
     const buffer = await element.screenshot({ 
       type: 'png',
-      timeout: 10000  // 10s вместо 30s
+      timeout: 10000
     }).catch(e => {
-      console.log(`[OCR] ${context}: screenshot failed - ${e.message}`);
+      console.log(`[OCR] ${context}: screenshot failed`);
       return null;
     });
 
     if (!buffer) return "";
-
-    console.log(`[OCR] ${context}: screenshot OK, sending to Vision API...`);
 
     const base64 = buffer.toString("base64");
 
@@ -281,9 +277,7 @@ async function ocrElement(page, element, context = "") {
     const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
     
     if (text) {
-      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 100)}"`);
-    } else {
-      console.log(`[OCR] ${context}: no text found in image`);
+      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 80)}"`);
     }
 
     return text;
@@ -373,7 +367,6 @@ async function crawlSmart(startUrl) {
       }
 
       try {
-        // Scroll + load images
         console.log("[PAGE] Loading content...");
         
         for (let i = 0; i < 3; i++) {
@@ -400,113 +393,51 @@ async function crawlSmart(startUrl) {
         let ocrText = "";
         const ocrTexts = new Set();
 
-        console.log(`[OCR] Starting OCR on: ${url}`);
+        console.log(`[OCR] === START on ${url} ===`);
 
         try {
-          // OCR на всички изображения
-          const imageElements = await page.$("img");
-          const imageCount = imageElements ? imageElements.length : 0;
-          console.log(`[OCR] Found ${imageCount} images`);
-          
-          const finalImageCount = imageElements ? imageElements.length : 0;
-          console.log(`[OCR] Processing ${finalImageCount} images...`);
+          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
-          if (imageElements && finalImageCount > 0) {
-            for (let i = 0; i < finalImageCount; i++) {
-              console.log(`[OCR] --- Processing image ${i+1}/${finalImageCount} ---`);
-              try {
-                const img = imageElements[i];
-                
-                // Проверяваме дали изображението изглежда че има текст
-                const imageInfo = await img.evaluate(el => {
-                  const src = el.src || "";
-                  const alt = el.alt || "";
-                  const className = el.className || "";
-                  const parent = el.parentElement;
-                  const parentClass = parent ? parent.className : "";
-                  
-                  // Индикатори че има текст
-                  const hasTextIndicators = 
-                    /price|ceni|tseni|card|banner|plan|package|offer|promo|badge|label/i.test(src + alt + className + parentClass);
-                  
-                  // Пропускаме decorative изображения
-                  const isDecorative = 
-                    /logo|icon|arrow|bullet|social|facebook|instagram|decoration|background|bg-|hero/i.test(src + alt + className);
-                  
-                  // Пропускаме много малки изображения (икони)
-                  const rect = el.getBoundingClientRect();
-                  const tooSmall = rect.width < 80 || rect.height < 50;
-                  
-                  return {
-                    src,
-                    alt,
-                    className,
-                    hasTextIndicators,
-                    isDecorative,
-                    tooSmall,
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height)
-                  };
-                });
+          let imgs;
+          try {
+            imgs = await page.$$("img");
+          } catch (e) {
+            console.log("[OCR] ERROR getting images:", e.message);
+            imgs = [];
+          }
 
-                console.log(`[OCR] Image ${i+1}/${imageCount}: ${imageInfo.src.slice(-60)}`);
-                console.log(`      Size: ${imageInfo.width}x${imageInfo.height}, Text indicators: ${imageInfo.hasTextIndicators}, Decorative: ${imageInfo.isDecorative}`);
+          console.log(`[OCR] Found ${imgs.length} images`);
 
-                // Решаваме дали да правим OCR
-                const shouldOCR = 
-                  !imageInfo.tooSmall && 
-                  !imageInfo.isDecorative && 
-                  (imageInfo.hasTextIndicators || imageInfo.width > 200);
+          for (let i = 0; i < imgs.length; i++) {
+            if (page.isClosed()) break;
 
-                if (!shouldOCR) {
-                  console.log(`      → Skipping (likely no text)`);
-                  continue;
-                }
+            try {
+              const info = await imgs[i].evaluate(el => ({
+                src: el.src || "",
+                w: Math.round(el.getBoundingClientRect().width),
+                h: Math.round(el.getBoundingClientRect().height)
+              })).catch(() => null);
 
-                console.log(`      → Processing with OCR...`);
+              if (!info) continue;
 
-                const text = await ocrElement(page, img, `img-${i+1}`);
-                if (text && text.length > 5 && !ocrTexts.has(text)) {
-                  ocrText += "\n" + text;
-                  ocrTexts.add(text);
-                  stats.ocrElementsProcessed++;
-                  stats.ocrCharsExtracted += text.length;
-                }
-              } catch (e) {
-                console.error(`[OCR] Image ${i+1} error:`, e.message);
+              console.log(`[OCR] Img ${i+1}: ${info.src.slice(-50)} (${info.w}x${info.h})`);
+
+              if (info.w < 50 || info.h < 30) continue;
+              if (/logo|icon/i.test(info.src)) continue;
+
+              const text = await ocrElement(page, imgs[i], `img-${i+1}`);
+              if (text && text.length > 3 && !ocrTexts.has(text)) {
+                ocrText += "\n" + text;
+                ocrTexts.add(text);
+                stats.ocrElementsProcessed++;
+                stats.ocrCharsExtracted += text.length;
               }
+            } catch (e) {
+              console.error(`[OCR] Img ${i+1} error:`, e.message);
             }
           }
 
-          // OCR на pricing cards/divs
-          const cardElements = await page.$('[class*="card"], [class*="price"], [class*="ceni"]');
-          const cardCount = cardElements ? cardElements.length : 0;
-          console.log(`[OCR] Found ${cardCount} cards`);
-          
-          if (cardElements && cardCount > 0) {
-            for (let i = 0; i < Math.min(cardCount, 10); i++) {
-              try {
-                // Проверка дали page е все още отворен
-                if (page.isClosed()) {
-                  console.log(`[OCR] Page closed, stopping card OCR at ${i+1}`);
-                  break;
-                }
-
-                const text = await ocrElement(page, cardElements[i], `card-${i+1}`);
-                if (text && text.length > 5 && !ocrTexts.has(text)) {
-                  ocrText += "\n" + text;
-                  ocrTexts.add(text);
-                  stats.ocrElementsProcessed++;
-                  stats.ocrCharsExtracted += text.length;
-                }
-              } catch (e) {
-                console.error(`[OCR] Card ${i+1} error:`, e.message);
-              }
-            }
-          }
-
-          console.log(`[OCR] ✓ Done: ${stats.ocrElementsProcessed} elements, ${stats.ocrCharsExtracted} chars`);
-
+          console.log(`[OCR] === DONE: ${stats.ocrElementsProcessed} elements, ${stats.ocrCharsExtracted} chars ===`);
         } catch (e) {
           console.error("[OCR ERROR]", e.message);
         }
