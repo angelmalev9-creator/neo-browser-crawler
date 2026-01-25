@@ -382,11 +382,46 @@ async function crawlSmart(startUrl) {
       }
 
       try {
-        // Trigger JS-rendered content
+        // Trigger JS-rendered content + ФОРСИРАНО ЗАРЕЖДАНЕ НА ИЗОБРАЖЕНИЯ
+        console.log("[PAGE] Scrolling and loading images...");
+        
         for (let i = 0; i < 4; i++) {
           await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(800);
         }
+
+        // Скролваме обратно нагоре да заредим всички изображения
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(500);
+
+        // ФОРСИРАМЕ зареждане на lazy-loaded изображения
+        await page.evaluate(() => {
+          document.querySelectorAll('img[loading="lazy"]').forEach(img => {
+            img.loading = 'eager';
+          });
+          
+          // Trigger scroll events за lazy load
+          window.dispatchEvent(new Event('scroll'));
+          window.dispatchEvent(new Event('resize'));
+        });
+
+        await page.waitForTimeout(1500);
+
+        // Чакаме всички изображения да се заредят
+        await page.evaluate(() => {
+          return Promise.all(
+            Array.from(document.images)
+              .filter(img => !img.complete)
+              .map(img => new Promise(resolve => {
+                img.addEventListener('load', resolve);
+                img.addEventListener('error', resolve);
+                setTimeout(resolve, 3000); // timeout 3s per image
+              }))
+          );
+        });
+
+        console.log("[PAGE] Images loaded, waiting extra time...");
+        await page.waitForTimeout(1000);
 
         // Trigger hover states and modals
         try {
