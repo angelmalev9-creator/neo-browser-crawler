@@ -187,16 +187,14 @@ async function extractStructured(page) {
 
 // ================= GOOGLE VISION OCR (SCREENSHOT) =================
 async function ocrElementScreenshot(page, elementHandle) {
+  async function ocrFullPage(page) {
   const apiKey = process.env.GOOGLE_VISION_API_KEY;
   if (!apiKey) return "";
-if (!process.env.GOOGLE_VISION_API_KEY) {
-  console.error("[OCR] NO GOOGLE VISION KEY");
-}
 
   try {
-    console.log("[OCR] screenshot sent to Vision API");
+    console.log("[OCR FULL PAGE] taking screenshot");
 
-    const buffer = await elementHandle.screenshot();
+    const buffer = await page.screenshot({ fullPage: true });
     const base64 = buffer.toString("base64");
 
     const res = await fetch(
@@ -216,18 +214,18 @@ if (!process.env.GOOGLE_VISION_API_KEY) {
     );
 
     const json = await res.json();
+    const text =
+      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
 
-    console.log(
-      "[OCR] Vision response chars:",
-      json.responses?.[0]?.fullTextAnnotation?.text?.length || 0
-    );
+    console.log("[OCR FULL PAGE CHARS]", text.length);
 
-    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+    return text;
   } catch (e) {
-    console.error("[OCR FAIL]", e.message);
+    console.error("[OCR FULL PAGE FAIL]", e.message);
     return "";
   }
 }
+
 
 // ================= LINK DISCOVERY =================
 async function collectAllLinks(page, base) {
@@ -298,8 +296,12 @@ const data = await extractStructured(page);
 // ===== OCR =====
 let ocrText = "";
 
-if (pageType === "services" || pageType === "general") {
-  console.log("[OCR] checking visual blocks on page:", url);
+if (
+  pageType === "services" ||
+  pageType === "general" ||
+  /tseni|pricing|price|ceni/.test(url)
+) {
+
 
   // 1️⃣ OCR images
   const images = await page.$$("img");
@@ -341,7 +343,16 @@ if (pageType === "services" || pageType === "general") {
   // 3️⃣ OCR embedded PDFs / iframes
   const embeds = await page.$$("iframe, embed, object");
 
-  for (const emb of embeds) {
+  for (const emb of embeds)
+  // 🔥 FALLBACK: OCR WHOLE PAGE (FOR IMAGE-ONLY PRICING)
+if (!ocrText || ocrText.length < 50) {
+  console.log("[OCR FALLBACK] full page OCR");
+  const fullPageText = await ocrFullPage(page);
+  if (fullPageText) {
+    ocrText += "\n" + fullPageText;
+  }
+}
+{
     if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
     const box = await emb.boundingBox();
