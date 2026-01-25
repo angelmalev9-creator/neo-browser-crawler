@@ -374,16 +374,16 @@ if (
 
   // 🔥 FALLBACK: OCR whole page
   if (!ocrText || ocrText.length < 50) {
-    const fullPageText = await ocrFullPage(page);
-    if (fullPageText) {
-      ocrText += "\n" + fullPageText;
-    }
+    ...
   }
-    } // END while(queue.length && Date.now() < deadline)
+} // END OCR if
 
-  await browser.close();
-  return { pages, stats };
+} // END while(queue.length && Date.now() < deadline)
+
+await browser.close();
+return { pages, stats };
 } // END crawlSmart
+
 
 
 // ================= HTTP SERVER =================
