@@ -6,11 +6,10 @@ const PORT = Number(process.env.PORT || 10000);
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const MAX_OCR_ELEMENTS = 5;
 
 // режем САМО реален шум
 const SKIP_URL_RE =
-  /(wp-content|uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
+  /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
@@ -47,7 +46,6 @@ function numberToBgWords(n) {
     return BG_TENS[t] + (r ? " и " + BG_0_19[r] : "");
   }
 
-  // НЕ пипаме по-големи числа (телефони, години, ID)
   return String(n);
 }
 
@@ -80,7 +78,7 @@ function detectPageType(url = "", title = "") {
   try {
     const s = (url + " " + title).toLowerCase();
     if (/za-nas|about/.test(s)) return "about";
-    if (/uslugi|services|pricing|price|ceni/.test(s)) return "services";
+    if (/uslugi|services|pricing|price|ceni|tseni/.test(s)) return "services";
     if (/kontakti|contact/.test(s)) return "contact";
     if (/faq|vuprosi|questions/.test(s)) return "faq";
     if (/blog|news|article/.test(s)) return "blog";
@@ -115,11 +113,9 @@ async function extractStructured(page) {
       let current = null;
       const processedElements = new Set();
 
-      // Събираме от основни елементи БЕЗ дублиране
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
         
-        // Пропускаме елементи които са деца на вече обработени
         let parent = el.parentElement;
         while (parent) {
           if (processedElements.has(parent)) return;
@@ -142,7 +138,6 @@ async function extractStructured(page) {
         processedElements.add(el);
       });
 
-      // Вземаме текст от CSS overlays, modals, popups
       const overlaySelectors = [
         '[class*="overlay"]',
         '[class*="modal"]',
@@ -172,12 +167,9 @@ async function extractStructured(page) {
               processedElements.add(el);
             }
           });
-        } catch (e) {
-          console.error("Overlay extraction error:", e);
-        }
+        } catch (e) {}
       });
 
-      // Вземаме текст от ::before и ::after псевдоелементи
       const pseudoTexts = [];
       try {
         document.querySelectorAll("*").forEach(el => {
@@ -196,11 +188,8 @@ async function extractStructured(page) {
             if (uniqueText) pseudoTexts.push(uniqueText);
           }
         });
-      } catch (e) {
-        console.error("Pseudo element extraction error:", e);
-      }
+      } catch (e) {}
 
-      // Main content САМО ако не е дублиран
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
@@ -225,28 +214,22 @@ async function extractStructured(page) {
   }
 }
 
-// ================= GOOGLE VISION OCR (IMPROVED) =================
+// ================= GOOGLE VISION OCR =================
 async function ocrElement(page, element, context = "") {
-  const apiKey = process.env.GOOGLE_VISION_API_KEY || "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
-  if (!apiKey) {
-    console.warn("[OCR] No API key found - skipping");
-    return "";
-  }
+  const apiKey = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
   try {
     const box = await element.boundingBox();
     if (!box) {
-      console.log(`[OCR] ${context}: no bounding box - skipping`);
+      console.log(`[OCR] ${context}: no bounding box`);
       return "";
     }
 
-    // НАМАЛЕНИ минимални размери - хващаме и малки изображения с цени
     if (box.width < 50 || box.height < 30) {
-      console.log(`[OCR] ${context}: too small (${box.width}x${box.height}) - skipping`);
       return "";
     }
 
-    console.log(`[OCR] Processing ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
+    console.log(`[OCR] ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
 
     const buffer = await element.screenshot({ type: 'png' });
     const base64 = buffer.toString("base64");
@@ -257,47 +240,35 @@ async function ocrElement(page, element, context = "") {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          requests: [
-            {
-              image: { content: base64 },
-              features: [
-                { type: "TEXT_DETECTION", maxResults: 50 },
-                { type: "DOCUMENT_TEXT_DETECTION", maxResults: 50 }
-              ],
-              imageContext: {
-                languageHints: ["bg", "en", "ru"]
-              }
-            },
-          ],
+          requests: [{
+            image: { content: base64 },
+            features: [
+              { type: "TEXT_DETECTION" },
+              { type: "DOCUMENT_TEXT_DETECTION" }
+            ],
+            imageContext: {
+              languageHints: ["bg", "en", "ru"]
+            }
+          }],
         }),
       }
     );
 
     if (!res.ok) {
-      const errorText = await res.text();
-      console.error(`[OCR] ${context}: Vision API error ${res.status} - ${errorText}`);
+      console.error(`[OCR] ${context}: API ${res.status}`);
       return "";
     }
 
     const json = await res.json();
-    
-    if (json.responses?.[0]?.error) {
-      console.error(`[OCR] ${context}: API error:`, json.responses[0].error);
-      return "";
-    }
-
     const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
     
     if (text) {
-      console.log(`[OCR] ✓ ${context}: extracted ${text.length} chars`);
-      console.log(`[OCR] Preview: "${text.slice(0, 200)}${text.length > 200 ? '...' : ''}"`);
-    } else {
-      console.log(`[OCR] ${context}: no text found`);
+      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 100)}"`);
     }
 
     return text;
   } catch (e) {
-    console.error(`[OCR] ${context}: FAIL -`, e.message);
+    console.error(`[OCR] ${context}: ERROR -`, e.message);
     return "";
   }
 }
@@ -346,7 +317,7 @@ async function crawlSmart(startUrl) {
     });
     page = await context.newPage();
   } catch (e) {
-    await browser.close();
+    await browser.close().catch(() => {});
     throw new Error("Failed to create page context: " + e.message);
   }
 
@@ -382,54 +353,22 @@ async function crawlSmart(startUrl) {
       }
 
       try {
-        // Trigger JS-rendered content + ФОРСИРАНО ЗАРЕЖДАНЕ НА ИЗОБРАЖЕНИЯ
-        console.log("[PAGE] Scrolling and loading images...");
+        // Scroll + load images
+        console.log("[PAGE] Loading content...");
         
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 3; i++) {
           await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-          await page.waitForTimeout(800);
+          await page.waitForTimeout(600);
         }
 
-        // Скролваме обратно нагоре да заредим всички изображения
-        await page.evaluate(() => window.scrollTo(0, 0));
-        await page.waitForTimeout(500);
-
-        // ФОРСИРАМЕ зареждане на lazy-loaded изображения
         await page.evaluate(() => {
           document.querySelectorAll('img[loading="lazy"]').forEach(img => {
             img.loading = 'eager';
           });
-          
-          // Trigger scroll events за lazy load
           window.dispatchEvent(new Event('scroll'));
-          window.dispatchEvent(new Event('resize'));
         });
 
-        await page.waitForTimeout(1500);
-
-        // Чакаме всички изображения да се заредят
-        await page.evaluate(() => {
-          return Promise.all(
-            Array.from(document.images)
-              .filter(img => !img.complete)
-              .map(img => new Promise(resolve => {
-                img.addEventListener('load', resolve);
-                img.addEventListener('error', resolve);
-                setTimeout(resolve, 3000); // timeout 3s per image
-              }))
-          );
-        });
-
-        console.log("[PAGE] Images loaded, waiting extra time...");
         await page.waitForTimeout(1000);
-
-        // Trigger hover states and modals
-        try {
-          await page.mouse.move(100, 100);
-          await page.waitForTimeout(300);
-        } catch (e) {
-          console.log("[MOUSE MOVE ERROR]", e.message);
-        }
 
         const title = clean(await page.title());
         const pageType = detectPageType(url, title);
@@ -437,93 +376,63 @@ async function crawlSmart(startUrl) {
 
         const data = await extractStructured(page);
 
-        // ===== OCR НА ВСИЧКИ ЕЛЕМЕНТИ (БЕЗ ЛИМИТ) =====
+        // ===== OCR =====
         let ocrText = "";
-        const ocrTexts = new Set(); // За дедупликация на OCR текстове
+        const ocrTexts = new Set();
 
-        console.log(`[OCR] Scanning ALL visual elements on: ${url}`);
+        console.log(`[OCR] Starting OCR on: ${url}`);
 
         try {
-          // 1. OCR на ВСИЧКИ изображения
-          console.log("[OCR] Processing images...");
-          const images = await page.$("img");
-          console.log(`[OCR] Found ${images.length} images`);
+          // OCR на всички изображения
+          const imageElements = await page.$$("img");
+          const imageCount = imageElements ? imageElements.length : 0;
+          console.log(`[OCR] Found ${imageCount} images`);
           
-          for (let i = 0; i < images.length; i++) {
-            try {
-              const text = await ocrElement(page, images[i], `image-${i+1}`);
-              if (text && !ocrTexts.has(text)) {
-                ocrText += "\n" + text;
-                ocrTexts.add(text);
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
+          if (imageElements && imageCount > 0) {
+            for (let i = 0; i < imageCount; i++) {
+              try {
+                const img = imageElements[i];
+                const src = await img.evaluate(el => el.src).catch(() => "");
+                console.log(`[OCR] Image ${i+1}/${imageCount}: ${src.slice(-50)}`);
+
+                const text = await ocrElement(page, img, `img-${i+1}`);
+                if (text && text.length > 5 && !ocrTexts.has(text)) {
+                  ocrText += "\n" + text;
+                  ocrTexts.add(text);
+                  stats.ocrElementsProcessed++;
+                  stats.ocrCharsExtracted += text.length;
+                }
+              } catch (e) {
+                console.error(`[OCR] Image ${i+1} error:`, e.message);
               }
-            } catch (e) {
-              console.error(`[OCR] Error processing image ${i+1}:`, e.message);
             }
           }
 
-          // 2. OCR на canvas елементи
-          console.log("[OCR] Processing canvas elements...");
-          const canvases = await page.$("canvas");
-          console.log(`[OCR] Found ${canvases.length} canvas elements`);
+          // OCR на pricing cards/divs
+          const cardElements = await page.$$('[class*="card"], [class*="price"], [class*="ceni"]');
+          const cardCount = cardElements ? cardElements.length : 0;
+          console.log(`[OCR] Found ${cardCount} cards`);
           
-          for (let i = 0; i < canvases.length; i++) {
-            try {
-              const text = await ocrElement(page, canvases[i], `canvas-${i+1}`);
-              if (text && !ocrTexts.has(text)) {
-                ocrText += "\n" + text;
-                ocrTexts.add(text);
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
+          if (cardElements && cardCount > 0) {
+            for (let i = 0; i < Math.min(cardCount, 10); i++) {
+              try {
+                const text = await ocrElement(page, cardElements[i], `card-${i+1}`);
+                if (text && text.length > 5 && !ocrTexts.has(text)) {
+                  ocrText += "\n" + text;
+                  ocrTexts.add(text);
+                  stats.ocrElementsProcessed++;
+                  stats.ocrCharsExtracted += text.length;
+                }
+              } catch (e) {
+                console.error(`[OCR] Card ${i+1} error:`, e.message);
               }
-            } catch (e) {
-              console.error(`[OCR] Error processing canvas ${i+1}:`, e.message);
             }
           }
 
-          // 3. OCR на div/section с background images и pricing cards
-          console.log("[OCR] Processing background elements and cards...");
-          const bgElements = await page.$('[style*="background-image"], [class*="bg-"], [class*="banner"], [class*="card"], [class*="price"], [class*="package"]');
-          console.log(`[OCR] Found ${bgElements.length} background/card elements`);
-          
-          for (let i = 0; i < bgElements.length; i++) {
-            try {
-              const text = await ocrElement(page, bgElements[i], `bg-element-${i+1}`);
-              if (text && !ocrTexts.has(text)) {
-                ocrText += "\n" + text;
-                ocrTexts.add(text);
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
-              }
-            } catch (e) {
-              console.error(`[OCR] Error processing bg-element ${i+1}:`, e.message);
-            }
-          }
-
-          // 4. OCR на SVG елементи
-          console.log("[OCR] Processing SVG elements...");
-          const svgs = await page.$("svg");
-          console.log(`[OCR] Found ${svgs.length} SVG elements`);
-          
-          for (let i = 0; i < svgs.length; i++) {
-            try {
-              const text = await ocrElement(page, svgs[i], `svg-${i+1}`);
-              if (text && !ocrTexts.has(text)) {
-                ocrText += "\n" + text;
-                ocrTexts.add(text);
-                stats.ocrElementsProcessed++;
-                stats.ocrCharsExtracted += text.length;
-              }
-            } catch (e) {
-              console.error(`[OCR] Error processing SVG ${i+1}:`, e.message);
-            }
-          }
-
-          console.log(`[OCR] Total elements processed: ${stats.ocrElementsProcessed}, Total chars: ${stats.ocrCharsExtracted}`);
+          console.log(`[OCR] ✓ Done: ${stats.ocrElementsProcessed} elements, ${stats.ocrCharsExtracted} chars`);
 
         } catch (e) {
-          console.error("[OCR EXTRACTION ERROR]", e.message);
+          console.error("[OCR ERROR]", e.message, e.stack);
         }
 
         const htmlContent = normalizeNumbers(clean(data.rawContent));
@@ -585,9 +494,12 @@ totalWords: ${totalWords}
     return { pages, stats };
   } finally {
     try {
-      await browser.close();
+      if (page && !page.isClosed()) await page.close();
+      if (context) await context.close();
+      if (browser) await browser.close();
+      console.log("[CLEANUP] Browser closed");
     } catch (e) {
-      console.error("[BROWSER CLOSE ERROR]", e.message);
+      console.error("[CLEANUP ERROR]", e.message);
     }
   }
 }
