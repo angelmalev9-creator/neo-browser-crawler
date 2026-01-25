@@ -187,13 +187,41 @@ async function extractStructured(page) {
 
 // ================= GOOGLE VISION OCR (SCREENSHOT) =================
 async function ocrElementScreenshot(page, elementHandle) {
-  async function ocrFullPage(page) {
   const apiKey = process.env.GOOGLE_VISION_API_KEY;
   if (!apiKey) return "";
 
   try {
-    console.log("[OCR FULL PAGE] taking screenshot");
+    const buffer = await elementHandle.screenshot();
+    const base64 = buffer.toString("base64");
 
+    const res = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [
+            {
+              image: { content: base64 },
+              features: [{ type: "TEXT_DETECTION" }],
+            },
+          ],
+        }),
+      }
+    );
+
+    const json = await res.json();
+    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
+async function ocrFullPage(page) {
+  const apiKey = process.env.GOOGLE_VISION_API_KEY;
+  if (!apiKey) return "";
+
+  try {
     const buffer = await page.screenshot({ fullPage: true });
     const base64 = buffer.toString("base64");
 
@@ -214,17 +242,12 @@ async function ocrElementScreenshot(page, elementHandle) {
     );
 
     const json = await res.json();
-    const text =
-      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
-
-    console.log("[OCR FULL PAGE CHARS]", text.length);
-
-    return text;
-  } catch (e) {
-    console.error("[OCR FULL PAGE FAIL]", e.message);
+    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+  } catch {
     return "";
   }
 }
+
 
 
 // ================= LINK DISCOVERY =================
@@ -343,7 +366,22 @@ if (
   // 3️⃣ OCR embedded PDFs / iframes
   const embeds = await page.$$("iframe, embed, object");
 
-  for (const emb of embeds)
+for (const emb of embeds) {
+  if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+
+  const box = await emb.boundingBox();
+  if (!box || box.width < 400 || box.height < 300) continue;
+
+  const text = await ocrElementScreenshot(page, emb);
+  if (text && text.length > 30) {
+    console.log("[OCR EMBED HIT]", text.slice(0, 120));
+    ocrText += "\n" + text;
+    stats.ocrBlocksUsed++;
+  }
+}
+
+
+
   // 🔥 FALLBACK: OCR WHOLE PAGE (FOR IMAGE-ONLY PRICING)
 if (!ocrText || ocrText.length < 50) {
   console.log("[OCR FALLBACK] full page OCR");
@@ -367,32 +405,6 @@ if (!ocrText || ocrText.length < 50) {
   }
 }
 // ===== FULL PAGE OCR FALLBACK =====
-if (
-  (pageType === "services" || /ceni|pricing/i.test(url)) &&
-ocrText.trim().length < 50
-) {
-  console.log("[OCR] FULL PAGE fallback triggered:", url);
-
-  try {
-    const screenshot = await page.screenshot({ fullPage: true });
-    const base64 = screenshot.toString("base64");
-
-    const res = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GOOGLE_VISION_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          requests: [
-            {
-              image: { content: base64 },
-              features: [{ type: "TEXT_DETECTION" }],
-            },
-          ],
-        }),
-      }
-    );
-
     const json = await res.json();
     const fullText =
       json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
@@ -420,7 +432,22 @@ ${htmlContent}
 ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
-    const pricing = extractPricing(content);
+   if (ocrText.trim().length < 50) {
+  console.log("[OCR FALLBACK] full page OCR");
+  const fullText = await ocrFullPage(page);
+  if (fullText) {
+    ocrText += "\n" + fullText;
+  }
+}
+
+const pricing = extractPricing(content);
+if (ocrText.trim().length < 50) {
+  console.log("[OCR FALLBACK] full page OCR");
+  const fullText = await ocrFullPage(page);
+  if (fullText) {
+    ocrText += "\n" + fullText;
+  }
+}
 
 if (pricing.length) {
   console.log("[PRICING FOUND]", pricing);
