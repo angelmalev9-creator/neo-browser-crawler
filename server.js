@@ -219,7 +219,20 @@ async function ocrElement(page, element, context = "") {
   const apiKey = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
   try {
-    const box = await element.boundingBox();
+    // Проверка дали page е затворен
+    if (page.isClosed()) {
+      console.log(`[OCR] ${context}: page closed, skipping`);
+      return "";
+    }
+
+    // Проверка дали element е visible
+    const isVisible = await element.isVisible().catch(() => false);
+    if (!isVisible) {
+      console.log(`[OCR] ${context}: not visible, skipping`);
+      return "";
+    }
+
+    const box = await element.boundingBox().catch(() => null);
     if (!box) {
       console.log(`[OCR] ${context}: no bounding box`);
       return "";
@@ -231,7 +244,17 @@ async function ocrElement(page, element, context = "") {
 
     console.log(`[OCR] ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
 
-    const buffer = await element.screenshot({ type: 'png' });
+    // Screenshot с по-кратък timeout
+    const buffer = await element.screenshot({ 
+      type: 'png',
+      timeout: 10000  // 10s вместо 30s
+    }).catch(e => {
+      console.log(`[OCR] ${context}: screenshot failed - ${e.message}`);
+      return null;
+    });
+
+    if (!buffer) return "";
+
     const base64 = buffer.toString("base64");
 
     const res = await fetch(
