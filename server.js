@@ -101,20 +101,45 @@ async function extractStructured(page) {
 
   try {
     return await page.evaluate(() => {
+      const seenTexts = new Set();
+      
+      function addUniqueText(text, minLength = 10) {
+        const normalized = text.trim().replace(/\s+/g, ' ');
+        if (normalized.length < minLength) return "";
+        if (seenTexts.has(normalized)) return "";
+        seenTexts.add(normalized);
+        return normalized;
+      }
+
       const sections = [];
       let current = null;
+      const processedElements = new Set();
 
-      // Събираме от основни елементи
-      document.querySelectorAll("h1,h2,h3,p,li,span,div").forEach(el => {
+      // Събираме от основни елементи БЕЗ дублиране
+      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
+        if (processedElements.has(el)) return;
+        
+        // Пропускаме елементи които са деца на вече обработени
+        let parent = el.parentElement;
+        while (parent) {
+          if (processedElements.has(parent)) return;
+          parent = parent.parentElement;
+        }
+        
         const text = el.innerText?.trim();
         if (!text) return;
 
+        const uniqueText = addUniqueText(text, 5);
+        if (!uniqueText) return;
+
         if (el.tagName.startsWith("H")) {
-          current = { heading: text, text: "" };
+          current = { heading: uniqueText, text: "" };
           sections.push(current);
-        } else if (current && text.length > 5) {
-          current.text += " " + text;
+        } else if (current) {
+          current.text += " " + uniqueText;
         }
+        
+        processedElements.add(el);
       });
 
       // Вземаме текст от CSS overlays, modals, popups
@@ -132,15 +157,19 @@ async function extractStructured(page) {
         '[role="alertdialog"]',
       ];
 
-      let overlayText = "";
+      const overlayTexts = [];
       overlaySelectors.forEach(selector => {
         try {
           document.querySelectorAll(selector).forEach(el => {
-            const computed = window.getComputedStyle(el);
-            // Взимаме дори скритите overlay-и (може да се покажат с JS)
+            if (processedElements.has(el)) return;
+            
             const text = el.innerText?.trim();
-            if (text && text.length > 10) {
-              overlayText += "\n" + text;
+            if (!text) return;
+            
+            const uniqueText = addUniqueText(text);
+            if (uniqueText) {
+              overlayTexts.push(uniqueText);
+              processedElements.add(el);
             }
           });
         } catch (e) {
@@ -149,7 +178,7 @@ async function extractStructured(page) {
       });
 
       // Вземаме текст от ::before и ::after псевдоелементи
-      let pseudoText = "";
+      const pseudoTexts = [];
       try {
         document.querySelectorAll("*").forEach(el => {
           const before = window.getComputedStyle(el, "::before").content;
@@ -157,30 +186,36 @@ async function extractStructured(page) {
           
           if (before && before !== "none" && before !== '""') {
             const cleaned = before.replace(/^["']|["']$/g, "");
-            if (cleaned.length > 3) pseudoText += " " + cleaned;
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
           }
           
           if (after && after !== "none" && after !== '""') {
             const cleaned = after.replace(/^["']|["']$/g, "");
-            if (cleaned.length > 3) pseudoText += " " + cleaned;
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
           }
         });
       } catch (e) {
         console.error("Pseudo element extraction error:", e);
       }
 
-      const mainContent =
-        document.querySelector("main")?.innerText ||
-        document.querySelector("article")?.innerText ||
-        document.body.innerText ||
-        "";
+      // Main content САМО ако не е дублиран
+      let mainContent = "";
+      const mainEl = document.querySelector("main") || document.querySelector("article");
+      if (mainEl && !processedElements.has(mainEl)) {
+        const text = mainEl.innerText?.trim();
+        if (text) {
+          mainContent = addUniqueText(text) || "";
+        }
+      }
 
       return {
         rawContent: [
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
-          overlayText,
-          pseudoText,
+          overlayTexts.join("\n"),
+          pseudoTexts.join(" "),
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -192,7 +227,7 @@ async function extractStructured(page) {
 
 // ================= GOOGLE VISION OCR (IMPROVED) =================
 async function ocrElement(page, element, context = "") {
-  const apiKey = process.env.GOOGLE_VISION_API_KEY || "AIzaSyB1g-JZCwk2AuhoGtroF0zurDV9PVHEZq0";
+  const apiKey = process.env.GOOGLE_VISION_API_KEY || "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
   if (!apiKey) {
     console.warn("[OCR] No API key found - skipping");
     return "";
