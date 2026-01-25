@@ -379,7 +379,11 @@ if (
       ocrText += "\n" + fullPageText;
     }
   }
-}
+    } // END while(queue.length && Date.now() < deadline)
+
+  await browser.close();
+  return { pages, stats };
+} // END crawlSmart
 
 
 // ================= HTTP SERVER =================
