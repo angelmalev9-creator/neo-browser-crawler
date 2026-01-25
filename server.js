@@ -327,21 +327,21 @@ if (
 
 
   // 1️⃣ OCR images
-  const images = await page.$$("img");
+const images = await page.$$("img");
 
-  for (const img of images) {
-    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
+for (const img of images) {
+  if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-    const box = await img.boundingBox();
-    if (!box || box.width < 200 || box.height < 200) continue;
+  const box = await img.boundingBox();
+  if (!box || box.width < 200 || box.height < 200) continue;
 
-    const text = await ocrElementScreenshot(page, img);
-    if (text) {
-      console.log("[OCR IMG HIT]", text.slice(0, 120));
-      ocrText += "\n" + text;
-      stats.ocrBlocksUsed++;
-    }
+  const text = await ocrElementScreenshot(page, img);
+  if (text) {
+    ocrText += "\n" + text;
+    stats.ocrBlocksUsed++;
   }
+}
+
 
   // 2️⃣ OCR large sections (pricing tables, materials, packages)
   const sections = await page.$$(
@@ -391,33 +391,7 @@ if (!ocrText || ocrText.length < 50) {
   }
 }
 {
-    if (stats.ocrBlocksUsed >= MAX_OCR_BLOCKS) break;
 
-    const box = await emb.boundingBox();
-    if (!box || box.width < 400 || box.height < 300) continue;
-
-    const text = await ocrElementScreenshot(page, emb);
-    if (text && text.length > 30) {
-      console.log("[OCR EMBED HIT]", text.slice(0, 120));
-      ocrText += "\n" + text;
-      stats.ocrBlocksUsed++;
-    }
-  }
-}
-// ===== FULL PAGE OCR FALLBACK =====
-    const json = await res.json();
-    const fullText =
-      json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
-
-    if (fullText.length > 30) {
-      console.log("[OCR FULL PAGE HIT]", fullText.slice(0, 200));
-      ocrText += "\n" + fullText;
-      stats.ocrBlocksUsed++;
-    }
-  } catch (e) {
-    console.error("[OCR FULL PAGE FAIL]", e.message);
-  }
-}
 
    const htmlContent = normalizeNumbers(clean(data.rawContent));
 const ocrContent = normalizeNumbers(clean(ocrText));
@@ -441,13 +415,6 @@ ${ocrContent}
 }
 
 const pricing = extractPricing(content);
-if (ocrText.trim().length < 50) {
-  console.log("[OCR FALLBACK] full page OCR");
-  const fullText = await ocrFullPage(page);
-  if (fullText) {
-    ocrText += "\n" + fullText;
-  }
-}
 
 if (pricing.length) {
   console.log("[PRICING FOUND]", pricing);
