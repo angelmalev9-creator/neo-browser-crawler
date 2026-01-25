@@ -384,7 +384,7 @@ async function crawlSmart(startUrl) {
 
         try {
           // OCR на всички изображения
-          const imageElements = await page.$$("img");
+          const imageElements = await page.$("img");
           const imageCount = imageElements ? imageElements.length : 0;
           console.log(`[OCR] Found ${imageCount} images`);
           
@@ -392,8 +392,54 @@ async function crawlSmart(startUrl) {
             for (let i = 0; i < imageCount; i++) {
               try {
                 const img = imageElements[i];
-                const src = await img.evaluate(el => el.src).catch(() => "");
-                console.log(`[OCR] Image ${i+1}/${imageCount}: ${src.slice(-50)}`);
+                
+                // Проверяваме дали изображението изглежда че има текст
+                const imageInfo = await img.evaluate(el => {
+                  const src = el.src || "";
+                  const alt = el.alt || "";
+                  const className = el.className || "";
+                  const parent = el.parentElement;
+                  const parentClass = parent ? parent.className : "";
+                  
+                  // Индикатори че има текст
+                  const hasTextIndicators = 
+                    /price|ceni|tseni|card|banner|plan|package|offer|promo|badge|label/i.test(src + alt + className + parentClass);
+                  
+                  // Пропускаме decorative изображения
+                  const isDecorative = 
+                    /logo|icon|arrow|bullet|social|facebook|instagram|decoration|background|bg-|hero/i.test(src + alt + className);
+                  
+                  // Пропускаме много малки изображения (икони)
+                  const rect = el.getBoundingClientRect();
+                  const tooSmall = rect.width < 80 || rect.height < 50;
+                  
+                  return {
+                    src,
+                    alt,
+                    className,
+                    hasTextIndicators,
+                    isDecorative,
+                    tooSmall,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                  };
+                });
+
+                console.log(`[OCR] Image ${i+1}/${imageCount}: ${imageInfo.src.slice(-60)}`);
+                console.log(`      Size: ${imageInfo.width}x${imageInfo.height}, Text indicators: ${imageInfo.hasTextIndicators}, Decorative: ${imageInfo.isDecorative}`);
+
+                // Решаваме дали да правим OCR
+                const shouldOCR = 
+                  !imageInfo.tooSmall && 
+                  !imageInfo.isDecorative && 
+                  (imageInfo.hasTextIndicators || imageInfo.width > 200);
+
+                if (!shouldOCR) {
+                  console.log(`      → Skipping (likely no text)`);
+                  continue;
+                }
+
+                console.log(`      → Processing with OCR...`);
 
                 const text = await ocrElement(page, img, `img-${i+1}`);
                 if (text && text.length > 5 && !ocrTexts.has(text)) {
