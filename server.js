@@ -372,9 +372,12 @@ if (
     }
   }
 
-  // 🔥 FALLBACK: OCR whole page
+   // 🔥 FALLBACK: OCR whole page
   if (!ocrText || ocrText.length < 50) {
-    ...
+    const fullPageText = await ocrFullPage(page);
+    if (fullPageText) {
+      ocrText += "\n" + fullPageText;
+    }
   }
 } // END OCR if
 
