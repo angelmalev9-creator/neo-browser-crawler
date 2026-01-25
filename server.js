@@ -408,8 +408,12 @@ async function crawlSmart(startUrl) {
           const imageCount = imageElements ? imageElements.length : 0;
           console.log(`[OCR] Found ${imageCount} images`);
           
-          if (imageElements && imageCount > 0) {
-            for (let i = 0; i < imageCount; i++) {
+          const finalImageCount = imageElements ? imageElements.length : 0;
+          console.log(`[OCR] Processing ${finalImageCount} images...`);
+
+          if (imageElements && finalImageCount > 0) {
+            for (let i = 0; i < finalImageCount; i++) {
+              console.log(`[OCR] --- Processing image ${i+1}/${finalImageCount} ---`);
               try {
                 const img = imageElements[i];
                 
