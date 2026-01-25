@@ -390,7 +390,7 @@ if (!ocrText || ocrText.length < 50) {
     ocrText += "\n" + fullPageText;
   }
 }
-{
+{}
 
 
    const htmlContent = normalizeNumbers(clean(data.rawContent));
