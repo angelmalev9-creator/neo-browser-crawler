@@ -2,6 +2,8 @@ import http from "http";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
+let crawlInProgress = false;
+
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
@@ -427,15 +429,11 @@ const htmlWordCount = countWordsExact(data.rawContent || "");
 
 
         // ===== OCR =====
-        let ocrText = "";
-        if (htmlWordCount < 300) {
-        const ocrTexts = new Set();
+        // ===== OCR =====
+let ocrText = "";
+const ocrTexts = new Set();
 
-        if (htmlWordCount < 300) {
-  console.log(`[OCR] === START on ${url} ===`);
-} else {
-  console.log(`[OCR] SKIP (HTML sufficient): ${htmlWordCount} words`);
-}
+console.log(`[OCR] === START on ${url} ===`);
 
 
         try {
@@ -489,11 +487,12 @@ await enqueueOCR(async () => {
             }
           }
 
-          console.log(`[OCR] === DONE: ${stats.ocrElementsProcessed} elements, ${stats.ocrCharsExtracted} chars ===`);
+          console.log(`[OCR] === DONE for page: ${ocrTexts.size} elements ===`);
+
         } catch (e) {
           console.error("[OCR ERROR]", e.message);
         }
-        }
+      
         const htmlContent = normalizeNumbers(clean(data.rawContent));
         const ocrContent = normalizeNumbers(clean(ocrText));
 
@@ -598,7 +597,18 @@ http
           }));
         }
 
-        const result = await crawlSmart(parsed.url);
+        if (crawlInProgress) {
+  res.writeHead(429, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    success: false,
+    error: "Crawler already running"
+  }));
+}
+
+crawlInProgress = true;
+const result = await crawlSmart(parsed.url);
+crawlInProgress = false;
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, ...result }));
       } catch (e) {
