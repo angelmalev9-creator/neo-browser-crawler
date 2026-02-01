@@ -3,18 +3,20 @@ import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 let crawlInProgress = false;
-let crawlFinished = false;       // ✅ НОВО
-let lastResult = null;           // ✅ НОВО
+let crawlFinished = false;
+let lastResult = null;
 const visited = new Set();
-
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
+const PARALLEL_TABS = 3; // паралелни табове
 
-// режем САМО реален шум
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
+
+// Skip OCR за тези изображения
+const SKIP_OCR_RE = /logo|icon|sprite|placeholder|loading|spinner|avatar|profile|thumb|social|facebook|twitter|instagram|linkedin|youtube|pinterest/i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
@@ -42,15 +44,12 @@ const BG_TENS = [
 function numberToBgWords(n) {
   n = Number(n);
   if (Number.isNaN(n)) return n;
-
   if (n < 20) return BG_0_19[n];
-
   if (n < 100) {
     const t = Math.floor(n / 10);
     const r = n % 10;
     return BG_TENS[t] + (r ? " и " + BG_0_19[r] : "");
   }
-
   return String(n);
 }
 
@@ -61,46 +60,51 @@ function normalizeNumbers(text = "") {
       (_, num, unit) => `${numberToBgWords(num)} ${unit}`
     );
   } catch (e) {
-    console.error("[NORMALIZE NUMBERS ERROR]", e.message);
     return text;
   }
 }
 
-// ================= SAFE GOTO =================
-async function safeGoto(page, url, timeout = 20000) {
+// ================= URL NORMALIZER =================
+const normalizeUrl = (u) => {
   try {
-    console.log("[GOTO]", url);
-    await page.goto(url, { timeout, waitUntil: "domcontentloaded" });
-    return true;
-  } catch (e) {
-    console.error("[GOTO FAIL]", url, e.message);
-    return false;
+    const url = new URL(u);
+    url.hash = "";
+    url.search = "";
+    url.hostname = url.hostname.replace(/^www\./, "");
+    if (url.pathname.endsWith("/") && url.pathname !== "/") {
+      url.pathname = url.pathname.slice(0, -1);
+    }
+    return url.toString();
+  } catch {
+    return u;
   }
-}
+};
+
+// Нормализира image src за кеширане (премахва hash-ове)
+const normalizeImageSrc = (src) => {
+  try {
+    return src.replace(/-[a-zA-Z0-9]{6,12}\.(png|jpg|jpeg|gif|webp)$/i, '.$1');
+  } catch {
+    return src;
+  }
+};
 
 // ================= PAGE TYPE =================
 function detectPageType(url = "", title = "") {
-  try {
-    const s = (url + " " + title).toLowerCase();
-    if (/za-nas|about/.test(s)) return "about";
-    if (/uslugi|services|pricing|price|ceni|tseni/.test(s)) return "services";
-    if (/kontakti|contact/.test(s)) return "contact";
-    if (/faq|vuprosi|questions/.test(s)) return "faq";
-    if (/blog|news|article/.test(s)) return "blog";
-    return "general";
-  } catch (e) {
-    console.error("[PAGE TYPE ERROR]", e.message);
-    return "general";
-  }
+  const s = (url + " " + title).toLowerCase();
+  if (/za-nas|about/.test(s)) return "about";
+  if (/uslugi|services|pricing|price|ceni|tseni/.test(s)) return "services";
+  if (/kontakti|contact/.test(s)) return "contact";
+  if (/faq|vuprosi|questions/.test(s)) return "faq";
+  if (/blog|news|article/.test(s)) return "blog";
+  return "general";
 }
 
-// ================= STRUCTURED EXTRACTOR WITH CSS OVERLAYS =================
+// ================= STRUCTURED EXTRACTOR =================
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("body", { timeout: 5000 });
-  } catch (e) {
-    console.warn("[WAIT BODY TIMEOUT]", e.message);
-  }
+    await page.waitForSelector("body", { timeout: 3000 });
+  } catch {}
 
   try {
     return await page.evaluate(() => {
@@ -144,17 +148,10 @@ async function extractStructured(page) {
       });
 
       const overlaySelectors = [
-        '[class*="overlay"]',
-        '[class*="modal"]',
-        '[class*="popup"]',
-        '[class*="tooltip"]',
-        '[class*="banner"]',
-        '[class*="notification"]',
-        '[class*="alert"]',
-        '[style*="position: fixed"]',
-        '[style*="position: absolute"]',
-        '[role="dialog"]',
-        '[role="alertdialog"]',
+        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
+        '[class*="alert"]', '[style*="position: fixed"]',
+        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
       ];
 
       const overlayTexts = [];
@@ -162,17 +159,15 @@ async function extractStructured(page) {
         try {
           document.querySelectorAll(selector).forEach(el => {
             if (processedElements.has(el)) return;
-            
             const text = el.innerText?.trim();
             if (!text) return;
-            
             const uniqueText = addUniqueText(text);
             if (uniqueText) {
               overlayTexts.push(uniqueText);
               processedElements.add(el);
             }
           });
-        } catch (e) {}
+        } catch {}
       });
 
       const pseudoTexts = [];
@@ -193,15 +188,13 @@ async function extractStructured(page) {
             if (uniqueText) pseudoTexts.push(uniqueText);
           }
         });
-      } catch (e) {}
+      } catch {}
 
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
         const text = mainEl.innerText?.trim();
-        if (text) {
-          mainContent = addUniqueText(text) || "";
-        }
+        if (text) mainContent = addUniqueText(text) || "";
       }
 
       return {
@@ -214,45 +207,82 @@ async function extractStructured(page) {
       };
     });
   } catch (e) {
-    console.error("[EXTRACT STRUCTURED ERROR]", e.message);
     return { rawContent: "" };
   }
 }
 
-// ================= GOOGLE VISION OCR =================
-async function ocrElement(page, element, context = "") {
+// ================= SMART OCR - САМО ЗА ИЗОБРАЖЕНИЯ С ТЕКСТ =================
+const ocrCache = new Map();
+
+async function smartOCR(page, imgElement, context) {
   const apiKey = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
   try {
-    if (page.isClosed()) {
-      console.log(`[OCR] ${context}: page closed`);
-      return "";
+    if (page.isClosed()) return "";
+
+    const info = await imgElement.evaluate(el => ({
+      src: el.src || "",
+      alt: el.alt || "",
+      w: Math.round(el.getBoundingClientRect().width),
+      h: Math.round(el.getBoundingClientRect().height),
+      isVisible: el.getBoundingClientRect().width > 0
+    })).catch(() => null);
+
+    if (!info || !info.isVisible) return "";
+
+    // Skip малки изображения
+    if (info.w < 100 || info.h < 50) return "";
+    
+    // Skip много големи (hero/background)
+    if (info.w > 1400 && info.h > 500) return "";
+    
+    // Skip по pattern в src
+    if (SKIP_OCR_RE.test(info.src)) return "";
+
+    // Нормализиран ключ за кеша
+    const cacheKey = normalizeImageSrc(info.src);
+    
+    // Проверка в кеша
+    if (ocrCache.has(cacheKey)) {
+      const cached = ocrCache.get(cacheKey);
+      if (cached) console.log(`[OCR] Cache hit: ${context}`);
+      return cached;
     }
 
-    const box = await element.boundingBox().catch(() => null);
-    if (!box) {
-      console.log(`[OCR] ${context}: no box`);
-      return "";
-    }
-
-    if (box.width < 50 || box.height < 30) {
-      return "";
-    }
-
-    console.log(`[OCR] ${context}: ${Math.round(box.width)}x${Math.round(box.height)}px`);
-
-    const buffer = await element.screenshot({ 
-      type: 'png',
-      timeout: 10000
-    }).catch(e => {
-      console.log(`[OCR] ${context}: screenshot failed`);
-      return null;
-    });
-
+    const buffer = await imgElement.screenshot({ type: 'png', timeout: 5000 }).catch(() => null);
     if (!buffer) return "";
 
-    const base64 = buffer.toString("base64");
+    // LABEL_DETECTION първо - бързо проверява дали има текст
+    const labelRes = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [{
+            image: { content: buffer.toString("base64") },
+            features: [{ type: "LABEL_DETECTION", maxResults: 5 }]
+          }]
+        })
+      }
+    );
 
+    const labelJson = await labelRes.json();
+    const labels = labelJson.responses?.[0]?.labelAnnotations || [];
+    const labelDescriptions = labels.map(l => l.description.toLowerCase());
+    
+    // Проверка дали има индикация за текст
+    const hasTextIndicator = labelDescriptions.some(l => 
+      /text|document|paper|sign|poster|banner|certificate|menu|card|letter|font|writing|receipt|screenshot|presentation/i.test(l)
+    );
+
+    // Ако няма текст индикатор, skip
+    if (!hasTextIndicator) {
+      ocrCache.set(cacheKey, "");
+      return "";
+    }
+
+    // Има текст - правим пълен OCR
     const res = await fetch(
       `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
       {
@@ -260,51 +290,32 @@ async function ocrElement(page, element, context = "") {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           requests: [{
-            image: { content: base64 },
+            image: { content: buffer.toString("base64") },
             features: [
               { type: "TEXT_DETECTION" },
               { type: "DOCUMENT_TEXT_DETECTION" }
             ],
-            imageContext: {
-              languageHints: ["bg", "en", "ru"]
-            }
-          }],
-        }),
+            imageContext: { languageHints: ["bg", "en", "ru"] }
+          }]
+        })
       }
     );
-
-    if (!res.ok) {
-      console.error(`[OCR] ${context}: API ${res.status}`);
-      return "";
-    }
 
     const json = await res.json();
     const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
     
+    // Кеширане
+    ocrCache.set(cacheKey, text);
+    
     if (text) {
-      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 80)}"`);
+      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 50)}..."`);
     }
 
     return text;
   } catch (e) {
-    console.error(`[OCR] ${context}: ERROR -`, e.message);
+    console.error(`[OCR] ${context}: ${e.message}`);
     return "";
   }
-}
-// ================= OCR QUEUE =================
-let ocrRunning = false;
-const ocrQueue = [];
-
-async function enqueueOCR(task) {
-  ocrQueue.push(task);
-  if (ocrRunning) return;
-
-  ocrRunning = true;
-  while (ocrQueue.length) {
-    const t = ocrQueue.shift();
-    await t();
-  }
-  ocrRunning = false;
 }
 
 // ================= LINK DISCOVERY =================
@@ -320,199 +331,83 @@ async function collectAllLinks(page, base) {
       });
       return Array.from(urls);
     }, base);
-  } catch (e) {
-    console.error("[COLLECT LINKS ERROR]", e.message);
+  } catch {
     return [];
   }
 }
 
-// ================= CRAWLER =================
-async function crawlSmart(startUrl) {
-  const deadline = Date.now() + MAX_SECONDS * 1000;
-  console.log("\n[CRAWL START]", startUrl);
-
-  let browser;
+// ================= PROCESS SINGLE PAGE =================
+async function processPage(page, url, base, stats, ocrImageCache) {
+  const startTime = Date.now();
+  
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-    });
-  } catch (e) {
-    console.error("[BROWSER LAUNCH ERROR]", e.message);
-    throw new Error("Failed to launch browser: " + e.message);
-  }
+    console.log("[GOTO]", url);
+    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
 
-  let context;
-  let page;
-  try {
-    context = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    });
-    page = await context.newPage();
-  } catch (e) {
-    await browser.close().catch(() => {});
-    throw new Error("Failed to create page context: " + e.message);
-  }
-
-  try {
-    if (!(await safeGoto(page, startUrl))) {
-      throw new Error("Failed to load start URL");
+    // Бързо скролиране (2 пъти вместо 3)
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+      await page.waitForTimeout(400);
     }
 
-    const base = new URL(page.url()).origin;
-    
+    // Trigger lazy load
+    await page.evaluate(() => {
+      document.querySelectorAll('img[loading="lazy"]').forEach(img => {
+        img.loading = 'eager';
+      });
+    });
 
-const normalizeUrl = (u) => {
-  try {
-    const url = new URL(u);
-    url.hash = "";
-    url.search = "";
-    url.hostname = url.hostname.replace(/^www\./, "");
-    if (url.pathname.endsWith("/") && url.pathname !== "/") {
-      url.pathname = url.pathname.slice(0, -1);
-    }
-    return url.toString();
-  } catch {
-    return u;
-  }
-};
+    await page.waitForTimeout(500);
 
-const queue = [normalizeUrl(page.url())];
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    const pages = [];
-    // global per-crawl OCR cache (src only, not size)
-const ocrImageCache = new Set();
+    const data = await extractStructured(page);
 
-    const stats = {
-      visited: 0,
-      saved: 0,
-      byType: {},
-      ocrElementsProcessed: 0,
-      ocrCharsExtracted: 0,
-      errors: 0,
-    };
+    // ===== SMART OCR =====
+    let ocrText = "";
+    const ocrTexts = new Set();
 
-    const MAX_PAGES = 100;
+    try {
+      const imgs = await page.$$("img");
+      console.log(`[OCR] Page has ${imgs.length} images`);
 
-while (queue.length && Date.now() < deadline && stats.visited < MAX_PAGES) {
+      let ocrCount = 0;
+      const MAX_OCR_PER_PAGE = 4;
 
-      const rawUrl = queue.shift();
-const url = normalizeUrl(rawUrl);
-
-if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
-
-visited.add(url);
-
-      stats.visited++;
-
-      if (!(await safeGoto(page, url))) {
-        stats.errors++;
-        continue;
-      }
-
-      try {
-        console.log("[PAGE] Loading content...");
-        
-        for (let i = 0; i < 3; i++) {
-          await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-          await page.waitForTimeout(600);
-        }
-
-        await page.evaluate(() => {
-          document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-            img.loading = 'eager';
-          });
-          window.dispatchEvent(new Event('scroll'));
-        });
-
-        await page.waitForTimeout(1000);
-
-        const title = clean(await page.title());
-        const pageType = detectPageType(url, title);
-        stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
-
-        const data = await extractStructured(page);
-const htmlWordCount = countWordsExact(data.rawContent || "");
-
-
-        // ===== OCR =====
-        // ===== OCR =====
-let ocrText = "";
-const ocrTexts = new Set();
-
-console.log(`[OCR] === START on ${url} ===`);
-
+      for (let i = 0; i < imgs.length && ocrCount < MAX_OCR_PER_PAGE; i++) {
+        if (page.isClosed()) break;
 
         try {
-          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+          const src = await imgs[i].evaluate(el => el.src).catch(() => "");
+          const cacheKey = normalizeImageSrc(src);
+          
+          // Skip вече обработени
+          if (ocrImageCache.has(cacheKey)) continue;
+          ocrImageCache.add(cacheKey);
 
-          let imgs;
-          try {
-            imgs = await page.$$("img");
-          } catch (e) {
-            console.log("[OCR] ERROR getting images:", e.message);
-            imgs = [];
+          const text = await smartOCR(page, imgs[i], `img-${i + 1}`);
+          
+          if (text && text.length > 5 && !ocrTexts.has(text)) {
+            ocrText += "\n" + text;
+            ocrTexts.add(text);
+            stats.ocrElementsProcessed++;
+            stats.ocrCharsExtracted += text.length;
+            ocrCount++;
           }
+        } catch {}
+      }
 
-          console.log(`[OCR] Found ${imgs.length} images`);
+      console.log(`[OCR] Extracted from ${ocrTexts.size} images`);
+    } catch (e) {
+      console.error("[OCR ERROR]", e.message);
+    }
 
-          let ocrCount = 0;
-for (let i = 0; i < imgs.length && ocrCount < 6; i++) {
+    const htmlContent = normalizeNumbers(clean(data.rawContent));
+    const ocrContent = normalizeNumbers(clean(ocrText));
 
-            if (page.isClosed()) break;
-
-            try {
-              const info = await imgs[i].evaluate(el => ({
-                src: el.src || "",
-                w: Math.round(el.getBoundingClientRect().width),
-                h: Math.round(el.getBoundingClientRect().height)
-              })).catch(() => null);
-
-              if (!info) continue;
-
-              console.log(`[OCR] Img ${i+1}: ${info.src.slice(-50)} (${info.w}x${info.h})`);
-
-              if (info.w < 50 || info.h < 30) continue;
-if (/logo|icon/i.test(info.src)) continue;
-
-// skip hero / background images (usually no useful OCR)
-if (info.w > 1200 && info.h > 400) continue;
-
-
-const ocrKey = info.src;
-if (ocrImageCache.has(ocrKey)) continue;
-ocrImageCache.add(ocrKey);
-
-
-              let text = "";
-await enqueueOCR(async () => {
-  text = await ocrElement(page, imgs[i], `img-${i+1}`);
-});
-
-              if (text && text.length > 3 && !ocrTexts.has(text)) {
-                ocrText += "\n" + text;
-                ocrTexts.add(text);
-                stats.ocrElementsProcessed++;
-ocrCount++;
-
-                stats.ocrCharsExtracted += text.length;
-              }
-            } catch (e) {
-              console.error(`[OCR] Img ${i+1} error:`, e.message);
-            }
-          }
-
-          console.log(`[OCR] === DONE for page: ${ocrTexts.size} elements ===`);
-
-        } catch (e) {
-          console.error("[OCR ERROR]", e.message);
-        }
-      
-        const htmlContent = normalizeNumbers(clean(data.rawContent));
-        const ocrContent = normalizeNumbers(clean(ocrText));
-
-        const content = `
+    const content = `
 === HTML_CONTENT_START ===
 ${htmlContent}
 === HTML_CONTENT_END ===
@@ -522,62 +417,153 @@ ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
 
-        const htmlWords = countWordsExact(htmlContent);
-        const ocrWords = countWordsExact(ocrContent);
-        const totalWords = countWordsExact(content);
+    const htmlWords = countWordsExact(htmlContent);
+    const ocrWords = countWordsExact(ocrContent);
+    const totalWords = htmlWords + ocrWords;
 
-        console.log(`
-[CONTENT STATS]
-url: ${url}
-type: ${pageType}
-htmlWords: ${htmlWords}
-ocrWords: ${ocrWords}
-totalWords: ${totalWords}
-`);
+    const elapsed = Date.now() - startTime;
+    console.log(`[PAGE] ✓ ${url} - ${totalWords} words (${htmlWords} HTML + ${ocrWords} OCR) in ${elapsed}ms`);
 
-        if (pageType !== "services" && totalWords < MIN_WORDS) {
-          console.log("[SKIP] too few words:", totalWords);
+    if (pageType !== "services" && totalWords < MIN_WORDS) {
+      console.log("[SKIP] too few words:", totalWords);
+      return { links: await collectAllLinks(page, base), page: null };
+    }
+
+    return {
+      links: await collectAllLinks(page, base),
+      page: {
+        url,
+        title,
+        pageType,
+        content,
+        wordCount: totalWords,
+        breakdown: { htmlWords, ocrWords },
+        status: "ok",
+      }
+    };
+  } catch (e) {
+    console.error("[PAGE ERROR]", url, e.message);
+    stats.errors++;
+    return { links: [], page: null };
+  }
+}
+
+// ================= PARALLEL CRAWLER =================
+async function crawlSmart(startUrl) {
+  const deadline = Date.now() + MAX_SECONDS * 1000;
+  console.log("\n[CRAWL START]", startUrl);
+  console.log(`[CONFIG] Parallel tabs: ${PARALLEL_TABS}, Max time: ${MAX_SECONDS}s`);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+  });
+
+  const stats = {
+    visited: 0,
+    saved: 0,
+    byType: {},
+    ocrElementsProcessed: 0,
+    ocrCharsExtracted: 0,
+    errors: 0,
+  };
+
+  const pages = [];
+  const queue = [];
+  const ocrImageCache = new Set();
+  let base = "";
+
+  try {
+    // Първоначално зареждане
+    const initContext = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    });
+    const initPage = await initContext.newPage();
+    
+    await initPage.goto(startUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+    base = new URL(initPage.url()).origin;
+    
+    const initialLinks = await collectAllLinks(initPage, base);
+    queue.push(normalizeUrl(initPage.url()));
+    initialLinks.forEach(l => {
+      const nl = normalizeUrl(l);
+      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+        queue.push(nl);
+      }
+    });
+    
+    await initPage.close();
+    await initContext.close();
+
+    console.log(`[CRAWL] Found ${queue.length} URLs`);
+
+    // Worker функция
+    const createWorker = async (workerId) => {
+      const ctx = await browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      });
+      const pg = await ctx.newPage();
+
+      while (Date.now() < deadline) {
+        // Вземи URL от опашката
+        let url = null;
+        while (queue.length > 0) {
+          const candidate = queue.shift();
+          const normalized = normalizeUrl(candidate);
+          if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
+            visited.add(normalized);
+            url = normalized;
+            break;
+          }
+        }
+
+        if (!url) {
+          // Изчакай малко и пробвай пак
+          await new Promise(r => setTimeout(r, 100));
+          if (queue.length === 0) break;
           continue;
         }
 
-        pages.push({
-          url,
-          title,
-          pageType,
-          content,
-          wordCount: totalWords,
-          breakdown: {
-            htmlWords,
-            ocrWords,
-          },
-          status: "ok",
+        stats.visited++;
+        
+        const result = await processPage(pg, url, base, stats, ocrImageCache);
+        
+        if (result.page) {
+          pages.push(result.page);
+          stats.saved++;
+        }
+
+        // Добави нови линкове
+        result.links.forEach(l => {
+          const nl = normalizeUrl(l);
+          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+            queue.push(nl);
+          }
         });
-
-        stats.saved++;
-
-        const links = await collectAllLinks(page, base);
-        links.forEach(l => {
-  const nl = normalizeUrl(l);
-  if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) queue.push(nl);
-});
-
-      } catch (e) {
-        console.error("[PAGE PROCESSING ERROR]", url, e.message);
-        stats.errors++;
       }
+
+      await pg.close();
+      await ctx.close();
+    };
+
+    // Стартирай workers паралелно
+    const workers = [];
+    for (let i = 0; i < PARALLEL_TABS; i++) {
+      workers.push(createWorker(i + 1));
     }
 
-    return { pages, stats };
+    await Promise.all(workers);
+
   } finally {
-    try {
-      if (page && !page.isClosed()) await page.close();
-      if (context) await context.close();
-      if (browser) await browser.close();
-      console.log("[CLEANUP] Browser closed");
-    } catch (e) {
-      console.error("[CLEANUP ERROR]", e.message);
-    }
+    await browser.close();
+    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages saved`);
+    console.log(`[STATS] OCR: ${stats.ocrElementsProcessed} images, ${stats.ocrCharsExtracted} chars`);
+    console.log("[CLEANUP] Browser closed");
   }
+
+  return { pages, stats };
 }
 
 // ================= HTTP SERVER =================
@@ -585,7 +571,11 @@ http
   .createServer((req, res) => {
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ status: "ok" }));
+      return res.end(JSON.stringify({ 
+        status: "ok",
+        crawlInProgress,
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
+      }));
     }
 
     if (req.method !== "POST") {
@@ -596,7 +586,6 @@ http
     let body = "";
     req.on("data", c => (body += c));
     req.on("error", err => {
-      console.error("[REQUEST ERROR]", err.message);
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: false, error: "Request error" }));
     });
@@ -614,39 +603,38 @@ http
         }
 
         if (crawlInProgress) {
-  res.writeHead(429, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({
-    success: false,
-    error: "Crawler already running"
-  }));
-}
+          res.writeHead(429, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({
+            success: false,
+            error: "Crawler already running"
+          }));
+        }
 
-crawlInProgress = true;
-crawlFinished = false;
-visited.clear();
+        crawlInProgress = true;
+        crawlFinished = false;
+        visited.clear();
+        ocrCache.clear();
 
-const result = await crawlSmart(parsed.url);
+        const result = await crawlSmart(parsed.url);
 
-crawlInProgress = false;
-crawlFinished = true;
-lastResult = result;
-
-
+        crawlInProgress = false;
+        crawlFinished = true;
+        lastResult = result;
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, ...result }));
       } catch (e) {
+        crawlInProgress = false;
         console.error("[CRAWL ERROR]", e.message);
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: false,
-            error: e instanceof Error ? e.message : String(e),
-          })
-        );
+        res.end(JSON.stringify({
+          success: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
       }
     });
   })
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
+    console.log(`Config: ${PARALLEL_TABS} parallel tabs, ${MAX_SECONDS}s max`);
   });
