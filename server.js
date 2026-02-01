@@ -20,8 +20,8 @@ const OCR_TIMEOUT_MS = 6000;
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
-// Skip OCR САМО за наистина безполезни изображения
-const SKIP_OCR_RE = /logo|icon|sprite|placeholder|loading|spinner|avatar|pixel|spacer|blank|transparent|favicon/i;
+// Skip OCR САМО за наистина безполезни изображения (много специфични patterns)
+const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transparent)\.|\/icons?\//i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
@@ -249,13 +249,17 @@ async function ocrAllImages(page, stats) {
     // Филтрираме валидни изображения (но НЕ по подобие на src)
     const validImages = imgInfos.filter(info => {
       if (!info || !info.visible) return false;
-      if (info.w < 60 || info.h < 30) return false;
+      if (info.w < 50 || info.h < 25) return false;  // Намалени минимални размери
       if (info.w > 1800 && info.h > 700) return false;
-      if (SKIP_OCR_RE.test(info.src)) return false;
+      if (SKIP_OCR_RE.test(info.src)) {
+        console.log(`[OCR] Skip (pattern): ${info.src.slice(-50)}`);
+        return false;
+      }
       return true;
     });
 
     console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
+    validImages.forEach((img, i) => console.log(`[OCR] Image ${i+1}: ${img.src.slice(-60)} (${img.w}x${img.h})`));
     if (validImages.length === 0) return results;
 
     // Screenshots паралелно
@@ -301,6 +305,7 @@ async function ocrAllImages(page, stats) {
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
+            console.log(`[OCR] ✓ Text: "${text.slice(0, 60).replace(/\n/g, ' ')}..."`);
             return { text, src: img.src, alt: img.alt };
           }
           return null;
@@ -342,16 +347,34 @@ async function processPage(page, url, base, stats) {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
-    // Бързо скролиране за lazy load
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
-    await page.waitForTimeout(250);
-
-    // Trigger lazy load
-    await page.evaluate(() => {
-      document.querySelectorAll('img[loading="lazy"]').forEach(img => img.loading = 'eager');
+    // Пълно скролиране за lazy load - важно за всички изображения!
+    await page.evaluate(async () => {
+      // Scroll до края на страницата на стъпки
+      const scrollStep = window.innerHeight;
+      const maxScroll = document.body.scrollHeight;
+      
+      for (let pos = 0; pos < maxScroll; pos += scrollStep) {
+        window.scrollTo(0, pos);
+        await new Promise(r => setTimeout(r, 100));
+      }
+      
+      // Scroll до края
+      window.scrollTo(0, maxScroll);
+      
+      // Trigger lazy load за всички изображения
+      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
+        img.loading = 'eager';
+        if (img.dataset.src) img.src = img.dataset.src;
+        if (img.dataset.lazy) img.src = img.dataset.lazy;
+      });
     });
-
-    await page.waitForTimeout(300);
+    
+    await page.waitForTimeout(500);
+    
+    // Изчакваме изображенията да се заредят
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 3000 });
+    } catch {}
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
