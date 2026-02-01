@@ -357,7 +357,24 @@ async function crawlSmart(startUrl) {
 
     const base = new URL(page.url()).origin;
     const visited = new Set();
-    const queue = [page.url()];
+
+const normalizeUrl = (u) => {
+  try {
+    const url = new URL(u);
+    url.hash = "";
+    url.search = "";
+    url.hostname = url.hostname.replace(/^www\./, "");
+    if (url.pathname.endsWith("/") && url.pathname !== "/") {
+      url.pathname = url.pathname.slice(0, -1);
+    }
+    return url.toString();
+  } catch {
+    return u;
+  }
+};
+
+const queue = [normalizeUrl(page.url())];
+
     const pages = [];
     const ocrImageCache = new Set();
     const stats = {
@@ -370,10 +387,13 @@ async function crawlSmart(startUrl) {
     };
 
     while (queue.length && Date.now() < deadline) {
-      const url = queue.shift();
-      if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
+      const rawUrl = queue.shift();
+const url = normalizeUrl(rawUrl);
 
-      visited.add(url);
+if (!url || visited.has(url) || SKIP_URL_RE.test(url)) continue;
+
+visited.add(url);
+
       stats.visited++;
 
       if (!(await safeGoto(page, url))) {
@@ -522,8 +542,10 @@ totalWords: ${totalWords}
 
         const links = await collectAllLinks(page, base);
         links.forEach(l => {
-          if (!visited.has(l) && !SKIP_URL_RE.test(l)) queue.push(l);
-        });
+  const nl = normalizeUrl(l);
+  if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) queue.push(nl);
+});
+
       } catch (e) {
         console.error("[PAGE PROCESSING ERROR]", url, e.message);
         stats.errors++;
