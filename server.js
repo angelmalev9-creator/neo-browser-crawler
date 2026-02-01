@@ -5,6 +5,9 @@ const PORT = Number(process.env.PORT || 10000);
 let crawlInProgress = false;
 let crawlFinished = false;
 let lastResult = null;
+let lastCrawlUrl = null;  // НОВО: запомняме URL-а
+let lastCrawlTime = 0;    // НОВО: кога е завършил
+const RESULT_TTL_MS = 5 * 60 * 1000; // 5 минути валидност на резултата
 const visited = new Set();
 
 // ================= LIMITS =================
@@ -572,8 +575,13 @@ http
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ 
-        status: "ok",
+        status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
         crawlInProgress,
+        crawlFinished,
+        lastCrawlUrl,
+        lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
+        resultAvailable: !!lastResult,
+        pagesCount: lastResult?.pages?.length || 0,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
       }));
     }
@@ -602,24 +610,55 @@ http
           }));
         }
 
-        if (crawlInProgress) {
-          res.writeHead(429, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({
-            success: false,
-            error: "Crawler already running"
-          }));
+        const requestedUrl = normalizeUrl(parsed.url);
+        const now = Date.now();
+
+        // ✅ НОВО: Ако имаме готов резултат за същия URL (в рамките на TTL) → върни го
+        if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
+          if (now - lastCrawlTime < RESULT_TTL_MS) {
+            console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ success: true, cached: true, ...lastResult }));
+          } else {
+            console.log("[CACHE EXPIRED] Result too old, will recrawl");
+          }
         }
 
+        // ✅ НОВО: Ако crawl е в прогрес за същия URL → върни статус
+        if (crawlInProgress) {
+          if (lastCrawlUrl === requestedUrl) {
+            res.writeHead(202, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({
+              success: false,
+              status: "in_progress",
+              message: "Crawl in progress for this URL, please wait"
+            }));
+          } else {
+            res.writeHead(429, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({
+              success: false,
+              error: "Crawler busy with different URL"
+            }));
+          }
+        }
+
+        // Стартирай нов crawl
         crawlInProgress = true;
         crawlFinished = false;
+        lastCrawlUrl = requestedUrl;
         visited.clear();
         ocrCache.clear();
+
+        console.log("[CRAWL START] New crawl for:", requestedUrl);
 
         const result = await crawlSmart(parsed.url);
 
         crawlInProgress = false;
         crawlFinished = true;
         lastResult = result;
+        lastCrawlTime = Date.now();
+
+        console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, ...result }));
