@@ -286,6 +286,21 @@ async function ocrElement(page, element, context = "") {
     return "";
   }
 }
+// ================= OCR QUEUE =================
+let ocrRunning = false;
+const ocrQueue = [];
+
+async function enqueueOCR(task) {
+  ocrQueue.push(task);
+  if (ocrRunning) return;
+
+  ocrRunning = true;
+  while (ocrQueue.length) {
+    const t = ocrQueue.shift();
+    await t();
+  }
+  ocrRunning = false;
+}
 
 // ================= LINK DISCOVERY =================
 async function collectAllLinks(page, base) {
@@ -344,7 +359,7 @@ async function crawlSmart(startUrl) {
     const visited = new Set();
     const queue = [page.url()];
     const pages = [];
-
+    const ocrImageCache = new Set();
     const stats = {
       visited: 0,
       saved: 0,
@@ -388,12 +403,20 @@ async function crawlSmart(startUrl) {
         stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
         const data = await extractStructured(page);
+const htmlWordCount = countWordsExact(data.rawContent || "");
+
 
         // ===== OCR =====
         let ocrText = "";
+        if (htmlWordCount < 300) {
         const ocrTexts = new Set();
 
-        console.log(`[OCR] === START on ${url} ===`);
+        if (htmlWordCount < 300) {
+  console.log(`[OCR] === START on ${url} ===`);
+} else {
+  console.log(`[OCR] SKIP (HTML sufficient): ${htmlWordCount} words`);
+}
+
 
         try {
           await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
@@ -423,9 +446,18 @@ async function crawlSmart(startUrl) {
               console.log(`[OCR] Img ${i+1}: ${info.src.slice(-50)} (${info.w}x${info.h})`);
 
               if (info.w < 50 || info.h < 30) continue;
-              if (/logo|icon/i.test(info.src)) continue;
+if (/logo|icon/i.test(info.src)) continue;
 
-              const text = await ocrElement(page, imgs[i], `img-${i+1}`);
+const ocrKey = `${info.src}|${info.w}x${info.h}`;
+if (ocrImageCache.has(ocrKey)) continue;
+ocrImageCache.add(ocrKey);
+
+
+              let text = "";
+await enqueueOCR(async () => {
+  text = await ocrElement(page, imgs[i], `img-${i+1}`);
+});
+
               if (text && text.length > 3 && !ocrTexts.has(text)) {
                 ocrText += "\n" + text;
                 ocrTexts.add(text);
@@ -441,7 +473,7 @@ async function crawlSmart(startUrl) {
         } catch (e) {
           console.error("[OCR ERROR]", e.message);
         }
-
+        }
         const htmlContent = normalizeNumbers(clean(data.rawContent));
         const ocrContent = normalizeNumbers(clean(ocrText));
 
