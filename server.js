@@ -5,32 +5,29 @@ const PORT = Number(process.env.PORT || 10000);
 let crawlInProgress = false;
 let crawlFinished = false;
 let lastResult = null;
-let lastCrawlUrl = null;  // НОВО: запомняме URL-а
-let lastCrawlTime = 0;    // НОВО: кога е завършил
-const RESULT_TTL_MS = 5 * 60 * 1000; // 5 минути валидност на резултата
+let lastCrawlUrl = null;
+let lastCrawlTime = 0;
+const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 3; // паралелни табове
+const PARALLEL_TABS = 5;          // ⬆️ увеличено от 3
+const PARALLEL_OCR = 8;           // паралелни OCR заявки
+const OCR_TIMEOUT_MS = 8000;      // timeout за OCR
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
-// Skip OCR за тези изображения
-const SKIP_OCR_RE = /logo|icon|sprite|placeholder|loading|spinner|avatar|profile|thumb|social|facebook|twitter|instagram|linkedin|youtube|pinterest/i;
+// Skip OCR само за очевидно безполезни изображения
+const SKIP_OCR_RE = /logo|icon|sprite|placeholder|loading|spinner|avatar|thumb|pixel|spacer|blank|transparent/i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
-  t
-    .replace(/\r/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
-const countWordsExact = (t = "") =>
-  t.split(/\s+/).filter(Boolean).length;
+const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
 // ================= BG NUMBER NORMALIZER =================
 const BG_0_19 = [
@@ -38,11 +35,7 @@ const BG_0_19 = [
   "десет","единадесет","дванадесет","тринадесет","четиринадесет",
   "петнадесет","шестнадесет","седемнадесет","осемнадесет","деветнадесет"
 ];
-
-const BG_TENS = [
-  "", "", "двадесет","тридесет","четиридесет",
-  "петдесет","шестдесет","седемдесет","осемдесет","деветдесет"
-];
+const BG_TENS = ["", "", "двадесет","тридесет","четиридесет","петдесет","шестдесет","седемдесет","осемдесет","деветдесет"];
 
 function numberToBgWords(n) {
   n = Number(n);
@@ -62,9 +55,7 @@ function normalizeNumbers(text = "") {
       /(\d+)\s?(лв|лева|€|eur|bgn|стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
       (_, num, unit) => `${numberToBgWords(num)} ${unit}`
     );
-  } catch (e) {
-    return text;
-  }
+  } catch { return text; }
 }
 
 // ================= URL NORMALIZER =================
@@ -78,18 +69,13 @@ const normalizeUrl = (u) => {
       url.pathname = url.pathname.slice(0, -1);
     }
     return url.toString();
-  } catch {
-    return u;
-  }
+  } catch { return u; }
 };
 
-// Нормализира image src за кеширане (премахва hash-ове)
 const normalizeImageSrc = (src) => {
   try {
     return src.replace(/-[a-zA-Z0-9]{6,12}\.(png|jpg|jpeg|gif|webp)$/i, '.$1');
-  } catch {
-    return src;
-  }
+  } catch { return src; }
 };
 
 // ================= PAGE TYPE =================
@@ -106,7 +92,7 @@ function detectPageType(url = "", title = "") {
 // ================= STRUCTURED EXTRACTOR =================
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("body", { timeout: 3000 });
+    await page.waitForSelector("body", { timeout: 2000 });
   } catch {}
 
   try {
@@ -115,8 +101,7 @@ async function extractStructured(page) {
       
       function addUniqueText(text, minLength = 10) {
         const normalized = text.trim().replace(/\s+/g, ' ');
-        if (normalized.length < minLength) return "";
-        if (seenTexts.has(normalized)) return "";
+        if (normalized.length < minLength || seenTexts.has(normalized)) return "";
         seenTexts.add(normalized);
         return normalized;
       }
@@ -127,26 +112,21 @@ async function extractStructured(page) {
 
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
-        
         let parent = el.parentElement;
         while (parent) {
           if (processedElements.has(parent)) return;
           parent = parent.parentElement;
         }
-        
         const text = el.innerText?.trim();
         if (!text) return;
-
         const uniqueText = addUniqueText(text, 5);
         if (!uniqueText) return;
-
         if (el.tagName.startsWith("H")) {
           current = { heading: uniqueText, text: "" };
           sections.push(current);
         } else if (current) {
           current.text += " " + uniqueText;
         }
-        
         processedElements.add(el);
       });
 
@@ -178,13 +158,11 @@ async function extractStructured(page) {
         document.querySelectorAll("*").forEach(el => {
           const before = window.getComputedStyle(el, "::before").content;
           const after = window.getComputedStyle(el, "::after").content;
-          
           if (before && before !== "none" && before !== '""') {
             const cleaned = before.replace(/^["']|["']$/g, "");
             const uniqueText = addUniqueText(cleaned, 3);
             if (uniqueText) pseudoTexts.push(uniqueText);
           }
-          
           if (after && after !== "none" && after !== '""') {
             const cleaned = after.replace(/^["']|["']$/g, "");
             const uniqueText = addUniqueText(cleaned, 3);
@@ -214,111 +192,143 @@ async function extractStructured(page) {
   }
 }
 
-// ================= SMART OCR - САМО ЗА ИЗОБРАЖЕНИЯ С ТЕКСТ =================
+// ================= FAST PARALLEL OCR =================
 const ocrCache = new Map();
+const API_KEY = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
-async function smartOCR(page, imgElement, context) {
-  const apiKey = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
-
+// Бърз OCR - директно TEXT_DETECTION без предварителна проверка
+async function fastOCR(buffer, context) {
   try {
-    if (page.isClosed()) return "";
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OCR_TIMEOUT_MS);
 
-    const info = await imgElement.evaluate(el => ({
-      src: el.src || "",
-      alt: el.alt || "",
-      w: Math.round(el.getBoundingClientRect().width),
-      h: Math.round(el.getBoundingClientRect().height),
-      isVisible: el.getBoundingClientRect().width > 0
-    })).catch(() => null);
-
-    if (!info || !info.isVisible) return "";
-
-    // Skip малки изображения
-    if (info.w < 100 || info.h < 50) return "";
-    
-    // Skip много големи (hero/background)
-    if (info.w > 1400 && info.h > 500) return "";
-    
-    // Skip по pattern в src
-    if (SKIP_OCR_RE.test(info.src)) return "";
-
-    // Нормализиран ключ за кеша
-    const cacheKey = normalizeImageSrc(info.src);
-    
-    // Проверка в кеша
-    if (ocrCache.has(cacheKey)) {
-      const cached = ocrCache.get(cacheKey);
-      if (cached) console.log(`[OCR] Cache hit: ${context}`);
-      return cached;
-    }
-
-    const buffer = await imgElement.screenshot({ type: 'png', timeout: 5000 }).catch(() => null);
-    if (!buffer) return "";
-
-    // LABEL_DETECTION първо - бързо проверява дали има текст
-    const labelRes = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          requests: [{
-            image: { content: buffer.toString("base64") },
-            features: [{ type: "LABEL_DETECTION", maxResults: 5 }]
-          }]
-        })
-      }
-    );
-
-    const labelJson = await labelRes.json();
-    const labels = labelJson.responses?.[0]?.labelAnnotations || [];
-    const labelDescriptions = labels.map(l => l.description.toLowerCase());
-    
-    // Проверка дали има индикация за текст
-    const hasTextIndicator = labelDescriptions.some(l => 
-      /text|document|paper|sign|poster|banner|certificate|menu|card|letter|font|writing|receipt|screenshot|presentation/i.test(l)
-    );
-
-    // Ако няма текст индикатор, skip
-    if (!hasTextIndicator) {
-      ocrCache.set(cacheKey, "");
-      return "";
-    }
-
-    // Има текст - правим пълен OCR
     const res = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
+      `https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           requests: [{
             image: { content: buffer.toString("base64") },
-            features: [
-              { type: "TEXT_DETECTION" },
-              { type: "DOCUMENT_TEXT_DETECTION" }
-            ],
-            imageContext: { languageHints: ["bg", "en", "ru"] }
+            features: [{ type: "TEXT_DETECTION" }],
+            imageContext: { languageHints: ["bg", "en", "tr", "ru"] }
           }]
-        })
+        }),
+        signal: controller.signal
       }
     );
+
+    clearTimeout(timeout);
+
+    if (!res.ok) return "";
 
     const json = await res.json();
     const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
     
-    // Кеширане
-    ocrCache.set(cacheKey, text);
-    
-    if (text) {
-      console.log(`[OCR] ✓ ${context}: ${text.length} chars - "${text.slice(0, 50)}..."`);
-    }
-
     return text;
   } catch (e) {
-    console.error(`[OCR] ${context}: ${e.message}`);
     return "";
   }
+}
+
+// Подготовка на изображения за OCR (screenshot + info)
+async function prepareImagesForOCR(page, ocrImageCache) {
+  const images = [];
+  
+  try {
+    const imgElements = await page.$$("img");
+    
+    // Вземаме info за всички изображения наведнъж
+    const imgInfos = await Promise.all(
+      imgElements.map(async (img, i) => {
+        try {
+          return await img.evaluate(el => ({
+            src: el.src || "",
+            w: Math.round(el.getBoundingClientRect().width),
+            h: Math.round(el.getBoundingClientRect().height),
+            visible: el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0
+          }));
+        } catch { return null; }
+      })
+    );
+
+    // Филтрираме
+    for (let i = 0; i < imgElements.length; i++) {
+      const info = imgInfos[i];
+      if (!info || !info.visible) continue;
+      
+      // Skip малки
+      if (info.w < 80 || info.h < 40) continue;
+      
+      // Skip много големи hero images
+      if (info.w > 1600 && info.h > 600) continue;
+      
+      // Skip по pattern
+      if (SKIP_OCR_RE.test(info.src)) continue;
+      
+      // Skip кеширани
+      const cacheKey = normalizeImageSrc(info.src);
+      if (ocrImageCache.has(cacheKey)) continue;
+      
+      ocrImageCache.add(cacheKey);
+      images.push({ element: imgElements[i], info, cacheKey, index: i });
+    }
+  } catch (e) {
+    console.error("[PREPARE OCR]", e.message);
+  }
+
+  return images;
+}
+
+// Паралелен OCR на batch изображения
+async function batchOCR(page, images, stats) {
+  const results = [];
+  
+  // Правим screenshots паралелно (по-бързо)
+  const screenshots = await Promise.all(
+    images.map(async (img) => {
+      try {
+        if (page.isClosed()) return null;
+        const buffer = await img.element.screenshot({ type: 'png', timeout: 3000 });
+        return { ...img, buffer };
+      } catch { return null; }
+    })
+  );
+
+  const validScreenshots = screenshots.filter(s => s && s.buffer);
+  
+  if (validScreenshots.length === 0) return results;
+
+  // OCR паралелно
+  const ocrResults = await Promise.all(
+    validScreenshots.map(async (img) => {
+      // Проверка в кеша
+      if (ocrCache.has(img.cacheKey)) {
+        return { text: ocrCache.get(img.cacheKey), cached: true };
+      }
+      
+      const text = await fastOCR(img.buffer, `img-${img.index}`);
+      
+      // Кеширай резултата (дори празен)
+      ocrCache.set(img.cacheKey, text);
+      
+      return { text, cached: false };
+    })
+  );
+
+  // Събираме резултатите
+  for (let i = 0; i < ocrResults.length; i++) {
+    const { text, cached } = ocrResults[i];
+    if (text && text.length > 3) {
+      results.push(text);
+      if (!cached) {
+        stats.ocrElementsProcessed++;
+        stats.ocrCharsExtracted += text.length;
+      }
+    }
+  }
+
+  return results;
 }
 
 // ================= LINK DISCOVERY =================
@@ -334,9 +344,7 @@ async function collectAllLinks(page, base) {
       });
       return Array.from(urls);
     }, base);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 // ================= PROCESS SINGLE PAGE =================
@@ -344,71 +352,50 @@ async function processPage(page, url, base, stats, ocrImageCache) {
   const startTime = Date.now();
   
   try {
-    console.log("[GOTO]", url);
-    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+    console.log("[PAGE]", url);
+    await page.goto(url, { timeout: 12000, waitUntil: "domcontentloaded" });
 
-    // Бързо скролиране (2 пъти вместо 3)
-    for (let i = 0; i < 2; i++) {
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-      await page.waitForTimeout(400);
-    }
+    // Минимално скролиране (1 път)
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
+    await page.waitForTimeout(300);
 
     // Trigger lazy load
     await page.evaluate(() => {
-      document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-        img.loading = 'eager';
-      });
+      document.querySelectorAll('img[loading="lazy"]').forEach(img => img.loading = 'eager');
     });
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
+    // Извличане на HTML content
     const data = await extractStructured(page);
 
-    // ===== SMART OCR =====
-    let ocrText = "";
-    const ocrTexts = new Set();
-
+    // ===== ПАРАЛЕЛЕН OCR ЗА ВСИЧКИ ИЗОБРАЖЕНИЯ =====
+    let ocrTexts = [];
+    
     try {
-      const imgs = await page.$$("img");
-      console.log(`[OCR] Page has ${imgs.length} images`);
+      const images = await prepareImagesForOCR(page, ocrImageCache);
+      console.log(`[OCR] ${images.length} images to process`);
 
-      let ocrCount = 0;
-      const MAX_OCR_PER_PAGE = 4;
-
-      for (let i = 0; i < imgs.length && ocrCount < MAX_OCR_PER_PAGE; i++) {
-        if (page.isClosed()) break;
-
-        try {
-          const src = await imgs[i].evaluate(el => el.src).catch(() => "");
-          const cacheKey = normalizeImageSrc(src);
-          
-          // Skip вече обработени
-          if (ocrImageCache.has(cacheKey)) continue;
-          ocrImageCache.add(cacheKey);
-
-          const text = await smartOCR(page, imgs[i], `img-${i + 1}`);
-          
-          if (text && text.length > 5 && !ocrTexts.has(text)) {
-            ocrText += "\n" + text;
-            ocrTexts.add(text);
-            stats.ocrElementsProcessed++;
-            stats.ocrCharsExtracted += text.length;
-            ocrCount++;
-          }
-        } catch {}
+      if (images.length > 0) {
+        // Обработваме на batch-ове по PARALLEL_OCR
+        for (let i = 0; i < images.length; i += PARALLEL_OCR) {
+          const batch = images.slice(i, i + PARALLEL_OCR);
+          const batchResults = await batchOCR(page, batch, stats);
+          ocrTexts.push(...batchResults);
+        }
       }
-
-      console.log(`[OCR] Extracted from ${ocrTexts.size} images`);
+      
+      console.log(`[OCR] ✓ Extracted text from ${ocrTexts.length} images`);
     } catch (e) {
       console.error("[OCR ERROR]", e.message);
     }
 
     const htmlContent = normalizeNumbers(clean(data.rawContent));
-    const ocrContent = normalizeNumbers(clean(ocrText));
+    const ocrContent = normalizeNumbers(clean(ocrTexts.join("\n")));
 
     const content = `
 === HTML_CONTENT_START ===
@@ -425,10 +412,9 @@ ${ocrContent}
     const totalWords = htmlWords + ocrWords;
 
     const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${url} - ${totalWords} words (${htmlWords} HTML + ${ocrWords} OCR) in ${elapsed}ms`);
+    console.log(`[PAGE] ✓ ${totalWords}w (${htmlWords}+${ocrWords}ocr) in ${elapsed}ms`);
 
     if (pageType !== "services" && totalWords < MIN_WORDS) {
-      console.log("[SKIP] too few words:", totalWords);
       return { links: await collectAllLinks(page, base), page: null };
     }
 
@@ -455,11 +441,11 @@ ${ocrContent}
 async function crawlSmart(startUrl) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] Parallel tabs: ${PARALLEL_TABS}, Max time: ${MAX_SECONDS}s`);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
   });
 
   const stats = {
@@ -484,7 +470,7 @@ async function crawlSmart(startUrl) {
     });
     const initPage = await initContext.newPage();
     
-    await initPage.goto(startUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 12000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
     
     const initialLinks = await collectAllLinks(initPage, base);
@@ -510,7 +496,6 @@ async function crawlSmart(startUrl) {
       const pg = await ctx.newPage();
 
       while (Date.now() < deadline) {
-        // Вземи URL от опашката
         let url = null;
         while (queue.length > 0) {
           const candidate = queue.shift();
@@ -523,8 +508,7 @@ async function crawlSmart(startUrl) {
         }
 
         if (!url) {
-          // Изчакай малко и пробвай пак
-          await new Promise(r => setTimeout(r, 100));
+          await new Promise(r => setTimeout(r, 50));
           if (queue.length === 0) break;
           continue;
         }
@@ -538,7 +522,6 @@ async function crawlSmart(startUrl) {
           stats.saved++;
         }
 
-        // Добави нови линкове
         result.links.forEach(l => {
           const nl = normalizeUrl(l);
           if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
@@ -561,9 +544,8 @@ async function crawlSmart(startUrl) {
 
   } finally {
     await browser.close();
-    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages saved`);
-    console.log(`[STATS] OCR: ${stats.ocrElementsProcessed} images, ${stats.ocrCharsExtracted} chars`);
-    console.log("[CLEANUP] Browser closed");
+    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
+    console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
   return { pages, stats };
@@ -582,7 +564,7 @@ http
         lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
       }));
     }
 
@@ -613,25 +595,23 @@ http
         const requestedUrl = normalizeUrl(parsed.url);
         const now = Date.now();
 
-        // ✅ НОВО: Ако имаме готов резултат за същия URL (в рамките на TTL) → върни го
+        // Ако имаме готов резултат за същия URL → върни го
         if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
           if (now - lastCrawlTime < RESULT_TTL_MS) {
             console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
             res.writeHead(200, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({ success: true, cached: true, ...lastResult }));
-          } else {
-            console.log("[CACHE EXPIRED] Result too old, will recrawl");
           }
         }
 
-        // ✅ НОВО: Ако crawl е в прогрес за същия URL → върни статус
+        // Ако crawl е в прогрес
         if (crawlInProgress) {
           if (lastCrawlUrl === requestedUrl) {
             res.writeHead(202, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({
               success: false,
               status: "in_progress",
-              message: "Crawl in progress for this URL, please wait"
+              message: "Crawl in progress for this URL"
             }));
           } else {
             res.writeHead(429, { "Content-Type": "application/json" });
@@ -675,5 +655,5 @@ http
   })
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
-    console.log(`Config: ${PARALLEL_TABS} parallel tabs, ${MAX_SECONDS}s max`);
+    console.log(`Config: ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
   });
