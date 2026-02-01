@@ -3,7 +3,10 @@ import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 let crawlInProgress = false;
-const visited = new Set(); // ✅ GLOBAL visited
+let crawlFinished = false;       // ✅ НОВО
+let lastResult = null;           // ✅ НОВО
+const visited = new Set();
+
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
@@ -596,7 +599,15 @@ http
             error: "Missing 'url' parameter" 
           }));
         }
-
+if (crawlFinished && lastResult) {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({
+    success: true,
+    pages: lastResult.pages,
+    stats: lastResult.stats,
+    cached: true
+  }));
+}
         if (crawlInProgress) {
   res.writeHead(429, { "Content-Type": "application/json" });
   return res.end(JSON.stringify({
@@ -606,9 +617,15 @@ http
 }
 
 crawlInProgress = true;
-visited.clear(); // ✅ нов crawl job = чист visited
+crawlFinished = false;
+visited.clear();
+
 const result = await crawlSmart(parsed.url);
+
 crawlInProgress = false;
+crawlFinished = true;
+lastResult = result;
+
 
 
         res.writeHead(200, { "Content-Type": "application/json" });
