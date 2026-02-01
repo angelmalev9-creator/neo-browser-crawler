@@ -381,7 +381,9 @@ const normalizeUrl = (u) => {
 const queue = [normalizeUrl(page.url())];
 
     const pages = [];
-    const ocrImageCache = new Set();
+    // global per-crawl OCR cache (src only, not size)
+const ocrImageCache = new Set();
+
     const stats = {
       visited: 0,
       saved: 0,
@@ -391,7 +393,10 @@ const queue = [normalizeUrl(page.url())];
       errors: 0,
     };
 
-    while (queue.length && Date.now() < deadline) {
+    const MAX_PAGES = 100;
+
+while (queue.length && Date.now() < deadline && stats.visited < MAX_PAGES) {
+
       const rawUrl = queue.shift();
 const url = normalizeUrl(rawUrl);
 
@@ -452,7 +457,9 @@ console.log(`[OCR] === START on ${url} ===`);
 
           console.log(`[OCR] Found ${imgs.length} images`);
 
-          for (let i = 0; i < imgs.length; i++) {
+          let ocrCount = 0;
+for (let i = 0; i < imgs.length && ocrCount < 6; i++) {
+
             if (page.isClosed()) break;
 
             try {
@@ -469,7 +476,11 @@ console.log(`[OCR] === START on ${url} ===`);
               if (info.w < 50 || info.h < 30) continue;
 if (/logo|icon/i.test(info.src)) continue;
 
-const ocrKey = `${info.src}|${info.w}x${info.h}`;
+// skip hero / background images (usually no useful OCR)
+if (info.w > 1200 && info.h > 400) continue;
+
+
+const ocrKey = info.src;
 if (ocrImageCache.has(ocrKey)) continue;
 ocrImageCache.add(ocrKey);
 
@@ -483,6 +494,8 @@ await enqueueOCR(async () => {
                 ocrText += "\n" + text;
                 ocrTexts.add(text);
                 stats.ocrElementsProcessed++;
+ocrCount++;
+
                 stats.ocrCharsExtracted += text.length;
               }
             } catch (e) {
@@ -599,15 +612,7 @@ http
             error: "Missing 'url' parameter" 
           }));
         }
-if (crawlFinished && lastResult) {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({
-    success: true,
-    pages: lastResult.pages,
-    stats: lastResult.stats,
-    cached: true
-  }));
-}
+
         if (crawlInProgress) {
   res.writeHead(429, { "Content-Type": "application/json" });
   return res.end(JSON.stringify({
