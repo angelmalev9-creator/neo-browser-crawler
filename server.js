@@ -3,7 +3,7 @@ import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 let crawlInProgress = false;
-
+const visited = new Set(); // ✅ GLOBAL visited
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
@@ -358,7 +358,7 @@ async function crawlSmart(startUrl) {
     }
 
     const base = new URL(page.url()).origin;
-    const visited = new Set();
+    
 
 const normalizeUrl = (u) => {
   try {
@@ -606,8 +606,10 @@ http
 }
 
 crawlInProgress = true;
+visited.clear(); // ✅ нов crawl job = чист visited
 const result = await crawlSmart(parsed.url);
 crawlInProgress = false;
+
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, ...result }));
