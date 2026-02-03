@@ -2,6 +2,15 @@ import http from "http";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
+
+// Worker config - за изпращане на SiteMap
+const WORKER_URL = process.env.NEO_WORKER_URL || "https://neo-worker.onrender.com";
+const WORKER_SECRET = process.env.NEO_WORKER_SECRET || "";
+
+// Supabase config - за записване на SiteMap
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
 let crawlInProgress = false;
 let crawlFinished = false;
 let lastResult = null;
@@ -20,7 +29,6 @@ const OCR_TIMEOUT_MS = 6000;
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
-// Skip OCR САМО за наистина безполезни изображения (много специфични patterns)
 const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transparent)\.|\/icons?\//i;
 
 // ================= UTILS =================
@@ -83,7 +91,447 @@ function detectPageType(url = "", title = "") {
   return "general";
 }
 
-// ================= STRUCTURED EXTRACTOR =================
+// ═══════════════════════════════════════════════════════════════════════════
+// SITEMAP EXTRACTION - NEW!
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Keyword mappings for buttons and fields
+const KEYWORD_MAP = {
+  // Booking
+  "резерв": ["book", "reserve", "booking"],
+  "запази": ["book", "reserve"],
+  "резервация": ["booking", "reservation"],
+  "резервирай": ["book", "reserve"],
+  // Search
+  "търси": ["search", "find"],
+  "провери": ["check", "verify"],
+  "покажи": ["show", "display"],
+  // Dates
+  "настаняване": ["check-in", "checkin", "arrival"],
+  "напускане": ["check-out", "checkout", "departure"],
+  "пристигане": ["arrival", "check-in"],
+  "заминаване": ["departure", "check-out"],
+  // Contact
+  "контакт": ["contact"],
+  "контакти": ["contact", "contacts"],
+  "свържи": ["contact", "reach"],
+  // Rooms
+  "стаи": ["rooms", "accommodation"],
+  "стая": ["room"],
+  // Other
+  "цени": ["prices", "rates"],
+  "услуги": ["services"],
+  "изпрати": ["send", "submit"],
+};
+
+function generateKeywords(text) {
+  const lower = text.toLowerCase().trim();
+  const keywords = new Set([lower]);
+  
+  // Split into words
+  const words = lower.split(/\s+/);
+  words.forEach(w => {
+    if (w.length > 2) keywords.add(w);
+  });
+  
+  // Add mapped keywords
+  for (const [bg, en] of Object.entries(KEYWORD_MAP)) {
+    if (lower.includes(bg)) {
+      en.forEach(k => keywords.add(k));
+    }
+  }
+  
+  return Array.from(keywords).filter(k => k.length > 1);
+}
+
+function detectActionType(text) {
+  const lower = text.toLowerCase();
+  
+  if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
+  if (/контакт|contact|свържи/i.test(lower)) return "contact";
+  if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
+  if (/стаи|rooms|услуги|services|за нас|about|галерия|gallery/i.test(lower)) return "navigation";
+  
+  return "other";
+}
+
+function detectFieldType(name, type, placeholder, label) {
+  const searchText = `${name} ${type} ${placeholder} ${label}`.toLowerCase();
+  
+  if (type === "date") return "date";
+  if (type === "number") return "number";
+  if (/date|дата/i.test(searchText)) return "date";
+  if (/guest|човек|брой|count|number/i.test(searchText)) return "number";
+  if (/select/i.test(type)) return "select";
+  
+  return "text";
+}
+
+function generateFieldKeywords(name, placeholder, label) {
+  const keywords = new Set();
+  const searchText = `${name} ${placeholder} ${label}`.toLowerCase();
+  
+  // Check-in patterns
+  if (/check-?in|checkin|arrival|от|настаняване|пристигане|from|start/i.test(searchText)) {
+    ["check-in", "checkin", "от", "настаняване", "arrival", "from"].forEach(k => keywords.add(k));
+  }
+  
+  // Check-out patterns
+  if (/check-?out|checkout|departure|до|напускане|заминаване|to|end/i.test(searchText)) {
+    ["check-out", "checkout", "до", "напускане", "departure", "to"].forEach(k => keywords.add(k));
+  }
+  
+  // Guests patterns
+  if (/guest|adult|човек|гост|брой|persons|pax/i.test(searchText)) {
+    ["guests", "гости", "човека", "adults", "persons", "брой"].forEach(k => keywords.add(k));
+  }
+  
+  // Name patterns
+  if (/name|име/i.test(searchText)) {
+    ["name", "име"].forEach(k => keywords.add(k));
+  }
+  
+  // Email patterns
+  if (/email|имейл|e-mail/i.test(searchText)) {
+    ["email", "имейл", "e-mail"].forEach(k => keywords.add(k));
+  }
+  
+  // Phone patterns
+  if (/phone|телефон|тел/i.test(searchText)) {
+    ["phone", "телефон"].forEach(k => keywords.add(k));
+  }
+  
+  // Add name/id as keywords
+  if (name) keywords.add(name.toLowerCase());
+  
+  return Array.from(keywords);
+}
+
+// Extract SiteMap from a page
+async function extractSiteMapFromPage(page) {
+  return await page.evaluate(() => {
+    // Helper: generate selector for element
+    const getSelector = (el, idx) => {
+      if (el.id) return `#${el.id}`;
+      if (el.className && typeof el.className === "string") {
+        const cls = el.className.trim().split(/\s+/)[0];
+        if (cls && !cls.includes(":") && !cls.includes("[")) {
+          const matches = document.querySelectorAll(`.${cls}`);
+          if (matches.length === 1) return `.${cls}`;
+        }
+      }
+      const tag = el.tagName.toLowerCase();
+      const parent = el.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+        const index = siblings.indexOf(el) + 1;
+        if (el.className) {
+          const cls = el.className.split(/\s+/)[0];
+          if (cls) return `${tag}.${cls}`;
+        }
+        return `${tag}:nth-of-type(${index})`;
+      }
+      return `${tag}:nth-of-type(${idx + 1})`;
+    };
+
+    // Helper: check visibility
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && 
+             style.display !== "none" && 
+             style.visibility !== "hidden";
+    };
+
+    // Helper: get label for input
+    const getLabel = (el) => {
+      const id = el.id;
+      if (id) {
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (label) return label.textContent?.trim();
+      }
+      const parent = el.closest("label");
+      if (parent) return parent.textContent?.trim();
+      const prev = el.previousElementSibling;
+      if (prev?.tagName === "LABEL") return prev.textContent?.trim();
+      return "";
+    };
+
+    // EXTRACT BUTTONS
+    const buttons = [];
+    const btnElements = document.querySelectorAll(
+      "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
+    );
+    
+    btnElements.forEach((el, i) => {
+      if (!isVisible(el)) return;
+      
+      const text = (el.textContent?.trim() || el.value || "").slice(0, 100);
+      if (!text || text.length < 2) return;
+      
+      // Skip common non-actionable links
+      const href = el.href || "";
+      if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
+      if (href && !href.includes(window.location.hostname)) return; // Skip external
+      
+      buttons.push({
+        text,
+        selector: getSelector(el, i),
+      });
+    });
+
+    // EXTRACT FORMS
+    const forms = [];
+    
+    document.querySelectorAll("form").forEach((form, formIdx) => {
+      if (!isVisible(form)) return;
+      
+      const fields = [];
+      
+      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
+        .forEach((input, inputIdx) => {
+          if (!isVisible(input)) return;
+          
+          fields.push({
+            name: input.name || input.id || `field_${inputIdx}`,
+            selector: getSelector(input, inputIdx),
+            type: input.type || input.tagName.toLowerCase(),
+            placeholder: input.placeholder || "",
+            label: getLabel(input),
+          });
+        });
+      
+      // Find submit button
+      let submitSelector = "";
+      const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
+      if (submitBtn) {
+        submitSelector = getSelector(submitBtn, 0);
+      }
+      
+      if (fields.length > 0) {
+        forms.push({
+          selector: getSelector(form, formIdx),
+          fields,
+          submit_button: submitSelector,
+        });
+      }
+    });
+
+    // EXTRACT PRICES
+    const prices = [];
+    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
+    
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      null
+    );
+    
+    let node;
+    while (node = walker.nextNode()) {
+      const text = node.textContent || "";
+      const matches = [...text.matchAll(priceRegex)];
+      
+      matches.forEach(match => {
+        const parent = node.parentElement;
+        let context = "";
+        
+        if (parent) {
+          const container = parent.closest("div, article, section, li, tr");
+          if (container) {
+            const heading = container.querySelector("h1, h2, h3, h4, h5, h6, strong, b, .title");
+            if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
+          }
+        }
+        
+        // Avoid duplicates
+        if (!prices.some(p => p.text === match[0] && p.context === context)) {
+          prices.push({
+            text: match[0],
+            context,
+          });
+        }
+      });
+    }
+
+    return {
+      url: window.location.href,
+      title: document.title,
+      buttons: buttons.slice(0, 30),
+      forms: forms.slice(0, 10),
+      prices: prices.slice(0, 20),
+    };
+  });
+}
+
+// Enrich raw SiteMap with keywords (runs in Node.js)
+function enrichSiteMap(raw, siteId, siteUrl) {
+  return {
+    site_id: siteId,
+    url: siteUrl || raw.url || "",
+    
+    buttons: (raw.buttons || []).map(btn => ({
+      text: btn.text,
+      selector: btn.selector,
+      keywords: generateKeywords(btn.text),
+      action_type: detectActionType(btn.text),
+    })),
+    
+    forms: (raw.forms || []).map(form => ({
+      selector: form.selector,
+      submit_button: form.submit_button,
+      fields: form.fields.map(field => ({
+        name: field.name,
+        selector: field.selector,
+        type: detectFieldType(field.name, field.type, field.placeholder, field.label),
+        keywords: generateFieldKeywords(field.name, field.placeholder, field.label),
+      })),
+    })),
+    
+    prices: (raw.prices || []).map(p => ({
+      text: p.text,
+      context: p.context || "",
+    })),
+  };
+}
+
+// Build combined SiteMap from all crawled pages
+function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
+  const combined = {
+    site_id: siteId,
+    url: siteUrl,
+    buttons: [],
+    forms: [],
+    prices: [],
+  };
+  
+  const seenButtons = new Set();
+  const seenForms = new Set();
+  const seenPrices = new Set();
+  
+  for (const pageMap of pageSiteMaps) {
+    // Merge buttons (dedupe by text)
+    for (const btn of pageMap.buttons || []) {
+      const key = btn.text.toLowerCase();
+      if (!seenButtons.has(key)) {
+        seenButtons.add(key);
+        combined.buttons.push(btn);
+      }
+    }
+    
+    // Merge forms (dedupe by field names)
+    for (const form of pageMap.forms || []) {
+      const key = form.fields.map(f => f.name).sort().join(",");
+      if (!seenForms.has(key)) {
+        seenForms.add(key);
+        combined.forms.push(form);
+      }
+    }
+    
+    // Merge prices (dedupe by text+context)
+    for (const price of pageMap.prices || []) {
+      const key = `${price.text}|${price.context}`;
+      if (!seenPrices.has(key)) {
+        seenPrices.add(key);
+        combined.prices.push(price);
+      }
+    }
+  }
+  
+  // Limit
+  combined.buttons = combined.buttons.slice(0, 50);
+  combined.forms = combined.forms.slice(0, 15);
+  combined.prices = combined.prices.slice(0, 30);
+  
+  console.log(`[SITEMAP] Combined: ${combined.buttons.length} buttons, ${combined.forms.length} forms, ${combined.prices.length} prices`);
+  
+  return combined;
+}
+
+// Save SiteMap to Supabase
+async function saveSiteMapToSupabase(siteMap) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.log("[SITEMAP] Supabase not configured, skipping save");
+    return false;
+  }
+  
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/sites_map`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
+        "Prefer": "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({
+        site_id: siteMap.site_id,
+        url: siteMap.url,
+        site_map: siteMap,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    
+    if (response.ok) {
+      console.log(`[SITEMAP] ✓ Saved to Supabase`);
+      return true;
+    } else {
+      const error = await response.text();
+      console.error(`[SITEMAP] ✗ Supabase error:`, error);
+      return false;
+    }
+  } catch (error) {
+    console.error(`[SITEMAP] ✗ Save error:`, error.message);
+    return false;
+  }
+}
+
+// Send SiteMap to Worker to prepare hot session
+async function sendSiteMapToWorker(siteMap) {
+  if (!WORKER_URL || !WORKER_SECRET) {
+    console.log("[SITEMAP] Worker not configured, skipping");
+    return false;
+  }
+  
+  try {
+    console.log(`[SITEMAP] Sending to worker: ${WORKER_URL}/prepare-session`);
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    
+    const response = await fetch(`${WORKER_URL}/prepare-session`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${WORKER_SECRET}`,
+      },
+      body: JSON.stringify({
+        site_id: siteMap.site_id,
+        site_map: siteMap,
+      }),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok) {
+      const result = await response.json();
+      console.log(`[SITEMAP] ✓ Worker response:`, result);
+      return result.success === true;
+    } else {
+      console.error(`[SITEMAP] ✗ Worker error:`, response.status);
+      return false;
+    }
+  } catch (error) {
+    console.error(`[SITEMAP] ✗ Worker send error:`, error.message);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXISTING EXTRACTION FUNCTIONS (unchanged)
+// ═══════════════════════════════════════════════════════════════════════════
+
 async function extractStructured(page) {
   try {
     await page.waitForSelector("body", { timeout: 1500 });
@@ -186,11 +634,10 @@ async function extractStructured(page) {
   }
 }
 
-// ================= GLOBAL OCR CACHE (между страници, по ТОЧЕН src URL) =================
+// ================= GLOBAL OCR CACHE =================
 const globalOcrCache = new Map();
 const API_KEY = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
 
-// Бърз OCR
 async function fastOCR(buffer) {
   try {
     const controller = new AbortController();
@@ -220,9 +667,6 @@ async function fastOCR(buffer) {
   } catch { return ""; }
 }
 
-// OCR за ВСИЧКИ изображения на страницата
-// Кешира между страници по ТОЧЕН src URL (за header/footer)
-// НЕ skip-ва подобни изображения на СЪЩАТА страница
 async function ocrAllImages(page, stats) {
   const results = [];
   
@@ -230,7 +674,6 @@ async function ocrAllImages(page, stats) {
     const imgElements = await page.$$("img");
     if (imgElements.length === 0) return results;
 
-    // Вземаме info за всички изображения
     const imgInfos = await Promise.all(
       imgElements.map(async (img, i) => {
         try {
@@ -246,27 +689,22 @@ async function ocrAllImages(page, stats) {
       })
     );
 
-    // Филтрираме валидни изображения (но НЕ по подобие на src)
     const validImages = imgInfos.filter(info => {
       if (!info || !info.visible) return false;
-      if (info.w < 50 || info.h < 25) return false;  // Намалени минимални размери
+      if (info.w < 50 || info.h < 25) return false;
       if (info.w > 1800 && info.h > 700) return false;
       if (SKIP_OCR_RE.test(info.src)) {
-        console.log(`[OCR] Skip (pattern): ${info.src.slice(-50)}`);
         return false;
       }
       return true;
     });
 
     console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
-    validImages.forEach((img, i) => console.log(`[OCR] Image ${i+1}: ${img.src.slice(-60)} (${img.w}x${img.h})`));
     if (validImages.length === 0) return results;
 
-    // Screenshots паралелно
     const screenshots = await Promise.all(
       validImages.map(async (img) => {
         try {
-          // Проверка в глобален кеш (по ТОЧЕН src URL)
           if (globalOcrCache.has(img.src)) {
             const cachedText = globalOcrCache.get(img.src);
             return { ...img, buffer: null, cached: true, text: cachedText };
@@ -281,13 +719,11 @@ async function ocrAllImages(page, stats) {
 
     const validScreenshots = screenshots.filter(s => s !== null);
 
-    // OCR паралелно на batch-ове
     for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
       const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
       
       const batchResults = await Promise.all(
         batch.map(async (img) => {
-          // Ако е от кеша
           if (img.cached) {
             if (img.text && img.text.length > 2) {
               return { text: img.text, src: img.src, alt: img.alt };
@@ -299,13 +735,11 @@ async function ocrAllImages(page, stats) {
           
           const text = await fastOCR(img.buffer);
           
-          // Кеширай в глобален кеш по ТОЧЕН src URL
           globalOcrCache.set(img.src, text);
           
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
-            console.log(`[OCR] ✓ Text: "${text.slice(0, 60).replace(/\n/g, ' ')}..."`);
             return { text, src: img.src, alt: img.alt };
           }
           return null;
@@ -315,7 +749,6 @@ async function ocrAllImages(page, stats) {
       results.push(...batchResults.filter(r => r !== null));
     }
 
-    console.log(`[OCR] ✓ Got text from ${results.length} images`);
   } catch (e) {
     console.error("[OCR ERROR]", e.message);
   }
@@ -340,16 +773,15 @@ async function collectAllLinks(page, base) {
 }
 
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats) {
+async function processPage(page, url, base, stats, siteMaps) {
   const startTime = Date.now();
   
   try {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
-    // Пълно скролиране за lazy load - важно за всички изображения!
+    // Scroll for lazy load
     await page.evaluate(async () => {
-      // Scroll до края на страницата на стъпки
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
       
@@ -358,10 +790,8 @@ async function processPage(page, url, base, stats) {
         await new Promise(r => setTimeout(r, 100));
       }
       
-      // Scroll до края
       window.scrollTo(0, maxScroll);
       
-      // Trigger lazy load за всички изображения
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
@@ -371,7 +801,6 @@ async function processPage(page, url, base, stats) {
     
     await page.waitForTimeout(500);
     
-    // Изчакваме изображенията да се заредят
     try {
       await page.waitForLoadState('networkidle', { timeout: 3000 });
     } catch {}
@@ -380,13 +809,24 @@ async function processPage(page, url, base, stats) {
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    // Извличане на HTML content
+    // Extract structured content
     const data = await extractStructured(page);
 
-    // OCR ВСИЧКИ изображения на страницата
+    // OCR images
     const ocrResults = await ocrAllImages(page, stats);
 
-    // Форматиране
+    // *** NEW: Extract SiteMap from this page ***
+    try {
+      const rawSiteMap = await extractSiteMapFromPage(page);
+      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
+        siteMaps.push(rawSiteMap);
+        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+      }
+    } catch (e) {
+      console.error("[SITEMAP] Extract error:", e.message);
+    }
+
+    // Format content
     const htmlContent = normalizeNumbers(clean(data.rawContent));
     const ocrTexts = ocrResults.map(r => r.text);
     const ocrContent = normalizeNumbers(clean(ocrTexts.join("\n\n")));
@@ -432,10 +872,11 @@ ${ocrContent}
 }
 
 // ================= PARALLEL CRAWLER =================
-async function crawlSmart(startUrl) {
+async function crawlSmart(startUrl, siteId = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
   console.log(`[CONFIG] ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
+  if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
     headless: true,
@@ -453,10 +894,11 @@ async function crawlSmart(startUrl) {
 
   const pages = [];
   const queue = [];
+  const siteMaps = []; // NEW: collect sitemaps from all pages
   let base = "";
 
   try {
-    // Първоначално зареждане
+    // Initial load
     const initContext = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -480,7 +922,7 @@ async function crawlSmart(startUrl) {
 
     console.log(`[CRAWL] Found ${queue.length} URLs`);
 
-    // Worker функция
+    // Worker function
     const createWorker = async () => {
       const ctx = await browser.newContext({
         viewport: { width: 1920, height: 1080 },
@@ -508,7 +950,7 @@ async function crawlSmart(startUrl) {
 
         stats.visited++;
         
-        const result = await processPage(pg, url, base, stats);
+        const result = await processPage(pg, url, base, stats, siteMaps);
         
         if (result.page) {
           pages.push(result.page);
@@ -527,7 +969,7 @@ async function crawlSmart(startUrl) {
       await ctx.close();
     };
 
-    // Стартирай workers паралелно
+    // Start workers in parallel
     await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
 
   } finally {
@@ -536,7 +978,25 @@ async function crawlSmart(startUrl) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
-  return { pages, stats };
+  // *** NEW: Build and send SiteMap ***
+  let combinedSiteMap = null;
+  if (siteMaps.length > 0 && siteId) {
+    console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
+    
+    // Enrich each page's sitemap
+    const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
+    
+    // Combine all
+    combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
+    
+    // Save to Supabase
+    await saveSiteMapToSupabase(combinedSiteMap);
+    
+    // Send to Worker
+    await sendSiteMapToWorker(combinedSiteMap);
+  }
+
+  return { pages, stats, siteMap: combinedSiteMap };
 }
 
 // ================= HTTP SERVER =================
@@ -581,9 +1041,10 @@ http
         }
 
         const requestedUrl = normalizeUrl(parsed.url);
+        const siteId = parsed.site_id || null; // NEW: accept site_id
         const now = Date.now();
 
-        // Ако имаме готов резултат за същия URL → върни го
+        // Cache check
         if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
           if (now - lastCrawlTime < RESULT_TTL_MS) {
             console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
@@ -592,7 +1053,7 @@ http
           }
         }
 
-        // Ако crawl е в прогрес
+        // In progress check
         if (crawlInProgress) {
           if (lastCrawlUrl === requestedUrl) {
             res.writeHead(202, { "Content-Type": "application/json" });
@@ -610,7 +1071,7 @@ http
           }
         }
 
-        // Стартирай нов crawl
+        // Start new crawl
         crawlInProgress = true;
         crawlFinished = false;
         lastCrawlUrl = requestedUrl;
@@ -618,8 +1079,9 @@ http
         globalOcrCache.clear();
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
+        if (siteId) console.log("[SITE ID]", siteId);
 
-        const result = await crawlSmart(parsed.url);
+        const result = await crawlSmart(parsed.url, siteId);
 
         crawlInProgress = false;
         crawlFinished = true;
@@ -644,4 +1106,5 @@ http
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
     console.log(`Config: ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
+    console.log(`Worker: ${WORKER_URL}`);
   });
