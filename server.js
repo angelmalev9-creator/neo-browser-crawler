@@ -1,4 +1,5 @@
 import http from "http";
+import crypto from "crypto";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
@@ -80,6 +81,15 @@ const normalizeUrl = (u) => {
   } catch { return u; }
 };
 
+function normalizeDomain(u) {
+  try {
+    const url = new URL(u);
+    return url.hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
 // ================= PAGE TYPE =================
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
@@ -92,7 +102,7 @@ function detectPageType(url = "", title = "") {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SITEMAP EXTRACTION - NEW!
+// SITEMAP EXTRACTION - EXISTING
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Keyword mappings for buttons and fields
@@ -127,83 +137,83 @@ const KEYWORD_MAP = {
 function generateKeywords(text) {
   const lower = text.toLowerCase().trim();
   const keywords = new Set([lower]);
-  
+
   // Split into words
   const words = lower.split(/\s+/);
   words.forEach(w => {
     if (w.length > 2) keywords.add(w);
   });
-  
+
   // Add mapped keywords
   for (const [bg, en] of Object.entries(KEYWORD_MAP)) {
     if (lower.includes(bg)) {
       en.forEach(k => keywords.add(k));
     }
   }
-  
+
   return Array.from(keywords).filter(k => k.length > 1);
 }
 
 function detectActionType(text) {
   const lower = text.toLowerCase();
-  
+
   if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
   if (/контакт|contact|свържи/i.test(lower)) return "contact";
   if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
   if (/стаи|rooms|услуги|services|за нас|about|галерия|gallery/i.test(lower)) return "navigation";
-  
+
   return "other";
 }
 
 function detectFieldType(name, type, placeholder, label) {
   const searchText = `${name} ${type} ${placeholder} ${label}`.toLowerCase();
-  
+
   if (type === "date") return "date";
   if (type === "number") return "number";
   if (/date|дата/i.test(searchText)) return "date";
   if (/guest|човек|брой|count|number/i.test(searchText)) return "number";
   if (/select/i.test(type)) return "select";
-  
+
   return "text";
 }
 
 function generateFieldKeywords(name, placeholder, label) {
   const keywords = new Set();
   const searchText = `${name} ${placeholder} ${label}`.toLowerCase();
-  
+
   // Check-in patterns
   if (/check-?in|checkin|arrival|от|настаняване|пристигане|from|start/i.test(searchText)) {
     ["check-in", "checkin", "от", "настаняване", "arrival", "from"].forEach(k => keywords.add(k));
   }
-  
+
   // Check-out patterns
   if (/check-?out|checkout|departure|до|напускане|заминаване|to|end/i.test(searchText)) {
     ["check-out", "checkout", "до", "напускане", "departure", "to"].forEach(k => keywords.add(k));
   }
-  
+
   // Guests patterns
   if (/guest|adult|човек|гост|брой|persons|pax/i.test(searchText)) {
     ["guests", "гости", "човека", "adults", "persons", "брой"].forEach(k => keywords.add(k));
   }
-  
+
   // Name patterns
   if (/name|име/i.test(searchText)) {
     ["name", "име"].forEach(k => keywords.add(k));
   }
-  
+
   // Email patterns
   if (/email|имейл|e-mail/i.test(searchText)) {
     ["email", "имейл", "e-mail"].forEach(k => keywords.add(k));
   }
-  
+
   // Phone patterns
   if (/phone|телефон|тел/i.test(searchText)) {
     ["phone", "телефон"].forEach(k => keywords.add(k));
   }
-  
+
   // Add name/id as keywords
   if (name) keywords.add(name.toLowerCase());
-  
+
   return Array.from(keywords);
 }
 
@@ -238,8 +248,8 @@ async function extractSiteMapFromPage(page) {
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && 
-             style.display !== "none" && 
+      return rect.width > 0 && rect.height > 0 &&
+             style.display !== "none" &&
              style.visibility !== "hidden";
     };
 
@@ -262,18 +272,18 @@ async function extractSiteMapFromPage(page) {
     const btnElements = document.querySelectorAll(
       "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
     );
-    
+
     btnElements.forEach((el, i) => {
       if (!isVisible(el)) return;
-      
+
       const text = (el.textContent?.trim() || el.value || "").slice(0, 100);
       if (!text || text.length < 2) return;
-      
+
       // Skip common non-actionable links
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
       if (href && !href.includes(window.location.hostname)) return; // Skip external
-      
+
       buttons.push({
         text,
         selector: getSelector(el, i),
@@ -282,16 +292,16 @@ async function extractSiteMapFromPage(page) {
 
     // EXTRACT FORMS
     const forms = [];
-    
+
     document.querySelectorAll("form").forEach((form, formIdx) => {
       if (!isVisible(form)) return;
-      
+
       const fields = [];
-      
+
       form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
         .forEach((input, inputIdx) => {
           if (!isVisible(input)) return;
-          
+
           fields.push({
             name: input.name || input.id || `field_${inputIdx}`,
             selector: getSelector(input, inputIdx),
@@ -300,14 +310,14 @@ async function extractSiteMapFromPage(page) {
             label: getLabel(input),
           });
         });
-      
+
       // Find submit button
       let submitSelector = "";
       const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
       if (submitBtn) {
         submitSelector = getSelector(submitBtn, 0);
       }
-      
+
       if (fields.length > 0) {
         forms.push({
           selector: getSelector(form, formIdx),
@@ -320,22 +330,22 @@ async function extractSiteMapFromPage(page) {
     // EXTRACT PRICES
     const prices = [];
     const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
-    
+
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
       null
     );
-    
+
     let node;
     while (node = walker.nextNode()) {
       const text = node.textContent || "";
       const matches = [...text.matchAll(priceRegex)];
-      
+
       matches.forEach(match => {
         const parent = node.parentElement;
         let context = "";
-        
+
         if (parent) {
           const container = parent.closest("div, article, section, li, tr");
           if (container) {
@@ -343,7 +353,7 @@ async function extractSiteMapFromPage(page) {
             if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
           }
         }
-        
+
         // Avoid duplicates
         if (!prices.some(p => p.text === match[0] && p.context === context)) {
           prices.push({
@@ -369,14 +379,14 @@ function enrichSiteMap(raw, siteId, siteUrl) {
   return {
     site_id: siteId,
     url: siteUrl || raw.url || "",
-    
+
     buttons: (raw.buttons || []).map(btn => ({
       text: btn.text,
       selector: btn.selector,
       keywords: generateKeywords(btn.text),
       action_type: detectActionType(btn.text),
     })),
-    
+
     forms: (raw.forms || []).map(form => ({
       selector: form.selector,
       submit_button: form.submit_button,
@@ -387,7 +397,7 @@ function enrichSiteMap(raw, siteId, siteUrl) {
         keywords: generateFieldKeywords(field.name, field.placeholder, field.label),
       })),
     })),
-    
+
     prices: (raw.prices || []).map(p => ({
       text: p.text,
       context: p.context || "",
@@ -404,11 +414,11 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
     forms: [],
     prices: [],
   };
-  
+
   const seenButtons = new Set();
   const seenForms = new Set();
   const seenPrices = new Set();
-  
+
   for (const pageMap of pageSiteMaps) {
     // Merge buttons (dedupe by text)
     for (const btn of pageMap.buttons || []) {
@@ -418,7 +428,7 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.buttons.push(btn);
       }
     }
-    
+
     // Merge forms (dedupe by field names)
     for (const form of pageMap.forms || []) {
       const key = form.fields.map(f => f.name).sort().join(",");
@@ -427,7 +437,7 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.forms.push(form);
       }
     }
-    
+
     // Merge prices (dedupe by text+context)
     for (const price of pageMap.prices || []) {
       const key = `${price.text}|${price.context}`;
@@ -437,14 +447,14 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
       }
     }
   }
-  
+
   // Limit
   combined.buttons = combined.buttons.slice(0, 50);
   combined.forms = combined.forms.slice(0, 15);
   combined.prices = combined.prices.slice(0, 30);
-  
+
   console.log(`[SITEMAP] Combined: ${combined.buttons.length} buttons, ${combined.forms.length} forms, ${combined.prices.length} prices`);
-  
+
   return combined;
 }
 
@@ -454,7 +464,7 @@ async function saveSiteMapToSupabase(siteMap) {
     console.log("[SITEMAP] Supabase not configured, skipping save");
     return false;
   }
-  
+
   try {
     const response = await fetch(`${SUPABASE_URL}/rest/v1/sites_map`, {
       method: "POST",
@@ -471,7 +481,7 @@ async function saveSiteMapToSupabase(siteMap) {
         updated_at: new Date().toISOString(),
       }),
     });
-    
+
     if (response.ok) {
       console.log(`[SITEMAP] ✓ Saved to Supabase`);
       return true;
@@ -492,13 +502,13 @@ async function sendSiteMapToWorker(siteMap) {
     console.log("[SITEMAP] Worker not configured, skipping");
     return false;
   }
-  
+
   try {
     console.log(`[SITEMAP] Sending to worker: ${WORKER_URL}/prepare-session`);
-    
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
-    
+
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
       headers: {
@@ -511,9 +521,9 @@ async function sendSiteMapToWorker(siteMap) {
       }),
       signal: controller.signal,
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     if (response.ok) {
       const result = await response.json();
       console.log(`[SITEMAP] ✓ Worker response:`, result);
@@ -529,6 +539,294 @@ async function sendSiteMapToWorker(siteMap) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// NEW: CAPABILITIES EXTRACTION (FOR form_schemas)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function stableSortObject(value) {
+  if (Array.isArray(value)) return value.map(stableSortObject);
+  if (value && typeof value === "object") {
+    const out = {};
+    Object.keys(value).sort().forEach(k => {
+      out[k] = stableSortObject(value[k]);
+    });
+    return out;
+  }
+  return value;
+}
+
+function stableStringify(obj) {
+  try {
+    return JSON.stringify(stableSortObject(obj));
+  } catch {
+    return JSON.stringify(obj);
+  }
+}
+
+function sha256Hex(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
+
+function guessVendorFromText(s = "") {
+  const t = s.toLowerCase();
+  if (t.includes("calendly")) return "calendly";
+  if (t.includes("simplybook")) return "simplybook";
+  if (t.includes("bookero")) return "bookero";
+  if (t.includes("cloudbeds")) return "cloudbeds";
+  if (t.includes("amelia")) return "amelia";
+  if (t.includes("wordpress")) return "wordpress";
+  return "unknown";
+}
+
+async function extractCapabilitiesFromPage(page) {
+  return await page.evaluate(() => {
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 &&
+             style.display !== "none" &&
+             style.visibility !== "hidden";
+    };
+
+    const getLabel = (el) => {
+      const id = el.id;
+      if (id) {
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (label) return label.textContent?.trim() || "";
+      }
+      const parent = el.closest("label");
+      if (parent) return parent.textContent?.trim() || "";
+      const aria = el.getAttribute("aria-label");
+      if (aria) return aria.trim();
+      const prev = el.previousElementSibling;
+      if (prev?.tagName === "LABEL") return prev.textContent?.trim() || "";
+      return "";
+    };
+
+    const selectorCandidates = (el) => {
+      const out = [];
+      try {
+        if (el.id) out.push(`#${CSS.escape(el.id)}`);
+      } catch {}
+      try {
+        const name = el.getAttribute("name");
+        if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
+      } catch {}
+      try {
+        const type = el.getAttribute("type");
+        if (type) out.push(`${el.tagName.toLowerCase()}[type="${CSS.escape(type)}"]`);
+      } catch {}
+      try {
+        const ph = el.getAttribute("placeholder");
+        if (ph && ph.length >= 2) out.push(`${el.tagName.toLowerCase()}[placeholder*="${ph.slice(0, 12).replace(/"/g, "")}"]`);
+      } catch {}
+      try {
+        const ac = el.getAttribute("autocomplete");
+        if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
+      } catch {}
+      // fallback (weak but usable)
+      try {
+        const cls = (el.className && typeof el.className === "string")
+          ? el.className.trim().split(/\s+/).filter(Boolean)[0]
+          : "";
+        if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
+      } catch {}
+      return Array.from(new Set(out)).slice(0, 6);
+    };
+
+    const forms = [];
+    document.querySelectorAll("form").forEach((form) => {
+      if (!isVisible(form)) return;
+
+      const fields = [];
+      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
+        .forEach((input) => {
+          if (!isVisible(input)) return;
+
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const placeholder = input.getAttribute("placeholder") || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
+
+          const autocomplete = input.getAttribute("autocomplete") || "";
+          const ariaLabel = input.getAttribute("aria-label") || "";
+          const ariaDesc = input.getAttribute("aria-describedby") || "";
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            placeholder,
+            required,
+            autocomplete,
+            aria_label: ariaLabel,
+            aria_describedby: ariaDesc,
+            selector_candidates: selectorCandidates(input),
+          });
+        });
+
+      if (fields.length === 0) return;
+
+      // submit candidates inside form
+      const submitCandidates = [];
+      form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
+        if (!isVisible(btn)) return;
+        const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
+        if (!text) return;
+        submitCandidates.push({
+          text,
+          selector_candidates: selectorCandidates(btn),
+        });
+      });
+
+      // try pick best submit candidate
+      const bestSubmit =
+        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
+        submitCandidates[0] ||
+        null;
+
+      // small dom snapshot (debug)
+      let dom_snapshot = "";
+      try {
+        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
+      } catch {}
+
+      forms.push({
+        kind: "form",
+        schema: {
+          fields,
+          submit: bestSubmit,
+          action: form.getAttribute("action") || "",
+          method: (form.getAttribute("method") || "get").toLowerCase(),
+        },
+        dom_snapshot,
+      });
+    });
+
+    // iframes (widgets)
+    const iframes = [];
+    document.querySelectorAll("iframe").forEach((fr) => {
+      const src = fr.getAttribute("src") || "";
+      if (!src) return;
+      iframes.push({
+        kind: "booking_widget",
+        schema: {
+          src,
+          title: fr.getAttribute("title") || "",
+          name: fr.getAttribute("name") || "",
+        },
+      });
+    });
+
+    // availability/date picker signals
+    const availability = [];
+    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
+      .filter(isVisible)
+      .slice(0, 10);
+
+    if (dateInputs.length > 0) {
+      availability.push({
+        kind: "availability",
+        schema: {
+          date_inputs: dateInputs.map(inp => ({
+            name: inp.getAttribute("name") || inp.id || "",
+            label: getLabel(inp),
+            selector_candidates: selectorCandidates(inp),
+            required:
+              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+          })),
+        },
+      });
+    }
+
+    // heuristic calendar containers
+    const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
+      .filter(isVisible)
+      .slice(0, 8);
+
+    if (calendarLike.length > 0) {
+      availability.push({
+        kind: "availability",
+        schema: {
+          calendar_containers: calendarLike.map(el => ({
+            selector_candidates: selectorCandidates(el),
+            text_hint: (el.textContent || "").trim().slice(0, 120),
+          })),
+        },
+      });
+    }
+
+    return {
+      url: window.location.href,
+      forms,
+      iframes,
+      availability,
+    };
+  });
+}
+
+function buildCombinedCapabilities(perPageCaps, baseOrigin) {
+  const combined = [];
+  const seen = new Set();
+
+  for (const p of perPageCaps) {
+    const url = p.url || "";
+    const domain = normalizeDomain(url || baseOrigin || "");
+
+    const pushCap = (kind, schema, dom_snapshot) => {
+      const normalized = {
+        url,
+        domain,
+        kind,
+        schema,
+      };
+      const fp = sha256Hex(stableStringify(normalized));
+      const key = `${url}|${kind}|${fp}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      combined.push({
+        url,
+        domain,
+        kind,
+        fingerprint: fp,
+        schema,
+        dom_snapshot: dom_snapshot || null,
+      });
+    };
+
+    for (const f of p.forms || []) {
+      pushCap("form", f.schema, f.dom_snapshot);
+    }
+
+    for (const w of p.iframes || []) {
+      const src = w.schema?.src || "";
+      pushCap("booking_widget", {
+        ...w.schema,
+        vendor: guessVendorFromText(src),
+      });
+    }
+
+    for (const a of p.availability || []) {
+      pushCap("availability", a.schema);
+    }
+  }
+
+  // hard limits to avoid insane payloads
+  const forms = combined.filter(c => c.kind === "form").slice(0, 40);
+  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 30);
+  const avail = combined.filter(c => c.kind === "availability").slice(0, 30);
+  const other = combined.filter(c => !["form","booking_widget","availability"].includes(c.kind)).slice(0, 20);
+
+  return [...forms, ...widgets, ...avail, ...other];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EXISTING EXTRACTION FUNCTIONS (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -540,7 +838,7 @@ async function extractStructured(page) {
   try {
     return await page.evaluate(() => {
       const seenTexts = new Set();
-      
+
       function addUniqueText(text, minLength = 10) {
         const normalized = text.trim().replace(/\s+/g, ' ');
         if (normalized.length < minLength || seenTexts.has(normalized)) return "";
@@ -669,7 +967,7 @@ async function fastOCR(buffer) {
 
 async function ocrAllImages(page, stats) {
   const results = [];
-  
+
   try {
     const imgElements = await page.$$("img");
     if (imgElements.length === 0) return results;
@@ -709,7 +1007,7 @@ async function ocrAllImages(page, stats) {
             const cachedText = globalOcrCache.get(img.src);
             return { ...img, buffer: null, cached: true, text: cachedText };
           }
-          
+
           if (page.isClosed()) return null;
           const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
           return { ...img, buffer, cached: false };
@@ -721,7 +1019,7 @@ async function ocrAllImages(page, stats) {
 
     for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
       const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
-      
+
       const batchResults = await Promise.all(
         batch.map(async (img) => {
           if (img.cached) {
@@ -730,13 +1028,13 @@ async function ocrAllImages(page, stats) {
             }
             return null;
           }
-          
+
           if (!img.buffer) return null;
-          
+
           const text = await fastOCR(img.buffer);
-          
+
           globalOcrCache.set(img.src, text);
-          
+
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
@@ -773,9 +1071,9 @@ async function collectAllLinks(page, base) {
 }
 
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
-  
+
   try {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
@@ -784,23 +1082,23 @@ async function processPage(page, url, base, stats, siteMaps) {
     await page.evaluate(async () => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
-      
+
       for (let pos = 0; pos < maxScroll; pos += scrollStep) {
         window.scrollTo(0, pos);
         await new Promise(r => setTimeout(r, 100));
       }
-      
+
       window.scrollTo(0, maxScroll);
-      
+
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
         if (img.dataset.lazy) img.src = img.dataset.lazy;
       });
     });
-    
+
     await page.waitForTimeout(500);
-    
+
     try {
       await page.waitForLoadState('networkidle', { timeout: 3000 });
     } catch {}
@@ -815,7 +1113,7 @@ async function processPage(page, url, base, stats, siteMaps) {
     // OCR images
     const ocrResults = await ocrAllImages(page, stats);
 
-    // *** NEW: Extract SiteMap from this page ***
+    // *** EXISTING: Extract SiteMap from this page ***
     try {
       const rawSiteMap = await extractSiteMapFromPage(page);
       if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
@@ -824,6 +1122,17 @@ async function processPage(page, url, base, stats, siteMaps) {
       }
     } catch (e) {
       console.error("[SITEMAP] Extract error:", e.message);
+    }
+
+    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
+    try {
+      const caps = await extractCapabilitiesFromPage(page);
+      if ((caps.forms?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+        capabilitiesMaps.push(caps);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+      }
+    } catch (e) {
+      console.error("[CAPS] Extract error:", e.message);
     }
 
     // Format content
@@ -894,7 +1203,8 @@ async function crawlSmart(startUrl, siteId = null) {
 
   const pages = [];
   const queue = [];
-  const siteMaps = []; // NEW: collect sitemaps from all pages
+  const siteMaps = []; // collect sitemaps from all pages
+  const capabilitiesMaps = []; // NEW: collect capabilities from all pages
   let base = "";
 
   try {
@@ -904,10 +1214,10 @@ async function crawlSmart(startUrl, siteId = null) {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     });
     const initPage = await initContext.newPage();
-    
+
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
-    
+
     const initialLinks = await collectAllLinks(initPage, base);
     queue.push(normalizeUrl(initPage.url()));
     initialLinks.forEach(l => {
@@ -916,7 +1226,7 @@ async function crawlSmart(startUrl, siteId = null) {
         queue.push(nl);
       }
     });
-    
+
     await initPage.close();
     await initContext.close();
 
@@ -949,9 +1259,9 @@ async function crawlSmart(startUrl, siteId = null) {
         }
 
         stats.visited++;
-        
-        const result = await processPage(pg, url, base, stats, siteMaps);
-        
+
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
+
         if (result.page) {
           pages.push(result.page);
           stats.saved++;
@@ -978,25 +1288,32 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
-  // *** NEW: Build and send SiteMap ***
+  // *** EXISTING: Build and send SiteMap ***
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
-    
+
     // Enrich each page's sitemap
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
-    
+
     // Combine all
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
-    
+
     // Save to Supabase
     await saveSiteMapToSupabase(combinedSiteMap);
-    
+
     // Send to Worker
     await sendSiteMapToWorker(combinedSiteMap);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap };
+  // *** NEW: Build combined capabilities for DB form_schemas ***
+  let combinedCapabilities = [];
+  if (capabilitiesMaps.length > 0) {
+    combinedCapabilities = buildCombinedCapabilities(capabilitiesMaps, base);
+    console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/widgets/availability)`);
+  }
+
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities };
 }
 
 // ================= HTTP SERVER =================
@@ -1004,7 +1321,7 @@ http
   .createServer((req, res) => {
     if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ 
+      return res.end(JSON.stringify({
         status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
         crawlInProgress,
         crawlFinished,
@@ -1012,6 +1329,7 @@ http
         lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
+        capabilitiesCount: lastResult?.capabilities?.length || 0,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
       }));
     }
@@ -1031,17 +1349,17 @@ http
     req.on("end", async () => {
       try {
         const parsed = JSON.parse(body || "{}");
-        
+
         if (!parsed.url) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ 
-            success: false, 
-            error: "Missing 'url' parameter" 
+          return res.end(JSON.stringify({
+            success: false,
+            error: "Missing 'url' parameter"
           }));
         }
 
         const requestedUrl = normalizeUrl(parsed.url);
-        const siteId = parsed.site_id || null; // NEW: accept site_id
+        const siteId = parsed.site_id || null; // accept site_id
         const now = Date.now();
 
         // Cache check
