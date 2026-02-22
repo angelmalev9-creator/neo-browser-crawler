@@ -39,6 +39,8 @@ const clean = (t = "") =>
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
 // ================= BG NUMBER NORMALIZER =================
+// IMPORTANT FIX: do NOT convert money amounts to words.
+// Keep numeric prices intact for downstream extraction.
 const BG_0_19 = [
   "нула","едно","две","три","четири","пет","шест","седем","осем","девет",
   "десет","единадесет","дванадесет","тринадесет","четиринадесет",
@@ -60,8 +62,10 @@ function numberToBgWords(n) {
 
 function normalizeNumbers(text = "") {
   try {
+    // ✅ Exclude money units (лв/лева/€/$/EUR/BGN) from normalization.
+    // Keep digits for prices so pack/pricing extraction works reliably.
     return text.replace(
-      /(\d+)\s?(лв|лева|€|eur|bgn|стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
+      /(\d+)\s?(стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
       (_, num, unit) => `${numberToBgWords(num)} ${unit}`
     );
   } catch { return text; }
@@ -220,7 +224,6 @@ function generateFieldKeywords(name, placeholder, label) {
 // Extract SiteMap from a page
 async function extractSiteMapFromPage(page) {
   return await page.evaluate(() => {
-    // Helper: generate selector for element
     const getSelector = (el, idx) => {
       if (el.id) return `#${el.id}`;
       if (el.className && typeof el.className === "string") {
@@ -244,7 +247,6 @@ async function extractSiteMapFromPage(page) {
       return `${tag}:nth-of-type(${idx + 1})`;
     };
 
-    // Helper: check visibility
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
@@ -253,7 +255,6 @@ async function extractSiteMapFromPage(page) {
              style.visibility !== "hidden";
     };
 
-    // Helper: get label for input
     const getLabel = (el) => {
       const id = el.id;
       if (id) {
@@ -279,10 +280,9 @@ async function extractSiteMapFromPage(page) {
       const text = (el.textContent?.trim() || el.value || "").slice(0, 100);
       if (!text || text.length < 2) return;
 
-      // Skip common non-actionable links
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
-      if (href && !href.includes(window.location.hostname)) return; // Skip external
+      if (href && !href.includes(window.location.hostname)) return;
 
       buttons.push({
         text,
@@ -292,7 +292,6 @@ async function extractSiteMapFromPage(page) {
 
     // EXTRACT FORMS
     const forms = [];
-
     document.querySelectorAll("form").forEach((form, formIdx) => {
       if (!isVisible(form)) return;
 
@@ -311,7 +310,6 @@ async function extractSiteMapFromPage(page) {
           });
         });
 
-      // Find submit button
       let submitSelector = "";
       const submitBtn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
       if (submitBtn) {
@@ -327,7 +325,7 @@ async function extractSiteMapFromPage(page) {
       }
     });
 
-    // EXTRACT PRICES
+    // EXTRACT PRICES (legacy, context-light)
     const prices = [];
     const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
 
@@ -354,7 +352,6 @@ async function extractSiteMapFromPage(page) {
           }
         }
 
-        // Avoid duplicates
         if (!prices.some(p => p.text === match[0] && p.context === context)) {
           prices.push({
             text: match[0],
@@ -420,7 +417,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
   const seenPrices = new Set();
 
   for (const pageMap of pageSiteMaps) {
-    // Merge buttons (dedupe by text)
     for (const btn of pageMap.buttons || []) {
       const key = btn.text.toLowerCase();
       if (!seenButtons.has(key)) {
@@ -429,7 +425,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
       }
     }
 
-    // Merge forms (dedupe by field names)
     for (const form of pageMap.forms || []) {
       const key = form.fields.map(f => f.name).sort().join(",");
       if (!seenForms.has(key)) {
@@ -438,7 +433,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
       }
     }
 
-    // Merge prices (dedupe by text+context)
     for (const price of pageMap.prices || []) {
       const key = `${price.text}|${price.context}`;
       if (!seenPrices.has(key)) {
@@ -448,7 +442,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
     }
   }
 
-  // Limit
   combined.buttons = combined.buttons.slice(0, 50);
   combined.forms = combined.forms.slice(0, 15);
   combined.prices = combined.prices.slice(0, 30);
@@ -539,6 +532,144 @@ async function sendSiteMapToWorker(siteMap) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// NEW: PRICING/PACKAGES STRUCTURED EXTRACTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function extractPricingFromPage(page) {
+  return await page.evaluate(() => {
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden";
+    };
+
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
+
+    const getText = (el) => norm(el?.innerText || el?.textContent || "");
+    const pickTitle = (root) => {
+      const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
+      const t = getText(h);
+      if (t && t.length <= 80) return t;
+      // fallback: first short line
+      const lines = getText(root).split("\n").map(norm).filter(Boolean);
+      return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
+    };
+
+    const pickBadge = (root) => {
+      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
+      const t = getText(b);
+      if (t && t.length <= 40) return t;
+      // also check for "Популярен" text
+      const all = getText(root);
+      if (/популярен|най-популярен|special|оферта/i.test(all)) {
+        const m = all.match(/(популярен|най-популярен|специална оферта)/i);
+        return m ? m[0] : "";
+      }
+      return "";
+    };
+
+    const pickFeatures = (root) => {
+      const items = [];
+      root.querySelectorAll("li").forEach(li => {
+        const t = getText(li);
+        if (!t) return;
+        if (t.length < 3 || t.length > 140) return;
+        items.push(t);
+      });
+      // dedupe
+      return Array.from(new Set(items)).slice(0, 30);
+    };
+
+    const pickPeriod = (root) => {
+      const t = getText(root);
+      if (/\/\s*месец|на месец|месец/i.test(t)) return "monthly";
+      if (/еднократно|one[-\s]?time|еднократ/i.test(t)) return "one_time";
+      return null;
+    };
+
+    const findCardRoot = (startEl) => {
+      let el = startEl;
+      for (let i = 0; i < 8 && el; i++) {
+        const cls = (el.className && typeof el.className === "string") ? el.className : "";
+        const tag = (el.tagName || "").toLowerCase();
+        const looksCard =
+          /card|pricing|package|plan|tier|column/i.test(cls) ||
+          ["article","section"].includes(tag);
+
+        const txt = getText(el);
+        const hasTitle = !!pickTitle(el);
+        const hasFeatures = el.querySelectorAll("li").length >= 3;
+
+        if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
+        el = el.parentElement;
+      }
+      return null;
+    };
+
+    const cards = [];
+    const seen = new Set();
+
+    // Scan text nodes that look like money, then lift to card container.
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while (node = walker.nextNode()) {
+      const txt = norm(node.textContent || "");
+      if (!txt) continue;
+      if (!moneyRe.test(txt) && !/по договаряне/i.test(txt)) continue;
+
+      const parent = node.parentElement;
+      if (!parent || !isVisible(parent)) continue;
+
+      const root = findCardRoot(parent);
+      if (!root || !isVisible(root)) continue;
+
+      const title = pickTitle(root);
+      if (!title) continue;
+
+      const rootText = getText(root);
+      const moneyMatch = rootText.match(moneyRe);
+      const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
+
+      // determine if it is monthly installment block or main package
+      const period = pickPeriod(root);
+
+      const badge = pickBadge(root);
+      const features = pickFeatures(root);
+
+      const key = `${title}|${price_text}|${period || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      cards.push({
+        title,
+        price_text,
+        period,
+        badge,
+        features,
+      });
+    }
+
+    // Split into two buckets
+    const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
+    const pricing_cards = cards.filter(c => !installment_plans.includes(c));
+
+    // Light cleanup: if a monthly plan card title is like "Advanced пакет / месец", normalize title
+    installment_plans.forEach(p => {
+      p.title = norm(p.title.replace(/\/\s*месец/i, "").replace(/пакет\s*\/\s*месец/i, "пакет")).trim();
+    });
+
+    return {
+      pricing_cards: pricing_cards.slice(0, 12),
+      installment_plans: installment_plans.slice(0, 12),
+    };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // NEW: CAPABILITIES EXTRACTION (FOR form_schemas)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -623,7 +754,6 @@ async function extractCapabilitiesFromPage(page) {
         const ac = el.getAttribute("autocomplete");
         if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
       } catch {}
-      // fallback (weak but usable)
       try {
         const cls = (el.className && typeof el.className === "string")
           ? el.className.trim().split(/\s+/).filter(Boolean)[0]
@@ -672,7 +802,6 @@ async function extractCapabilitiesFromPage(page) {
 
       if (fields.length === 0) return;
 
-      // submit candidates inside form
       const submitCandidates = [];
       form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
@@ -684,13 +813,11 @@ async function extractCapabilitiesFromPage(page) {
         });
       });
 
-      // try pick best submit candidate
       const bestSubmit =
         submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
         submitCandidates[0] ||
         null;
 
-      // small dom snapshot (debug)
       let dom_snapshot = "";
       try {
         dom_snapshot = (form.outerHTML || "").slice(0, 4000);
@@ -708,7 +835,6 @@ async function extractCapabilitiesFromPage(page) {
       });
     });
 
-    // iframes (widgets)
     const iframes = [];
     document.querySelectorAll("iframe").forEach((fr) => {
       const src = fr.getAttribute("src") || "";
@@ -723,7 +849,6 @@ async function extractCapabilitiesFromPage(page) {
       });
     });
 
-    // availability/date picker signals
     const availability = [];
     const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
       .filter(isVisible)
@@ -744,7 +869,6 @@ async function extractCapabilitiesFromPage(page) {
       });
     }
 
-    // heuristic calendar containers
     const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
       .filter(isVisible)
       .slice(0, 8);
@@ -779,12 +903,7 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     const domain = normalizeDomain(url || baseOrigin || "");
 
     const pushCap = (kind, schema, dom_snapshot) => {
-      const normalized = {
-        url,
-        domain,
-        kind,
-        schema,
-      };
+      const normalized = { url, domain, kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
       const key = `${url}|${kind}|${fp}`;
       if (seen.has(key)) return;
@@ -800,24 +919,16 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
       });
     };
 
-    for (const f of p.forms || []) {
-      pushCap("form", f.schema, f.dom_snapshot);
-    }
+    for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
 
     for (const w of p.iframes || []) {
       const src = w.schema?.src || "";
-      pushCap("booking_widget", {
-        ...w.schema,
-        vendor: guessVendorFromText(src),
-      });
+      pushCap("booking_widget", { ...w.schema, vendor: guessVendorFromText(src) });
     }
 
-    for (const a of p.availability || []) {
-      pushCap("availability", a.schema);
-    }
+    for (const a of p.availability || []) pushCap("availability", a.schema);
   }
 
-  // hard limits to avoid insane payloads
   const forms = combined.filter(c => c.kind === "form").slice(0, 40);
   const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 30);
   const avail = combined.filter(c => c.kind === "availability").slice(0, 30);
@@ -1113,6 +1224,17 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // OCR images
     const ocrResults = await ocrAllImages(page, stats);
 
+    // NEW: Pricing/package structured extraction (cards + installment)
+    let pricing = null;
+    try {
+      pricing = await extractPricingFromPage(page);
+      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+      }
+    } catch (e) {
+      console.error("[PRICING] Extract error:", e.message);
+    }
+
     // *** EXISTING: Extract SiteMap from this page ***
     try {
       const rawSiteMap = await extractSiteMapFromPage(page);
@@ -1168,6 +1290,8 @@ ${ocrContent}
         title,
         pageType,
         content,
+        // ✅ New structured output (keeps backward compat)
+        structured: { pricing },
         wordCount: totalWords,
         breakdown: { htmlWords, ocrWords, images: ocrResults.length },
         status: "ok",
@@ -1204,11 +1328,10 @@ async function crawlSmart(startUrl, siteId = null) {
   const pages = [];
   const queue = [];
   const siteMaps = []; // collect sitemaps from all pages
-  const capabilitiesMaps = []; // NEW: collect capabilities from all pages
+  const capabilitiesMaps = []; // collect capabilities from all pages
   let base = "";
 
   try {
-    // Initial load
     const initContext = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -1232,7 +1355,6 @@ async function crawlSmart(startUrl, siteId = null) {
 
     console.log(`[CRAWL] Found ${queue.length} URLs`);
 
-    // Worker function
     const createWorker = async () => {
       const ctx = await browser.newContext({
         viewport: { width: 1920, height: 1080 },
@@ -1279,7 +1401,6 @@ async function crawlSmart(startUrl, siteId = null) {
       await ctx.close();
     };
 
-    // Start workers in parallel
     await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
 
   } finally {
@@ -1288,25 +1409,17 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
-  // *** EXISTING: Build and send SiteMap ***
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
 
-    // Enrich each page's sitemap
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
-
-    // Combine all
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    // Save to Supabase
     await saveSiteMapToSupabase(combinedSiteMap);
-
-    // Send to Worker
     await sendSiteMapToWorker(combinedSiteMap);
   }
 
-  // *** NEW: Build combined capabilities for DB form_schemas ***
   let combinedCapabilities = [];
   if (capabilitiesMaps.length > 0) {
     combinedCapabilities = buildCombinedCapabilities(capabilitiesMaps, base);
@@ -1359,10 +1472,9 @@ http
         }
 
         const requestedUrl = normalizeUrl(parsed.url);
-        const siteId = parsed.site_id || null; // accept site_id
+        const siteId = parsed.site_id || null;
         const now = Date.now();
 
-        // Cache check
         if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
           if (now - lastCrawlTime < RESULT_TTL_MS) {
             console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
@@ -1371,7 +1483,6 @@ http
           }
         }
 
-        // In progress check
         if (crawlInProgress) {
           if (lastCrawlUrl === requestedUrl) {
             res.writeHead(202, { "Content-Type": "application/json" });
@@ -1389,7 +1500,6 @@ http
           }
         }
 
-        // Start new crawl
         crawlInProgress = true;
         crawlFinished = false;
         lastCrawlUrl = requestedUrl;
