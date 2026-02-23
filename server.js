@@ -94,6 +94,93 @@ function normalizeDomain(u) {
   }
 }
 
+// ================= CONTACT EXTRACTION =================
+const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+// broad phone-ish: +90 532 155 86 96, (052) 123-45-67, 0888 123 456 etc.
+const PHONE_CANDIDATE_RE = /(\+?\d[\d\s().-]{6,}\d)/g;
+const DATE_DOT_RE = /\b\d{1,2}\.\d{1,2}\.\d{4}\b/;
+
+function normalizePhone(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (DATE_DOT_RE.test(s)) return ""; // avoid dates like 10.12.2025
+
+  // keep leading +, strip other non-digits
+  const hasPlus = s.trim().startsWith("+");
+  const digits = s.replace(/[^\d]/g, "");
+  // typical phone length guard (tolerant)
+  if (digits.length < 8 || digits.length > 15) return "";
+
+  return hasPlus ? `+${digits}` : digits;
+}
+
+function extractContactsFromText(text) {
+  const out = { emails: [], phones: [] };
+
+  if (!text) return out;
+
+  const emails = (text.match(EMAIL_RE) || [])
+    .map(e => e.trim())
+    .filter(Boolean);
+
+  const phonesRaw = [];
+  let m;
+  while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
+    phonesRaw.push(m[1]);
+  }
+  const phones = phonesRaw
+    .map(normalizePhone)
+    .filter(Boolean);
+
+  // dedupe
+  out.emails = Array.from(new Set(emails)).slice(0, 12);
+  out.phones = Array.from(new Set(phones)).slice(0, 12);
+
+  return out;
+}
+
+async function extractContactsFromPage(page) {
+  try {
+    const dom = await page.evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+      const emails = new Set();
+      const phones = new Set();
+
+      // mailto/tel links
+      document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
+        const href = a.getAttribute("href") || "";
+        const v = href.replace(/^mailto:/i, "").split("?")[0];
+        if (v) emails.add(v.trim());
+      });
+
+      document.querySelectorAll('a[href^="tel:"]').forEach(a => {
+        const href = a.getAttribute("href") || "";
+        const v = href.replace(/^tel:/i, "");
+        if (v) phones.add(v.trim());
+      });
+
+      // visible text hints near footer/contact areas
+      const candidates = [];
+      const footer = document.querySelector("footer");
+      if (footer) candidates.push(footer.innerText || "");
+      const contactSection =
+        document.querySelector("[id*='contact'],[class*='contact'],[id*='kontakti'],[class*='kontakti']");
+      if (contactSection) candidates.push(contactSection.innerText || "");
+
+      return {
+        emails: Array.from(emails).map(norm).filter(Boolean).slice(0, 12),
+        phones: Array.from(phones).map(norm).filter(Boolean).slice(0, 12),
+        textHints: candidates.map(norm).filter(Boolean).join("\n"),
+      };
+    });
+
+    return dom || { emails: [], phones: [], textHints: "" };
+  } catch {
+    return { emails: [], phones: [], textHints: "" };
+  }
+}
+
 // ================= PAGE TYPE =================
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
@@ -554,7 +641,6 @@ async function extractPricingFromPage(page) {
       const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
       const t = getText(h);
       if (t && t.length <= 80) return t;
-      // fallback: first short line
       const lines = getText(root).split("\n").map(norm).filter(Boolean);
       return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
     };
@@ -563,7 +649,6 @@ async function extractPricingFromPage(page) {
       const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
       const t = getText(b);
       if (t && t.length <= 40) return t;
-      // also check for "Популярен" text
       const all = getText(root);
       if (/популярен|най-популярен|special|оферта/i.test(all)) {
         const m = all.match(/(популярен|най-популярен|специална оферта)/i);
@@ -580,7 +665,6 @@ async function extractPricingFromPage(page) {
         if (t.length < 3 || t.length > 140) return;
         items.push(t);
       });
-      // dedupe
       return Array.from(new Set(items)).slice(0, 30);
     };
 
@@ -613,7 +697,6 @@ async function extractPricingFromPage(page) {
     const cards = [];
     const seen = new Set();
 
-    // Scan text nodes that look like money, then lift to card container.
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
     while (node = walker.nextNode()) {
@@ -634,7 +717,6 @@ async function extractPricingFromPage(page) {
       const moneyMatch = rootText.match(moneyRe);
       const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
 
-      // determine if it is monthly installment block or main package
       const period = pickPeriod(root);
 
       const badge = pickBadge(root);
@@ -653,11 +735,9 @@ async function extractPricingFromPage(page) {
       });
     }
 
-    // Split into two buckets
     const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
     const pricing_cards = cards.filter(c => !installment_plans.includes(c));
 
-    // Light cleanup: if a monthly plan card title is like "Advanced пакет / месец", normalize title
     installment_plans.forEach(p => {
       p.title = norm(p.title.replace(/\/\s*месец/i, "").replace(/пакет\s*\/\s*месец/i, "пакет")).trim();
     });
@@ -1272,6 +1352,22 @@ ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
 
+    // ✅ NEW: contacts extraction (DOM + combined text)
+    const domContacts = await extractContactsFromPage(page);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
+
+    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
+    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
+
+    const contacts = {
+      emails: mergedEmails,
+      phones: mergedPhones,
+    };
+
+    if (contacts.emails.length || contacts.phones.length) {
+      console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
+    }
+
     const htmlWords = countWordsExact(htmlContent);
     const ocrWords = countWordsExact(ocrContent);
     const totalWords = htmlWords + ocrWords;
@@ -1290,8 +1386,8 @@ ${ocrContent}
         title,
         pageType,
         content,
-        // ✅ New structured output (keeps backward compat)
-        structured: { pricing },
+        // ✅ structured output: pricing + contacts
+        structured: { pricing, contacts },
         wordCount: totalWords,
         breakdown: { htmlWords, ocrWords, images: ocrResults.length },
         status: "ok",
@@ -1330,6 +1426,9 @@ async function crawlSmart(startUrl, siteId = null) {
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
   let base = "";
+
+  // ✅ NEW: aggregate contacts across pages
+  const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
     const initContext = await browser.newContext({
@@ -1385,6 +1484,11 @@ async function crawlSmart(startUrl, siteId = null) {
         const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
+          // ✅ collect contacts
+          const c = result.page?.structured?.contacts;
+          if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
+          if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
+
           pages.push(result.page);
           stats.saved++;
         }
@@ -1426,7 +1530,16 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/widgets/availability)`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities };
+  const contacts = {
+    emails: Array.from(contactAgg.emails).filter(Boolean).slice(0, 20),
+    phones: Array.from(contactAgg.phones).filter(Boolean).slice(0, 20),
+  };
+
+  if (contacts.emails.length || contacts.phones.length) {
+    console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
+  }
+
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
 }
 
 // ================= HTTP SERVER =================
@@ -1443,6 +1556,7 @@ http
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
+        contacts: lastResult?.contacts || null,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
       }));
     }
