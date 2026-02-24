@@ -789,324 +789,138 @@ function guessVendorFromText(s = "") {
 }
 
 async function extractCapabilitiesFromPage(page) {
-  // Read-only discovery. NO click, NO dummy fill, NO rescan.
-  // Goal: capture ANY interactive input surface (native + custom + ARIA) universally.
   return await page.evaluate(() => {
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-
     const isVisible = (el) => {
-      if (!el) return false;
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
       const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 &&
+             style.display !== "none" &&
+             style.visibility !== "hidden";
     };
 
     const getLabel = (el) => {
-      try {
-        const aria = el.getAttribute("aria-label");
-        if (aria) return norm(aria);
-
-        const labelledBy = el.getAttribute("aria-labelledby");
-        if (labelledBy) {
-          const ref = document.getElementById(labelledBy);
-          if (ref) return norm(ref.textContent || "");
-        }
-
-        const id = el.id;
-        if (id) {
-          const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-          if (label) return norm(label.textContent || "");
-        }
-
-        const parent = el.closest("label");
-        if (parent) return norm(parent.textContent || "");
-
-        const prev = el.previousElementSibling;
-        if (prev && prev.tagName === "LABEL") return norm(prev.textContent || "");
-      } catch {}
+      const id = el.id;
+      if (id) {
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (label) return label.textContent?.trim() || "";
+      }
+      const parent = el.closest("label");
+      if (parent) return parent.textContent?.trim() || "";
+      const aria = el.getAttribute("aria-label");
+      if (aria) return aria.trim();
+      const prev = el.previousElementSibling;
+      if (prev?.tagName === "LABEL") return prev.textContent?.trim() || "";
       return "";
     };
 
     const selectorCandidates = (el) => {
       const out = [];
-      const tag = (el?.tagName || "").toLowerCase() || "div";
-
-      try { if (el.id) out.push(`#${CSS.escape(el.id)}`); } catch {}
       try {
-        const name = el.getAttribute("name");
-        if (name) out.push(`${tag}[name="${CSS.escape(name)}"]`);
+        if (el.id) out.push(`#${CSS.escape(el.id)}`);
       } catch {}
       try {
-        const role = el.getAttribute("role");
-        if (role) out.push(`${tag}[role="${CSS.escape(role)}"]`);
+        const name = el.getAttribute("name");
+        if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
       } catch {}
       try {
         const type = el.getAttribute("type");
-        if (type) out.push(`${tag}[type="${CSS.escape(type)}"]`);
-      } catch {}
-      try {
-        const ac = el.getAttribute("autocomplete");
-        if (ac) out.push(`${tag}[autocomplete="${CSS.escape(ac)}"]`);
+        if (type) out.push(`${el.tagName.toLowerCase()}[type="${CSS.escape(type)}"]`);
       } catch {}
       try {
         const ph = el.getAttribute("placeholder");
-        if (ph && ph.length >= 2) {
-          const frag = ph.slice(0, 14).replace(/"/g, "");
-          out.push(`${tag}[placeholder*="${frag}"]`);
-        }
+        if (ph && ph.length >= 2) out.push(`${el.tagName.toLowerCase()}[placeholder*="${ph.slice(0, 12).replace(/"/g, "")}"]`);
+      } catch {}
+      try {
+        const ac = el.getAttribute("autocomplete");
+        if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
       } catch {}
       try {
         const cls = (el.className && typeof el.className === "string")
           ? el.className.trim().split(/\s+/).filter(Boolean)[0]
           : "";
-        if (cls && !cls.includes(":") && !cls.includes("[") && !cls.includes("]")) out.push(`${tag}.${cls}`);
+        if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
       } catch {}
-
-      return Array.from(new Set(out)).slice(0, 10);
+      return Array.from(new Set(out)).slice(0, 6);
     };
 
-    const fieldType = (el) => {
-      const tag = (el?.tagName || "").toLowerCase();
-      const type = (el.getAttribute("type") || "").toLowerCase();
-      const role = (el.getAttribute("role") || "").toLowerCase();
-
-      if (tag === "textarea") return "textarea";
-      if (tag === "select") return "select";
-      if (type) return type;
-      if (el.isContentEditable) return "contenteditable";
-
-      // ARIA roles for custom inputs
-      if (role === "combobox") return "combobox";
-      if (role === "listbox") return "listbox";
-      if (role === "textbox") return "textbox";
-      if (role === "spinbutton") return "spinbutton";
-      if (role === "slider") return "slider";
-
-      // heuristic: clickable select-like
-      const hasPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox";
-      if (hasPopup) return "combobox";
-
-      return tag || "unknown";
-    };
-
-    const isInteractiveInput = (el) => {
-      if (!isVisible(el)) return false;
-
-      const tag = (el.tagName || "").toLowerCase();
-      const type = (el.getAttribute("type") || "").toLowerCase();
-      const role = (el.getAttribute("role") || "").toLowerCase();
-
-      if (tag === "input") {
-        if (["hidden", "submit", "button", "image", "reset"].includes(type)) return false;
-        return true;
-      }
-      if (tag === "select" || tag === "textarea") return true;
-      if (el.isContentEditable) return true;
-
-      // ARIA custom input roles
-      if (["combobox", "listbox", "textbox", "spinbutton", "slider"].includes(role)) return true;
-
-      // custom dropdown trigger
-      const hasPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox";
-      const tab = el.getAttribute("tabindex");
-      if (hasPopup && (tab === "0" || tab === 0 || tab === "-1")) return true;
-
-      return false;
-    };
-
-    const isClickable = (el) => {
-      if (!isVisible(el)) return false;
-      const tag = (el.tagName || "").toLowerCase();
-      const role = (el.getAttribute("role") || "").toLowerCase();
-
-      if (tag === "button") return true;
-      if (tag === "a" && (el.getAttribute("href") || "").trim()) return true;
-      if (tag === "input") {
-        const t = (el.getAttribute("type") || "").toLowerCase();
-        if (["button", "submit"].includes(t)) return true;
-      }
-      if (role === "button") return true;
-
-      // onclick elements
-      if (typeof el.onclick === "function") return true;
-      const tab = el.getAttribute("tabindex");
-      if (tab === "0" && /click|button/i.test((el.className || "") + " " + (el.getAttribute("role") || ""))) return true;
-
-      return false;
-    };
-
-    const requiredHeuristic = (el, labelText) => {
-      try {
-        if (el.hasAttribute("required") || el.getAttribute("aria-required") === "true") return true;
-        const lb = labelText || "";
-        if (lb && /(\*|required|задължително)/i.test(lb)) return true;
-      } catch {}
-      return false;
-    };
-
-    const toField = (el) => {
-      const tag = (el.tagName || "").toLowerCase();
-      const label = getLabel(el);
-      const placeholder = el.getAttribute("placeholder") || "";
-      const name = el.getAttribute("name") || el.id || "";
-      const type = fieldType(el);
-      return {
-        tag,
-        type,
-        name,
-        label,
-        placeholder: placeholder || "",
-        required: requiredHeuristic(el, label),
-        autocomplete: el.getAttribute("autocomplete") || "",
-        aria_label: el.getAttribute("aria-label") || "",
-        aria_describedby: el.getAttribute("aria-describedby") || "",
-        selector_candidates: selectorCandidates(el),
-      };
-    };
-
-    // 1) Classic <form> blocks (keep)
     const forms = [];
     document.querySelectorAll("form").forEach((form) => {
       if (!isVisible(form)) return;
 
       const fields = [];
-      form.querySelectorAll("input,select,textarea,[role='combobox'],[role='listbox'],[role='textbox'],[role='spinbutton'],[role='slider'],[contenteditable='true'],[aria-haspopup='listbox']")
-        .forEach((el) => {
-          if (!isInteractiveInput(el)) return;
-          fields.push(toField(el));
+      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
+        .forEach((input) => {
+          if (!isVisible(input)) return;
+
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const placeholder = input.getAttribute("placeholder") || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
+
+          const autocomplete = input.getAttribute("autocomplete") || "";
+          const ariaLabel = input.getAttribute("aria-label") || "";
+          const ariaDesc = input.getAttribute("aria-describedby") || "";
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            placeholder,
+            required,
+            autocomplete,
+            aria_label: ariaLabel,
+            aria_describedby: ariaDesc,
+            selector_candidates: selectorCandidates(input),
+          });
         });
 
       if (fields.length === 0) return;
 
-      const actions = [];
-      form.querySelectorAll("button,[role='button'],a[href],input[type='submit'],input[type='button']").forEach((b) => {
-        if (!isClickable(b)) return;
-        actions.push({
-          text: norm(b.textContent || b.getAttribute("value") || b.getAttribute("aria-label") || ""),
-          disabled: b.hasAttribute("disabled") || b.getAttribute("aria-disabled") === "true",
-          selector_candidates: selectorCandidates(b),
+      const submitCandidates = [];
+      form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
+        if (!isVisible(btn)) return;
+        const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
+        if (!text) return;
+        submitCandidates.push({
+          text,
+          selector_candidates: selectorCandidates(btn),
         });
       });
 
+      const bestSubmit =
+        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
+        submitCandidates[0] ||
+        null;
+
       let dom_snapshot = "";
-      try { dom_snapshot = (form.outerHTML || "").slice(0, 4000); } catch {}
+      try {
+        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
+      } catch {}
 
       forms.push({
         kind: "form",
-        schema: { fields: fields.slice(0, 120), actions: actions.slice(0, 30) },
-        dom_snapshot,
-      });
-    });
-
-    // 2) Universal input groups (wizard/custom UIs)
-    const inputNodes = Array.from(
-      document.querySelectorAll("input,select,textarea,[role='combobox'],[role='listbox'],[role='textbox'],[role='spinbutton'],[role='slider'],[contenteditable='true'],[aria-haspopup='listbox']")
-    ).filter(isInteractiveInput);
-
-    const groups = new Map();
-
-    const pickRoot = (el) => {
-      let cur = el.parentElement;
-      for (let depth = 0; depth < 10 && cur; depth++) {
-        if (cur === document.body) break;
-        if (!isVisible(cur)) { cur = cur.parentElement; continue; }
-
-        const textLen = (cur.innerText || "").trim().length;
-        if (textLen > 6000) { cur = cur.parentElement; continue; }
-
-        const inputsCount = cur.querySelectorAll(
-          "input,select,textarea,[role='combobox'],[role='listbox'],[role='textbox'],[role='spinbutton'],[role='slider'],[contenteditable='true'],[aria-haspopup='listbox']"
-        ).length;
-        const actionsCount = cur.querySelectorAll("button,[role='button'],a[href],input[type='submit'],input[type='button']").length;
-
-        if (inputsCount >= 2 || (inputsCount >= 1 && actionsCount >= 1)) return cur;
-
-        // modal/wizard/panel hints
-        const cls = (cur.className && typeof cur.className === "string") ? cur.className : "";
-        if (/(modal|dialog|wizard|step|form|checkout|panel|drawer)/i.test(cls) && inputsCount >= 1) return cur;
-
-        cur = cur.parentElement;
-      }
-      return null;
-    };
-
-    inputNodes.forEach((el) => {
-      const root = pickRoot(el);
-      if (!root) return;
-      const arr = groups.get(root) || [];
-      arr.push(el);
-      groups.set(root, arr);
-    });
-
-    const input_groups = [];
-    const seenKeys = new Set();
-
-    groups.forEach((els, root) => {
-      const uniq = Array.from(new Set(els));
-      if (uniq.length === 0) return;
-
-      const fields = uniq.map(toField);
-
-      // also allow file-only groups
-      const hasFile = fields.some(f => f.type === "file");
-      if (fields.length < 2 && !hasFile) return;
-
-      const key = fields
-        .map(f => (f.name || f.label || f.placeholder || f.type).toLowerCase().slice(0, 50))
-        .sort()
-        .join("|");
-      if (!key || key.length < 3) return;
-      if (seenKeys.has(key)) return;
-      seenKeys.add(key);
-
-      const actions = [];
-      root.querySelectorAll("button,[role='button'],a[href],input[type='submit'],input[type='button']").forEach((b) => {
-        if (!isClickable(b)) return;
-        actions.push({
-          text: norm(b.textContent || b.getAttribute("value") || b.getAttribute("aria-label") || ""),
-          disabled: b.hasAttribute("disabled") || b.getAttribute("aria-disabled") === "true",
-          selector_candidates: selectorCandidates(b),
-        });
-      });
-
-      // option/segment buttons: short texts that act as choices
-      const option_buttons = [];
-      const seenOpt = new Set();
-      root.querySelectorAll("button,[role='button'],div,span,a").forEach((b) => {
-        if (!isVisible(b)) return;
-        const t = norm(b.textContent || b.getAttribute("aria-label") || "");
-        if (!t || t.length < 2 || t.length > 18) return;
-        const tl = t.toLowerCase();
-        if (seenOpt.has(tl)) return;
-        // don't include typical navigation verbs (language-agnostic-ish)
-        if (/^(ok|done|next|back|submit|send|continue)$/i.test(tl)) return;
-        seenOpt.add(tl);
-        option_buttons.push({ text: t, selector_candidates: selectorCandidates(b) });
-      });
-
-      let dom_snapshot = "";
-      try { dom_snapshot = (root.outerHTML || "").slice(0, 4000); } catch {}
-
-      input_groups.push({
-        kind: "input_group",
         schema: {
-          fields: fields.slice(0, 180),
-          actions: actions.slice(0, 40),
-          option_buttons: option_buttons.slice(0, 24),
-          root_selector_candidates: selectorCandidates(root),
+          fields,
+          submit: bestSubmit,
+          action: form.getAttribute("action") || "",
+          method: (form.getAttribute("method") || "get").toLowerCase(),
         },
         dom_snapshot,
       });
     });
 
-    // 3) Iframe widgets (booking/forms)
     const iframes = [];
     document.querySelectorAll("iframe").forEach((fr) => {
       const src = fr.getAttribute("src") || "";
       if (!src) return;
       iframes.push({
-        kind: "iframe_widget",
+        kind: "booking_widget",
         schema: {
           src,
           title: fr.getAttribute("title") || "",
@@ -1115,79 +929,56 @@ async function extractCapabilitiesFromPage(page) {
       });
     });
 
-    // 4) Embedded widgets (script/link based) - universal "there is an embedded external interactive"
-    const embedded_widgets = [];
-    const pushWidget = (vendor, url) => {
-      if (!url) return;
-      embedded_widgets.push({ kind: "embedded_widget", schema: { vendor, url } });
-    };
+    const availability = [];
+    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
+      .filter(isVisible)
+      .slice(0, 10);
 
-    const scripts = Array.from(document.querySelectorAll("script[src]"));
-    scripts.forEach((s) => {
-      const src = s.getAttribute("src") || "";
-      const l = src.toLowerCase();
-      if (!src) return;
-      if (l.includes("calendly")) pushWidget("calendly", src);
-      else if (l.includes("typeform")) pushWidget("typeform", src);
-      else if (l.includes("jotform")) pushWidget("jotform", src);
-      else if (l.includes("simplybook")) pushWidget("simplybook", src);
-      else if (l.includes("clockpms") || l.includes("clock-software")) pushWidget("clockpms", src);
-      else if (l.includes("google.com/recaptcha")) pushWidget("recaptcha", src);
-      else if (l.includes("hcaptcha")) pushWidget("hcaptcha", src);
-    });
-
-    const links = Array.from(document.querySelectorAll("link[href]"));
-    links.forEach((ln) => {
-      const href = ln.getAttribute("href") || "";
-      const l = href.toLowerCase();
-      if (!href) return;
-      if (l.includes("typeform")) pushWidget("typeform", href);
-      if (l.includes("calendly")) pushWidget("calendly", href);
-    });
-
-    // also detect known embed containers
-    document.querySelectorAll("[data-calendly-url],[data-tf-widget],[data-tf-live],[data-jotform-embed]").forEach((el) => {
-      const v = el.getAttribute("data-calendly-url") || el.getAttribute("data-tf-widget") || el.getAttribute("data-tf-live") || el.getAttribute("data-jotform-embed") || "";
-      if (!v) return;
-      pushWidget("embed", v);
-    });
-
-    // 5) General interactives: clickables + focusables (for UI automation planning)
-    const interactives = [];
-    const interactiveNodes = Array.from(
-      document.querySelectorAll("button,[role='button'],a[href],input[type='submit'],input[type='button'],[onclick],[tabindex='0']")
-    );
-
-    interactiveNodes.forEach((el) => {
-      if (!isClickable(el)) return;
-      const text = norm(el.textContent || el.getAttribute("value") || el.getAttribute("aria-label") || "");
-      interactives.push({
-        kind: "interactive",
+    if (dateInputs.length > 0) {
+      availability.push({
+        kind: "availability",
         schema: {
-          text: text.slice(0, 120),
-          selector_candidates: selectorCandidates(el),
-          disabled: el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true",
+          date_inputs: dateInputs.map(inp => ({
+            name: inp.getAttribute("name") || inp.id || "",
+            label: getLabel(inp),
+            selector_candidates: selectorCandidates(inp),
+            required:
+              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+          })),
         },
       });
-    });
+    }
+
+    const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
+      .filter(isVisible)
+      .slice(0, 8);
+
+    if (calendarLike.length > 0) {
+      availability.push({
+        kind: "availability",
+        schema: {
+          calendar_containers: calendarLike.map(el => ({
+            selector_candidates: selectorCandidates(el),
+            text_hint: (el.textContent || "").trim().slice(0, 120),
+          })),
+        },
+      });
+    }
 
     return {
       url: window.location.href,
       forms,
-      input_groups,
       iframes,
-      embedded_widgets,
-      interactives: interactives.slice(0, 120),
+      availability,
     };
   });
 }
-
 
 function buildCombinedCapabilities(perPageCaps, baseOrigin) {
   const combined = [];
   const seen = new Set();
 
-  for (const p of perPageCaps || []) {
+  for (const p of perPageCaps) {
     const url = p.url || "";
     const domain = normalizeDomain(url || baseOrigin || "");
 
@@ -1208,36 +999,27 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
       });
     };
 
-    for (const f of (p.forms || [])) pushCap("form", f.schema, f.dom_snapshot);
-    for (const g of (p.input_groups || [])) pushCap("input_group", g.schema, g.dom_snapshot);
+    for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
 
-    for (const fr of (p.iframes || [])) pushCap("iframe_widget", fr.schema, null);
-    for (const w of (p.embedded_widgets || [])) pushCap("embedded_widget", w.schema, null);
+    for (const w of p.iframes || []) {
+      const src = w.schema?.src || "";
+      pushCap("booking_widget", { ...w.schema, vendor: guessVendorFromText(src) });
+    }
 
-    // keep a small set of generic interactives (useful for downstream planning)
-    for (const i of (p.interactives || [])) pushCap("interactive", i.schema, null);
+    for (const a of p.availability || []) pushCap("availability", a.schema);
   }
 
-    // Priority: input groups + forms first, then widgets
-    const forms = combined.filter(c => c.kind === "input_group" || c.kind === "form").slice(0, 80);
-    const widgets = combined.filter(c => c.kind === "iframe_widget" || c.kind === "embedded_widget").slice(0, 50);
+  const forms = combined.filter(c => c.kind === "form").slice(0, 40);
+  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 30);
+  const avail = combined.filter(c => c.kind === "availability").slice(0, 30);
+  const other = combined.filter(c => !["form","booking_widget","availability"].includes(c.kind)).slice(0, 20);
 
-    // Only keep interactives that look like submit/action buttons — not every link/nav button.
-    // Generic interactives (all page clickables) are too noisy: 100+ per page × many pages
-    // = thousands of rows that blow the Supabase upsert payload limit and cause silent failure.
-    const inter = combined
-      .filter(c => c.kind === "interactive")
-      .filter(c => {
-        const text = ((c.schema?.text) || "").toLowerCase();
-        return /резерв|запази|изпрати|book|reserve|send|submit|contact|провери|check|търси|search/i.test(text);
-      })
-      .slice(0, 30);
-
-    const rest = combined.filter(c => !["input_group","form","iframe_widget","embedded_widget","interactive"].includes(c.kind)).slice(0, 20);
-
-  return [...forms, ...widgets, ...inter, ...rest];
+  return [...forms, ...widgets, ...avail, ...other];
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// EXISTING EXTRACTION FUNCTIONS (unchanged)
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function extractStructured(page) {
   try {
@@ -1547,9 +1329,9 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
     try {
       const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.input_groups?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.embedded_widgets?.length || 0) > 0 || (caps.interactives?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+      if ((caps.forms?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
         capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.input_groups?.length || 0} input_groups, ${caps.iframes?.length || 0} iframes, ${caps.embedded_widgets?.length || 0} embedded_widgets, ${caps.interactives?.length || 0} interactives, ${caps.availability?.length || 0} availability`);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
       }
     } catch (e) {
       console.error("[CAPS] Extract error:", e.message);
