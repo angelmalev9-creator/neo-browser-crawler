@@ -1218,11 +1218,22 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     for (const i of (p.interactives || [])) pushCap("interactive", i.schema, null);
   }
 
-  // Priority: input groups + forms first, then widgets
-  const forms = combined.filter(c => c.kind === "input_group" || c.kind === "form").slice(0, 80);
-  const widgets = combined.filter(c => c.kind === "iframe_widget" || c.kind === "embedded_widget").slice(0, 50);
-  const inter = combined.filter(c => c.kind === "interactive").slice(0, 120);
-  const rest = combined.filter(c => !["input_group","form","iframe_widget","embedded_widget","interactive"].includes(c.kind)).slice(0, 20);
+    // Priority: input groups + forms first, then widgets
+    const forms = combined.filter(c => c.kind === "input_group" || c.kind === "form").slice(0, 80);
+    const widgets = combined.filter(c => c.kind === "iframe_widget" || c.kind === "embedded_widget").slice(0, 50);
+
+    // Only keep interactives that look like submit/action buttons — not every link/nav button.
+    // Generic interactives (all page clickables) are too noisy: 100+ per page × many pages
+    // = thousands of rows that blow the Supabase upsert payload limit and cause silent failure.
+    const inter = combined
+      .filter(c => c.kind === "interactive")
+      .filter(c => {
+        const text = ((c.schema?.text) || "").toLowerCase();
+        return /резерв|запази|изпрати|book|reserve|send|submit|contact|провери|check|търси|search/i.test(text);
+      })
+      .slice(0, 30);
+
+    const rest = combined.filter(c => !["input_group","form","iframe_widget","embedded_widget","interactive"].includes(c.kind)).slice(0, 20);
 
   return [...forms, ...widgets, ...inter, ...rest];
 }
