@@ -794,127 +794,313 @@ async function extractCapabilitiesFromPage(page) {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
       return rect.width > 0 && rect.height > 0 &&
-             style.display !== "none" &&
-             style.visibility !== "hidden";
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0";
     };
+
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
     const getLabel = (el) => {
       const id = el.id;
       if (id) {
-        const label = document.querySelector(`label[for="${id}"]`);
-        if (label) return label.textContent?.trim() || "";
+        const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+        if (label) return norm(label.textContent || "");
       }
-      const parent = el.closest("label");
-      if (parent) return parent.textContent?.trim() || "";
+      const parentLabel = el.closest("label");
+      if (parentLabel) return norm(parentLabel.textContent || "");
       const aria = el.getAttribute("aria-label");
-      if (aria) return aria.trim();
+      if (aria) return norm(aria);
+      const labelledBy = el.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        const ref = document.getElementById(labelledBy);
+        if (ref) return norm(ref.textContent || "");
+      }
       const prev = el.previousElementSibling;
-      if (prev?.tagName === "LABEL") return prev.textContent?.trim() || "";
+      if (prev && prev.tagName === "LABEL") return norm(prev.textContent || "");
       return "";
     };
 
     const selectorCandidates = (el) => {
       const out = [];
-      try {
-        if (el.id) out.push(`#${CSS.escape(el.id)}`);
-      } catch {}
+      const tag = (el.tagName || "").toLowerCase();
+
+      try { if (el.id) out.push(`#${CSS.escape(el.id)}`); } catch {}
       try {
         const name = el.getAttribute("name");
-        if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
+        if (name) out.push(`${tag}[name="${CSS.escape(name)}"]`);
       } catch {}
       try {
         const type = el.getAttribute("type");
-        if (type) out.push(`${el.tagName.toLowerCase()}[type="${CSS.escape(type)}"]`);
+        if (type) out.push(`${tag}[type="${CSS.escape(type)}"]`);
       } catch {}
       try {
-        const ph = el.getAttribute("placeholder");
-        if (ph && ph.length >= 2) out.push(`${el.tagName.toLowerCase()}[placeholder*="${ph.slice(0, 12).replace(/"/g, "")}"]`);
+        const role = el.getAttribute("role");
+        if (role) out.push(`${tag}[role="${CSS.escape(role)}"]`);
       } catch {}
       try {
         const ac = el.getAttribute("autocomplete");
-        if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
+        if (ac) out.push(`${tag}[autocomplete="${CSS.escape(ac)}"]`);
+      } catch {}
+      try {
+        const ph = el.getAttribute("placeholder");
+        if (ph && ph.length >= 2) {
+          const frag = ph.slice(0, 14).replace(/"/g, "");
+          out.push(`${tag}[placeholder*="${frag}"]`);
+        }
       } catch {}
       try {
         const cls = (el.className && typeof el.className === "string")
           ? el.className.trim().split(/\s+/).filter(Boolean)[0]
           : "";
-        if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
+        if (cls && !cls.includes(":") && !cls.includes("[") && !cls.includes("]")) out.push(`${tag}.${cls}`);
       } catch {}
-      return Array.from(new Set(out)).slice(0, 6);
+
+      return Array.from(new Set(out)).slice(0, 8);
     };
 
+    const fieldType = (el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      const typeAttr = (el.getAttribute("type") || "").toLowerCase();
+      const role = (el.getAttribute("role") || "").toLowerCase();
+
+      if (tag === "textarea") return "textarea";
+      if (tag === "select") return "select";
+      if (typeAttr === "email") return "email";
+      if (typeAttr === "tel") return "tel";
+      if (typeAttr === "number") return "number";
+      if (typeAttr === "date") return "date";
+      if (typeAttr === "file") return "file";
+      if (typeAttr === "checkbox") return "checkbox";
+      if (typeAttr === "radio") return "radio";
+      if (tag === "input") return typeAttr || "text";
+
+      if (el.isContentEditable) return "contenteditable";
+      if (role === "combobox") return "combobox";
+      if (role === "listbox") return "listbox";
+
+      return "unknown";
+    };
+
+    const isInteractiveInput = (el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      const typeAttr = (el.getAttribute("type") || "").toLowerCase();
+      const role = (el.getAttribute("role") || "").toLowerCase();
+
+      if (!isVisible(el)) return false;
+
+      if (tag === "input") {
+        if (["hidden", "submit", "button", "image", "reset"].includes(typeAttr)) return false;
+        return true;
+      }
+      if (tag === "select" || tag === "textarea") return true;
+      if (el.isContentEditable) return true;
+      if (role === "combobox" || role === "listbox") return true;
+
+      const tab = el.getAttribute("tabindex");
+      const hasPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox";
+      if (tab === "0" && hasPopup) return true;
+
+      return false;
+    };
+
+    const isClickable = (el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      const role = (el.getAttribute("role") || "").toLowerCase();
+      if (!isVisible(el)) return false;
+      if (tag === "button") return true;
+      if (tag === "a" && (el.getAttribute("href") || "").trim()) return true;
+      if (tag === "input") {
+        const t = (el.getAttribute("type") || "").toLowerCase();
+        if (["button", "submit"].includes(t)) return true;
+      }
+      if (role === "button") return true;
+      return false;
+    };
+
+    const clickablesIn = (root) => {
+      const out = [];
+      root.querySelectorAll("button,[role='button'],a,input[type='button'],input[type='submit']").forEach((b) => {
+        if (!isClickable(b)) return;
+        const text = norm(b.textContent || b.getAttribute("value") || b.getAttribute("aria-label") || "");
+        out.push({
+          text: text || "",
+          disabled: b.hasAttribute("disabled") || b.getAttribute("aria-disabled") === "true",
+          selector_candidates: selectorCandidates(b),
+        });
+      });
+      return out.slice(0, 20);
+    };
+
+    // 1) Standard <form> extraction (kept)
     const forms = [];
     document.querySelectorAll("form").forEach((form) => {
       if (!isVisible(form)) return;
 
       const fields = [];
-      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
-        .forEach((input) => {
-          if (!isVisible(input)) return;
+      form.querySelectorAll("input,select,textarea,[role='combobox'],[role='listbox'],[contenteditable='true']")
+        .forEach((el) => {
+          if (!isInteractiveInput(el)) return;
 
-          const tag = input.tagName.toLowerCase();
-          const type = (input.getAttribute("type") || tag).toLowerCase();
-          const name = input.getAttribute("name") || input.id || "";
-          const placeholder = input.getAttribute("placeholder") || "";
-          const label = getLabel(input);
+          const tag = (el.tagName || "").toLowerCase();
+          const type = fieldType(el);
+          const name = el.getAttribute("name") || el.id || "";
+          const placeholder = el.getAttribute("placeholder") || "";
+          const label = getLabel(el);
+
           const required =
-            input.hasAttribute("required") ||
-            input.getAttribute("aria-required") === "true" ||
+            el.hasAttribute("required") ||
+            el.getAttribute("aria-required") === "true" ||
             (label && /(\*|задължително|required)/i.test(label));
-
-          const autocomplete = input.getAttribute("autocomplete") || "";
-          const ariaLabel = input.getAttribute("aria-label") || "";
-          const ariaDesc = input.getAttribute("aria-describedby") || "";
 
           fields.push({
             tag,
             type,
             name,
             label,
-            placeholder,
+            placeholder: placeholder || "",
             required,
-            autocomplete,
-            aria_label: ariaLabel,
-            aria_describedby: ariaDesc,
-            selector_candidates: selectorCandidates(input),
+            autocomplete: el.getAttribute("autocomplete") || "",
+            aria_label: el.getAttribute("aria-label") || "",
+            aria_describedby: el.getAttribute("aria-describedby") || "",
+            selector_candidates: selectorCandidates(el),
           });
         });
 
       if (fields.length === 0) return;
 
-      const submitCandidates = [];
-      form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
-        if (!isVisible(btn)) return;
-        const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
-        if (!text) return;
-        submitCandidates.push({
-          text,
-          selector_candidates: selectorCandidates(btn),
-        });
-      });
-
-      const bestSubmit =
-        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
-        submitCandidates[0] ||
-        null;
-
+      const actions = clickablesIn(form);
       let dom_snapshot = "";
-      try {
-        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
-      } catch {}
+      try { dom_snapshot = (form.outerHTML || "").slice(0, 4000); } catch {}
 
       forms.push({
         kind: "form",
+        schema: { fields, actions },
+        dom_snapshot,
+      });
+    });
+
+    // 2) Universal INPUT GROUP extraction (non-<form> UIs)
+    const inputEls = Array.from(
+      document.querySelectorAll("input,select,textarea,[role='combobox'],[role='listbox'],[contenteditable='true'],[aria-haspopup='listbox'][tabindex='0']")
+    ).filter(isInteractiveInput);
+
+    const groups = new Map();
+
+    const pickRoot = (el) => {
+      let cur = el.parentElement;
+      for (let depth = 0; depth < 8 && cur; depth++) {
+        if (cur === document.body) break;
+
+        const txtLen = (cur.innerText || "").trim().length;
+        if (txtLen > 4000) { cur = cur.parentElement; continue; }
+
+        const inputsHere = cur.querySelectorAll(
+          "input,select,textarea,[role='combobox'],[role='listbox'],[contenteditable='true'],[aria-haspopup='listbox'][tabindex='0']"
+        ).length;
+
+        const hasActions = cur.querySelectorAll("button,[role='button'],input[type='submit'],input[type='button']").length > 0;
+
+        if (inputsHere >= 2 || (hasActions && inputsHere >= 1)) return cur;
+
+        cur = cur.parentElement;
+      }
+      return null;
+    };
+
+    inputEls.forEach((el) => {
+      const root = pickRoot(el);
+      if (!root) return;
+      const arr = groups.get(root) || [];
+      arr.push(el);
+      groups.set(root, arr);
+    });
+
+    const input_groups = [];
+    const seenGroupKeys = new Set();
+
+    groups.forEach((els, root) => {
+      const uniq = Array.from(new Set(els));
+      if (uniq.length === 0) return;
+
+      const fields = [];
+      uniq.forEach((el) => {
+        const tag = (el.tagName || "").toLowerCase();
+        const type = fieldType(el);
+        const name = el.getAttribute("name") || el.id || "";
+        const placeholder = el.getAttribute("placeholder") || "";
+        const label = getLabel(el);
+
+        const required =
+          el.hasAttribute("required") ||
+          el.getAttribute("aria-required") === "true" ||
+          (label && /(\*|задължително|required)/i.test(label));
+
+        fields.push({
+          tag,
+          type,
+          name,
+          label,
+          placeholder: placeholder || "",
+          required,
+          autocomplete: el.getAttribute("autocomplete") || "",
+          aria_label: el.getAttribute("aria-label") || "",
+          aria_describedby: el.getAttribute("aria-describedby") || "",
+          selector_candidates: selectorCandidates(el),
+        });
+      });
+
+      const hasFile = fields.some(f => f.type === "file");
+      if (fields.length < 2 && !hasFile) return;
+
+      // dedupe groups by field signature
+      const key = fields
+        .map(f => (f.name || f.label || f.placeholder || f.type).toLowerCase().slice(0, 40))
+        .sort()
+        .join("|");
+      if (!key || key.length < 3) return;
+      if (seenGroupKeys.has(key)) return;
+      seenGroupKeys.add(key);
+
+      const actions = clickablesIn(root);
+
+      // option buttons (segmented controls etc.)
+      const option_buttons = [];
+      const clickableCandidates = Array.from(root.querySelectorAll("button,[role='button'],a,div,span"))
+        .filter(isVisible)
+        .map(el => ({
+          el,
+          text: norm(el.textContent || el.getAttribute("aria-label") || ""),
+        }))
+        .filter(x => x.text && x.text.length >= 2 && x.text.length <= 18);
+
+      const seenOpt = new Set();
+      for (const x of clickableCandidates) {
+        const t = x.text.toLowerCase();
+        if (seenOpt.has(t)) continue;
+        // skip obvious nav/submit labels (language-agnostic-ish)
+        if (/(back|next|previous|continue|submit|send|ok|cancel|назад|напред|изпрати|продължи|отказ)/i.test(x.text)) continue;
+        seenOpt.add(t);
+        option_buttons.push({ text: x.text, selector_candidates: selectorCandidates(x.el) });
+        if (option_buttons.length >= 12) break;
+      }
+
+      let dom_snapshot = "";
+      try { dom_snapshot = (root.outerHTML || "").slice(0, 4000); } catch {}
+
+      input_groups.push({
+        kind: "input_group",
         schema: {
           fields,
-          submit: bestSubmit,
-          action: form.getAttribute("action") || "",
-          method: (form.getAttribute("method") || "get").toLowerCase(),
+          actions,
+          option_buttons,
+          root_selector_candidates: selectorCandidates(root),
         },
         dom_snapshot,
       });
     });
 
+    // 3) Widgets / iframes
     const iframes = [];
     document.querySelectorAll("iframe").forEach((fr) => {
       const src = fr.getAttribute("src") || "";
@@ -929,11 +1115,9 @@ async function extractCapabilitiesFromPage(page) {
       });
     });
 
+    // 4) Availability signals (kept)
     const availability = [];
-    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
-      .filter(isVisible)
-      .slice(0, 10);
-
+    const dateInputs = Array.from(document.querySelectorAll("input[type='date']")).filter(isVisible).slice(0, 10);
     if (dateInputs.length > 0) {
       availability.push({
         kind: "availability",
@@ -942,16 +1126,15 @@ async function extractCapabilitiesFromPage(page) {
             name: inp.getAttribute("name") || inp.id || "",
             label: getLabel(inp),
             selector_candidates: selectorCandidates(inp),
-            required:
-              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+            required: inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
           })),
         },
       });
     }
 
-    const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
-      .filter(isVisible)
-      .slice(0, 8);
+    const calendarLike = Array.from(
+      document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']")
+    ).filter(isVisible).slice(0, 8);
 
     if (calendarLike.length > 0) {
       availability.push({
@@ -959,7 +1142,7 @@ async function extractCapabilitiesFromPage(page) {
         schema: {
           calendar_containers: calendarLike.map(el => ({
             selector_candidates: selectorCandidates(el),
-            text_hint: (el.textContent || "").trim().slice(0, 120),
+            text_hint: norm((el.textContent || "")).slice(0, 120),
           })),
         },
       });
@@ -968,6 +1151,7 @@ async function extractCapabilitiesFromPage(page) {
     return {
       url: window.location.href,
       forms,
+      input_groups,
       iframes,
       availability,
     };
@@ -1000,6 +1184,7 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     };
 
     for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
+    for (const g of p.input_groups || []) pushCap("input_group", g.schema, g.dom_snapshot);
 
     for (const w of p.iframes || []) {
       const src = w.schema?.src || "";
@@ -1009,10 +1194,10 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     for (const a of p.availability || []) pushCap("availability", a.schema);
   }
 
-  const forms = combined.filter(c => c.kind === "form").slice(0, 40);
+  const forms = combined.filter(c => c.kind === "form" || c.kind === "input_group").slice(0, 60);
   const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 30);
   const avail = combined.filter(c => c.kind === "availability").slice(0, 30);
-  const other = combined.filter(c => !["form","booking_widget","availability"].includes(c.kind)).slice(0, 20);
+  const other = combined.filter(c => !["form","input_group","booking_widget","availability"].includes(c.kind)).slice(0, 20);
 
   return [...forms, ...widgets, ...avail, ...other];
 }
