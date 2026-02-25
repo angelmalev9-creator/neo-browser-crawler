@@ -882,6 +882,12 @@ async function extractCapabilitiesFromPage(page) {
 
       if (fields.length === 0) return;
 
+      // ✅ NEW: require at least 1 meaningful input (not just buttons/checkboxes)
+      const meaningfulFields = fields.filter(f =>
+        !['hidden','submit','button','reset','image'].includes(f.type)
+      );
+      if (meaningfulFields.length === 0) return;
+
       const submitCandidates = [];
       form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
@@ -965,9 +971,213 @@ async function extractCapabilitiesFromPage(page) {
       });
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // ✅ NEW: Detect wizard/multi-step forms (div-based, not <form>)
+    // Catches forms like DentaSay's 6-step wizard with step indicators
+    // ═══════════════════════════════════════════════════════════
+    const wizards = [];
+    try {
+      // Strategy: find containers with step indicators that contain inputs
+      // but are NOT inside a <form> tag
+      const stepSelectors = [
+        '[class*="step"]',
+        '[class*="wizard"]',
+        '[data-step]',
+        '[class*="multi-step"]',
+        '[class*="multistep"]',
+        '[class*="form-step"]',
+        '[class*="stepper"]',
+      ];
+
+      // Also detect step indicators (progress bars, step numbers)
+      const stepIndicatorSelectors = [
+        '[class*="step-indicator"]',
+        '[class*="progress-step"]',
+        '[class*="step-nav"]',
+        '[class*="stepper"]',
+        '[class*="step-number"]',
+        '[class*="form-progress"]',
+      ];
+
+      const wizardRoots = new Set();
+
+      // Method 1: Find step containers with inputs
+      for (const sel of stepSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(el => {
+            // Skip if inside a <form> (already captured by form extraction)
+            if (el.closest('form')) return;
+            if (!isVisible(el)) return;
+
+            // Look for the outermost wizard container
+            const root = el.closest(
+              '[class*="wizard"],[class*="step-container"],[class*="form-wrapper"],' +
+              '[class*="multistep"],[class*="multi-step"],[class*="stepper"]'
+            ) || el;
+
+            if (root.closest('form')) return;
+
+            // Must have visible inputs inside
+            const inputs = root.querySelectorAll(
+              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+            );
+            const visibleInputs = Array.from(inputs).filter(isVisible);
+            if (visibleInputs.length >= 1) {
+              wizardRoots.add(root);
+            }
+          });
+        } catch {}
+      }
+
+      // Method 2: Find step indicators near inputs (not in form)
+      for (const sel of stepIndicatorSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(indicator => {
+            if (indicator.closest('form')) return;
+            if (!isVisible(indicator)) return;
+
+            // The wizard is likely a parent/sibling container
+            const parent = indicator.parentElement;
+            if (!parent || parent.closest('form')) return;
+
+            // Walk up to find a container with inputs
+            let container = parent;
+            for (let i = 0; i < 5; i++) {
+              if (!container) break;
+              const inputs = container.querySelectorAll(
+                'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+              );
+              const visibleInputs = Array.from(inputs).filter(isVisible);
+              if (visibleInputs.length >= 1) {
+                wizardRoots.add(container);
+                break;
+              }
+              container = container.parentElement;
+            }
+          });
+        } catch {}
+      }
+
+      // Method 3: Look for navigation buttons (Напред/Назад, Next/Back)
+      // near input fields, not inside <form>
+      const navButtonRe = /напред|назад|next|back|previous|стъпка|step/i;
+      document.querySelectorAll('button, [role="button"], a[class*="btn"]').forEach(btn => {
+        try {
+          if (btn.closest('form')) return;
+          if (!isVisible(btn)) return;
+          const text = (btn.textContent || "").trim();
+          if (!navButtonRe.test(text)) return;
+
+          // Walk up to find a container with inputs
+          let container = btn.parentElement;
+          for (let i = 0; i < 6; i++) {
+            if (!container) break;
+            if (container.closest('form')) break;
+            const inputs = container.querySelectorAll(
+              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+            );
+            const visibleInputs = Array.from(inputs).filter(isVisible);
+            if (visibleInputs.length >= 2) {
+              wizardRoots.add(container);
+              break;
+            }
+            container = container.parentElement;
+          }
+        } catch {}
+      });
+
+      // Extract fields from each wizard root
+      for (const root of wizardRoots) {
+        const fields = [];
+        root.querySelectorAll(
+          'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+        ).forEach(input => {
+          if (!isVisible(input)) return;
+
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const placeholder = input.getAttribute("placeholder") || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            placeholder,
+            required,
+            autocomplete: input.getAttribute("autocomplete") || "",
+            aria_label: input.getAttribute("aria-label") || "",
+            aria_describedby: input.getAttribute("aria-describedby") || "",
+            selector_candidates: selectorCandidates(input),
+          });
+        });
+
+        if (fields.length === 0) continue;
+
+        // Detect step indicators text
+        const stepIndicators = [];
+        root.querySelectorAll(
+          '[class*="step"], [data-step], [class*="progress"]'
+        ).forEach(el => {
+          const t = (el.textContent || "").trim().slice(0, 80);
+          if (t && t.length > 1 && t.length < 80) stepIndicators.push(t);
+        });
+
+        // Find submit/next buttons
+        const submitCandidates = [];
+        root.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
+          if (!isVisible(btn)) return;
+          const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
+          if (!text) return;
+          submitCandidates.push({
+            text,
+            selector_candidates: selectorCandidates(btn),
+          });
+        });
+
+        const bestSubmit =
+          submitCandidates.find(b => /изпрати|send|submit|запази|напред|next|резерв|book/i.test(b.text)) ||
+          submitCandidates[0] ||
+          null;
+
+        // Detect total steps from text like "Стъпка 1 от 6" or "Step 1/6"
+        const rootText = (root.textContent || "").slice(0, 500);
+        const stepsMatch = rootText.match(/(?:стъпка|step)\s*\d+\s*(?:от|of|\/)\s*(\d+)/i);
+        const totalSteps = stepsMatch ? parseInt(stepsMatch[1], 10) : null;
+
+        let dom_snapshot = "";
+        try {
+          dom_snapshot = (root.outerHTML || "").slice(0, 4000);
+        } catch {}
+
+        wizards.push({
+          kind: "wizard",
+          schema: {
+            fields,
+            submit: bestSubmit,
+            is_multi_step: true,
+            total_steps: totalSteps,
+            step_indicators: [...new Set(stepIndicators)].slice(0, 10),
+            action: "",
+            method: "post",
+          },
+          dom_snapshot,
+        });
+      }
+    } catch (e) {
+      // wizard detection is best-effort, never crash
+    }
+
     return {
       url: window.location.href,
       forms,
+      wizards,
       iframes,
       availability,
     };
@@ -983,9 +1193,11 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     const domain = normalizeDomain(url || baseOrigin || "");
 
     const pushCap = (kind, schema, dom_snapshot) => {
-      const normalized = { url, domain, kind, schema };
+      // ✅ FIX: fingerprint based ONLY on kind + schema (not url)
+      // Same form on 15 pages → single fingerprint → single capability
+      const normalized = { kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
-      const key = `${url}|${kind}|${fp}`;
+      const key = `${kind}|${fp}`;
       if (seen.has(key)) return;
       seen.add(key);
 
@@ -1001,6 +1213,9 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
 
     for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
 
+    // ✅ NEW: Process wizard capabilities
+    for (const w of p.wizards || []) pushCap("wizard", w.schema, w.dom_snapshot);
+
     for (const w of p.iframes || []) {
       const src = w.schema?.src || "";
       pushCap("booking_widget", { ...w.schema, vendor: guessVendorFromText(src) });
@@ -1009,12 +1224,14 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     for (const a of p.availability || []) pushCap("availability", a.schema);
   }
 
-  const forms = combined.filter(c => c.kind === "form").slice(0, 40);
-  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 30);
-  const avail = combined.filter(c => c.kind === "availability").slice(0, 30);
-  const other = combined.filter(c => !["form","booking_widget","availability"].includes(c.kind)).slice(0, 20);
+  // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
+  const forms = combined.filter(c => c.kind === "form").slice(0, 8);
+  const wizards = combined.filter(c => c.kind === "wizard").slice(0, 5);
+  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 5);
+  const avail = combined.filter(c => c.kind === "availability").slice(0, 5);
+  const other = combined.filter(c => !["form","wizard","booking_widget","availability"].includes(c.kind)).slice(0, 10);
 
-  return [...forms, ...widgets, ...avail, ...other];
+  return [...forms, ...wizards, ...widgets, ...avail, ...other];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1329,9 +1546,9 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
     try {
       const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
         capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
       }
     } catch (e) {
       console.error("[CAPS] Extract error:", e.message);
@@ -1527,7 +1744,7 @@ async function crawlSmart(startUrl, siteId = null) {
   let combinedCapabilities = [];
   if (capabilitiesMaps.length > 0) {
     combinedCapabilities = buildCombinedCapabilities(capabilitiesMaps, base);
-    console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/widgets/availability)`);
+    console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/wizards/widgets/availability)`);
   }
 
   const contacts = {
