@@ -815,6 +815,147 @@ async function extractCapabilitiesFromPage(page) {
 
     const selectorCandidates = (el) => {
       const out = [];
+      try { if (el.id) out.push(`#${CSS.escape(el.id)}`); } catch {}
+      try {
+        const name = el.getAttribute("name");
+        if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
+      } catch {}
+      try {
+        const cls = (el.className && typeof el.className === "string")
+          ? el.className.trim().split(/\s+/).filter(Boolean)[0]
+          : "";
+        if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
+      } catch {}
+      return Array.from(new Set(out)).slice(0, 5);
+    };
+
+    const wizards = [];
+
+    const wizardRoots = Array.from(document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]'))
+      .filter(el => isVisible(el) && !el.closest("form"));
+
+    for (const root of wizardRoots) {
+
+      const fields = [];
+      const choices = [];
+
+      // ================= NORMAL INPUTS =================
+      root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea')
+        .forEach(input => {
+          if (!isVisible(input)) return;
+
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
+
+          // RADIO = CHOICE
+          if (type === "radio") {
+            const groupName = name || label;
+            let group = choices.find(c => c.name === groupName);
+            if (!group) {
+              group = {
+                name: groupName,
+                label,
+                required,
+                type: "radio",
+                options: []
+              };
+              choices.push(group);
+            }
+
+            group.options.push({
+              value: input.value || label,
+              label: getLabel(input) || input.value,
+              selector_candidates: selectorCandidates(input)
+            });
+
+            return;
+          }
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            required,
+            selector_candidates: selectorCandidates(input),
+          });
+        });
+
+      // ================= BUTTON CHOICES =================
+      root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button')
+        .forEach(btn => {
+          if (!isVisible(btn)) return;
+
+          const text = (btn.textContent || "").trim();
+          if (!text || text.length < 2) return;
+
+          const parentLabel = getLabel(btn.parentElement) || "";
+          const groupName = parentLabel || "button_group";
+
+          let group = choices.find(c => c.name === groupName);
+          if (!group) {
+            group = {
+              name: groupName,
+              label: parentLabel,
+              required: false,
+              type: "button_group",
+              options: []
+            };
+            choices.push(group);
+          }
+
+          group.options.push({
+            value: text,
+            label: text,
+            selector_candidates: selectorCandidates(btn)
+          });
+        });
+
+      if (fields.length === 0 && choices.length === 0) continue;
+
+      wizards.push({
+        kind: "wizard",
+        schema: {
+          fields,
+          choices,
+          is_multi_step: true,
+        }
+      });
+    }
+
+    return {
+      url: window.location.href,
+      forms: [],
+      wizards,
+      iframes: [],
+      availability: []
+    };
+  });
+}
+
+    const getLabel = (el) => {
+      const id = el.id;
+      if (id) {
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (label) return label.textContent?.trim() || "";
+      }
+      const parent = el.closest("label");
+      if (parent) return parent.textContent?.trim() || "";
+      const aria = el.getAttribute("aria-label");
+      if (aria) return aria.trim();
+      const prev = el.previousElementSibling;
+      if (prev?.tagName === "LABEL") return prev.textContent?.trim() || "";
+      return "";
+    };
+
+    const selectorCandidates = (el) => {
+      const out = [];
       try {
         if (el.id) out.push(`#${CSS.escape(el.id)}`);
       } catch {}
