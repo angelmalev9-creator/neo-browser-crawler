@@ -815,10 +815,24 @@ async function extractCapabilitiesFromPage(page) {
 
     const selectorCandidates = (el) => {
       const out = [];
-      try { if (el.id) out.push(`#${CSS.escape(el.id)}`); } catch {}
+      try {
+        if (el.id) out.push(`#${CSS.escape(el.id)}`);
+      } catch {}
       try {
         const name = el.getAttribute("name");
         if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
+      } catch {}
+      try {
+        const type = el.getAttribute("type");
+        if (type) out.push(`${el.tagName.toLowerCase()}[type="${CSS.escape(type)}"]`);
+      } catch {}
+      try {
+        const ph = el.getAttribute("placeholder");
+        if (ph && ph.length >= 2) out.push(`${el.tagName.toLowerCase()}[placeholder*="${ph.slice(0, 12).replace(/"/g, "")}"]`);
+      } catch {}
+      try {
+        const ac = el.getAttribute("autocomplete");
+        if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
       } catch {}
       try {
         const cls = (el.className && typeof el.className === "string")
@@ -826,115 +840,463 @@ async function extractCapabilitiesFromPage(page) {
           : "";
         if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
       } catch {}
-      return Array.from(new Set(out)).slice(0, 5);
+      return Array.from(new Set(out)).slice(0, 6);
     };
 
-    const wizards = [];
-
-    const wizardRoots = Array.from(document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]'))
-      .filter(el => isVisible(el) && !el.closest("form"));
-
-    for (const root of wizardRoots) {
-
-      const fields = [];
+    // ═══════════════════════════════════════════════════════════
+    // Helper: extract radio choices + button-group choices from
+    // any container (used for both <form> and wizard roots)
+    // ═══════════════════════════════════════════════════════════
+    const extractChoices = (root) => {
       const choices = [];
 
-      // ================= NORMAL INPUTS =================
-      root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea')
-        .forEach(input => {
+      // ---- RADIO GROUPS ----
+      root.querySelectorAll('input[type="radio"]').forEach(input => {
+        if (!isVisible(input)) return;
+        const name = input.getAttribute("name") || input.id || "";
+        const label = getLabel(input);
+        const groupName = name || label;
+        const required =
+          input.hasAttribute("required") ||
+          input.getAttribute("aria-required") === "true" ||
+          (label && /(\*|задължително|required)/i.test(label));
+
+        let group = choices.find(c => c.name === groupName && c.type === "radio");
+        if (!group) {
+          group = {
+            name: groupName,
+            label: getLabel(input.closest("[role='radiogroup']") || input.parentElement) || label,
+            required,
+            type: "radio",
+            options: []
+          };
+          choices.push(group);
+        }
+
+        group.options.push({
+          value: input.value || label,
+          label: getLabel(input) || input.value,
+          selector_candidates: selectorCandidates(input)
+        });
+      });
+
+      // ---- BUTTON GROUPS (aria-pressed, role=radio, segmented) ----
+      root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button').forEach(btn => {
+        if (!isVisible(btn)) return;
+
+        const text = (btn.textContent || "").trim();
+        if (!text || text.length < 2) return;
+
+        const parentLabel = getLabel(btn.parentElement) || "";
+        const groupName = parentLabel || "button_group";
+
+        let group = choices.find(c => c.name === groupName && c.type === "button_group");
+        if (!group) {
+          group = {
+            name: groupName,
+            label: parentLabel,
+            required: false,
+            type: "button_group",
+            options: []
+          };
+          choices.push(group);
+        }
+
+        group.options.push({
+          value: text,
+          label: text,
+          selector_candidates: selectorCandidates(btn)
+        });
+      });
+
+      // ---- SELECT OPTIONS (capture <select> options as choices) ----
+      root.querySelectorAll("select").forEach(sel => {
+        if (!isVisible(sel)) return;
+        const name = sel.getAttribute("name") || sel.id || "";
+        const label = getLabel(sel);
+        const required =
+          sel.hasAttribute("required") ||
+          sel.getAttribute("aria-required") === "true";
+
+        const options = [];
+        sel.querySelectorAll("option").forEach(opt => {
+          const val = opt.value;
+          const text = (opt.textContent || "").trim();
+          // skip empty/placeholder options
+          if (!val && !text) return;
+          if (/^(--|изберете|избери|select|choose)/i.test(text) && !val) return;
+          options.push({
+            value: val,
+            label: text,
+            selector_candidates: [] // options don't need selectors, parent select does
+          });
+        });
+
+        if (options.length > 0) {
+          choices.push({
+            name: name || label,
+            label,
+            required,
+            type: "select",
+            options,
+            selector_candidates: selectorCandidates(sel)
+          });
+        }
+      });
+
+      return choices;
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // FORMS EXTRACTION (original + enriched with choices)
+    // ═══════════════════════════════════════════════════════════
+    const forms = [];
+    document.querySelectorAll("form").forEach((form) => {
+      if (!isVisible(form)) return;
+
+      const fields = [];
+      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
+        .forEach((input) => {
           if (!isVisible(input)) return;
 
           const tag = input.tagName.toLowerCase();
           const type = (input.getAttribute("type") || tag).toLowerCase();
           const name = input.getAttribute("name") || input.id || "";
+          const placeholder = input.getAttribute("placeholder") || "";
           const label = getLabel(input);
           const required =
             input.hasAttribute("required") ||
             input.getAttribute("aria-required") === "true" ||
             (label && /(\*|задължително|required)/i.test(label));
 
-          // RADIO = CHOICE
-          if (type === "radio") {
-            const groupName = name || label;
-            let group = choices.find(c => c.name === groupName);
-            if (!group) {
-              group = {
-                name: groupName,
-                label,
-                required,
-                type: "radio",
-                options: []
-              };
-              choices.push(group);
-            }
+          const autocomplete = input.getAttribute("autocomplete") || "";
+          const ariaLabel = input.getAttribute("aria-label") || "";
+          const ariaDesc = input.getAttribute("aria-describedby") || "";
 
-            group.options.push({
-              value: input.value || label,
-              label: getLabel(input) || input.value,
-              selector_candidates: selectorCandidates(input)
-            });
-
-            return;
-          }
+          // Skip radios from fields array (they go into choices)
+          if (type === "radio") return;
 
           fields.push({
             tag,
             type,
             name,
             label,
+            placeholder,
             required,
+            autocomplete,
+            aria_label: ariaLabel,
+            aria_describedby: ariaDesc,
             selector_candidates: selectorCandidates(input),
           });
         });
 
-      // ================= BUTTON CHOICES =================
-      root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button')
-        .forEach(btn => {
-          if (!isVisible(btn)) return;
+      if (fields.length === 0) return;
 
-          const text = (btn.textContent || "").trim();
-          if (!text || text.length < 2) return;
+      // require at least 1 meaningful input (not just buttons/checkboxes)
+      const meaningfulFields = fields.filter(f =>
+        !['hidden','submit','button','reset','image'].includes(f.type)
+      );
+      if (meaningfulFields.length === 0) return;
 
-          const parentLabel = getLabel(btn.parentElement) || "";
-          const groupName = parentLabel || "button_group";
+      // ✅ Extract choices (radio groups, button groups, select options) from form
+      const choices = extractChoices(form);
 
-          let group = choices.find(c => c.name === groupName);
-          if (!group) {
-            group = {
-              name: groupName,
-              label: parentLabel,
-              required: false,
-              type: "button_group",
-              options: []
-            };
-            choices.push(group);
-          }
-
-          group.options.push({
-            value: text,
-            label: text,
-            selector_candidates: selectorCandidates(btn)
-          });
+      const submitCandidates = [];
+      form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
+        if (!isVisible(btn)) return;
+        const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
+        if (!text) return;
+        submitCandidates.push({
+          text,
+          selector_candidates: selectorCandidates(btn),
         });
+      });
 
-      if (fields.length === 0 && choices.length === 0) continue;
+      const bestSubmit =
+        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
+        submitCandidates[0] ||
+        null;
 
-      wizards.push({
-        kind: "wizard",
+      let dom_snapshot = "";
+      try {
+        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
+      } catch {}
+
+      forms.push({
+        kind: "form",
         schema: {
           fields,
           choices,
-          is_multi_step: true,
-        }
+          submit: bestSubmit,
+          action: form.getAttribute("action") || "",
+          method: (form.getAttribute("method") || "get").toLowerCase(),
+        },
+        dom_snapshot,
       });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // IFRAMES EXTRACTION (unchanged)
+    // ═══════════════════════════════════════════════════════════
+    const iframes = [];
+    document.querySelectorAll("iframe").forEach((fr) => {
+      const src = fr.getAttribute("src") || "";
+      if (!src) return;
+      iframes.push({
+        kind: "booking_widget",
+        schema: {
+          src,
+          title: fr.getAttribute("title") || "",
+          name: fr.getAttribute("name") || "",
+        },
+      });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // AVAILABILITY EXTRACTION (unchanged)
+    // ═══════════════════════════════════════════════════════════
+    const availability = [];
+    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
+      .filter(isVisible)
+      .slice(0, 10);
+
+    if (dateInputs.length > 0) {
+      availability.push({
+        kind: "availability",
+        schema: {
+          date_inputs: dateInputs.map(inp => ({
+            name: inp.getAttribute("name") || inp.id || "",
+            label: getLabel(inp),
+            selector_candidates: selectorCandidates(inp),
+            required:
+              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+          })),
+        },
+      });
+    }
+
+    const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
+      .filter(isVisible)
+      .slice(0, 8);
+
+    if (calendarLike.length > 0) {
+      availability.push({
+        kind: "availability",
+        schema: {
+          calendar_containers: calendarLike.map(el => ({
+            selector_candidates: selectorCandidates(el),
+            text_hint: (el.textContent || "").trim().slice(0, 120),
+          })),
+        },
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // WIZARD / MULTI-STEP DETECTION (enriched with choices)
+    // Catches div-based wizards not inside <form>
+    // ═══════════════════════════════════════════════════════════
+    const wizards = [];
+    try {
+      const stepSelectors = [
+        '[class*="step"]',
+        '[class*="wizard"]',
+        '[data-step]',
+        '[class*="multi-step"]',
+        '[class*="multistep"]',
+        '[class*="form-step"]',
+        '[class*="stepper"]',
+      ];
+
+      const stepIndicatorSelectors = [
+        '[class*="step-indicator"]',
+        '[class*="progress-step"]',
+        '[class*="step-nav"]',
+        '[class*="stepper"]',
+        '[class*="step-number"]',
+        '[class*="form-progress"]',
+      ];
+
+      const wizardRoots = new Set();
+
+      // Method 1: Find step containers with inputs
+      for (const sel of stepSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(el => {
+            if (el.closest('form')) return;
+            if (!isVisible(el)) return;
+
+            const root = el.closest(
+              '[class*="wizard"],[class*="step-container"],[class*="form-wrapper"],' +
+              '[class*="multistep"],[class*="multi-step"],[class*="stepper"]'
+            ) || el;
+
+            if (root.closest('form')) return;
+
+            const inputs = root.querySelectorAll(
+              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+            );
+            const visibleInputs = Array.from(inputs).filter(isVisible);
+            if (visibleInputs.length >= 1) {
+              wizardRoots.add(root);
+            }
+          });
+        } catch {}
+      }
+
+      // Method 2: Find step indicators near inputs (not in form)
+      for (const sel of stepIndicatorSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(indicator => {
+            if (indicator.closest('form')) return;
+            if (!isVisible(indicator)) return;
+
+            const parent = indicator.parentElement;
+            if (!parent || parent.closest('form')) return;
+
+            let container = parent;
+            for (let i = 0; i < 5; i++) {
+              if (!container) break;
+              const inputs = container.querySelectorAll(
+                'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+              );
+              const visibleInputs = Array.from(inputs).filter(isVisible);
+              if (visibleInputs.length >= 1) {
+                wizardRoots.add(container);
+                break;
+              }
+              container = container.parentElement;
+            }
+          });
+        } catch {}
+      }
+
+      // Method 3: Navigation buttons (Напред/Назад, Next/Back) near inputs
+      const navButtonRe = /напред|назад|next|back|previous|стъпка|step/i;
+      document.querySelectorAll('button, [role="button"], a[class*="btn"]').forEach(btn => {
+        try {
+          if (btn.closest('form')) return;
+          if (!isVisible(btn)) return;
+          const text = (btn.textContent || "").trim();
+          if (!navButtonRe.test(text)) return;
+
+          let container = btn.parentElement;
+          for (let i = 0; i < 6; i++) {
+            if (!container) break;
+            if (container.closest('form')) break;
+            const inputs = container.querySelectorAll(
+              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+            );
+            const visibleInputs = Array.from(inputs).filter(isVisible);
+            if (visibleInputs.length >= 2) {
+              wizardRoots.add(container);
+              break;
+            }
+            container = container.parentElement;
+          }
+        } catch {}
+      });
+
+      // Extract fields + choices from each wizard root
+      for (const root of wizardRoots) {
+        const fields = [];
+        root.querySelectorAll(
+          'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+        ).forEach(input => {
+          if (!isVisible(input)) return;
+
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const placeholder = input.getAttribute("placeholder") || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
+
+          // Skip radios from fields (they go into choices)
+          if (type === "radio") return;
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            placeholder,
+            required,
+            autocomplete: input.getAttribute("autocomplete") || "",
+            aria_label: input.getAttribute("aria-label") || "",
+            aria_describedby: input.getAttribute("aria-describedby") || "",
+            selector_candidates: selectorCandidates(input),
+          });
+        });
+
+        // ✅ Extract choices (radio groups, button groups, select options) from wizard
+        const choices = extractChoices(root);
+
+        if (fields.length === 0 && choices.length === 0) continue;
+
+        // Detect step indicators text
+        const stepIndicators = [];
+        root.querySelectorAll(
+          '[class*="step"], [data-step], [class*="progress"]'
+        ).forEach(el => {
+          const t = (el.textContent || "").trim().slice(0, 80);
+          if (t && t.length > 1 && t.length < 80) stepIndicators.push(t);
+        });
+
+        // Find submit/next buttons
+        const submitCandidates = [];
+        root.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
+          if (!isVisible(btn)) return;
+          const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
+          if (!text) return;
+          submitCandidates.push({
+            text,
+            selector_candidates: selectorCandidates(btn),
+          });
+        });
+
+        const bestSubmit =
+          submitCandidates.find(b => /изпрати|send|submit|запази|напред|next|резерв|book/i.test(b.text)) ||
+          submitCandidates[0] ||
+          null;
+
+        // Detect total steps from text like "Стъпка 1 от 6" or "Step 1/6"
+        const rootText = (root.textContent || "").slice(0, 500);
+        const stepsMatch = rootText.match(/(?:стъпка|step)\s*\d+\s*(?:от|of|\/)\s*(\d+)/i);
+        const totalSteps = stepsMatch ? parseInt(stepsMatch[1], 10) : null;
+
+        let dom_snapshot = "";
+        try {
+          dom_snapshot = (root.outerHTML || "").slice(0, 4000);
+        } catch {}
+
+        wizards.push({
+          kind: "wizard",
+          schema: {
+            fields,
+            choices,
+            submit: bestSubmit,
+            is_multi_step: true,
+            total_steps: totalSteps,
+            step_indicators: [...new Set(stepIndicators)].slice(0, 10),
+            action: "",
+            method: "post",
+          },
+          dom_snapshot,
+        });
+      }
+    } catch (e) {
+      // wizard detection is best-effort, never crash
     }
 
     return {
       url: window.location.href,
-      forms: [],
+      forms,
       wizards,
-      iframes: [],
-      availability: []
+      iframes,
+      availability,
     };
   });
 }
