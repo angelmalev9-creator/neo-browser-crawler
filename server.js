@@ -909,6 +909,74 @@ async function extractCapabilitiesFromPage(page) {
         });
       });
 
+      // ---- SIBLING BUTTON CHOICES ----
+      // Detect containers that hold 2+ sibling buttons as option choices
+      // (e.g. "Пол *" → [Мъж] [Жена])
+      // Skip nav/submit buttons by filtering short-text, same-level buttons
+      const seenBtnContainers = new Set();
+      root.querySelectorAll("button").forEach(btn => {
+        if (!isVisible(btn)) return;
+        const parent = btn.parentElement;
+        if (!parent || seenBtnContainers.has(parent)) return;
+
+        // Skip if already captured by aria-pressed / role=radio
+        if (btn.hasAttribute("aria-pressed") || btn.getAttribute("role") === "radio") return;
+
+        // Get all sibling buttons in this container
+        const siblingBtns = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
+          .filter(b => isVisible(b));
+
+        // Need at least 2 sibling buttons to form a choice group
+        if (siblingBtns.length < 2) return;
+
+        // Filter out nav/submit-like buttons
+        const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel/i;
+        const optionBtns = siblingBtns.filter(b => {
+          const t = (b.textContent || "").trim();
+          // short text (1-30 chars), not a nav/submit button
+          return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
+        });
+
+        if (optionBtns.length < 2) return;
+
+        seenBtnContainers.add(parent);
+
+        // Find the label for this group — look for preceding label/text
+        let groupLabel = "";
+        const prevSib = parent.previousElementSibling;
+        if (prevSib) {
+          const t = (prevSib.textContent || "").trim();
+          if (t.length >= 2 && t.length <= 60) groupLabel = t;
+        }
+        if (!groupLabel) groupLabel = getLabel(parent) || "";
+
+        const required = /\*|задължително|required/i.test(groupLabel);
+        const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
+        const groupName = cleanLabel || "button_choice";
+
+        // Skip if already captured under same name
+        if (choices.find(c => c.name === groupName)) return;
+
+        const group = {
+          name: groupName,
+          label: cleanLabel,
+          required,
+          type: "button_group",
+          options: []
+        };
+
+        optionBtns.forEach(b => {
+          const text = (b.textContent || "").trim();
+          group.options.push({
+            value: text,
+            label: text,
+            selector_candidates: selectorCandidates(b)
+          });
+        });
+
+        choices.push(group);
+      });
+
       // ---- SELECT OPTIONS (capture <select> options as choices) ----
       root.querySelectorAll("select").forEach(sel => {
         if (!isVisible(sel)) return;
