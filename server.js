@@ -790,12 +790,10 @@ function guessVendorFromText(s = "") {
 
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
-
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
-      return rect.width > 0 &&
-             rect.height > 0 &&
+      return rect.width > 0 && rect.height > 0 &&
              style.display !== "none" &&
              style.visibility !== "hidden";
     };
@@ -831,144 +829,93 @@ async function extractCapabilitiesFromPage(page) {
       return Array.from(new Set(out)).slice(0, 5);
     };
 
-    const forms = [];
     const wizards = [];
-    const iframes = [];
-    const availability = [];
 
-    // ===========================
-    // STANDARD FORMS
-    // ===========================
-
-    document.querySelectorAll("form").forEach((form) => {
-      if (!isVisible(form)) return;
-
-      const fields = [];
-
-      form.querySelectorAll(
-        "input:not([type='hidden']):not([type='submit']), select, textarea"
-      ).forEach((input) => {
-        if (!isVisible(input)) return;
-
-        const tag = input.tagName.toLowerCase();
-        const type = (input.getAttribute("type") || tag).toLowerCase();
-        const name = input.getAttribute("name") || input.id || "";
-        const label = getLabel(input);
-        const required =
-          input.hasAttribute("required") ||
-          input.getAttribute("aria-required") === "true" ||
-          (label && /(\*|задължително|required)/i.test(label));
-
-        fields.push({
-          tag,
-          type,
-          name,
-          label,
-          required,
-          selector_candidates: selectorCandidates(input),
-        });
-      });
-
-      if (fields.length === 0) return;
-
-      forms.push({
-        kind: "form",
-        schema: {
-          fields,
-          action: form.getAttribute("action") || "",
-          method: (form.getAttribute("method") || "post").toLowerCase(),
-        },
-        dom_snapshot: (form.outerHTML || "").slice(0, 4000),
-      });
-    });
-
-    // ===========================
-    // WIZARD / MULTI-STEP (div-based)
-    // ===========================
-
-    const wizardRoots = Array.from(
-      document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]')
-    ).filter(el => isVisible(el) && !el.closest("form"));
+    const wizardRoots = Array.from(document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]'))
+      .filter(el => isVisible(el) && !el.closest("form"));
 
     for (const root of wizardRoots) {
 
       const fields = [];
       const choices = [];
 
-      root.querySelectorAll(
-        'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-      ).forEach(input => {
+      // ================= NORMAL INPUTS =================
+      root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea')
+        .forEach(input => {
+          if (!isVisible(input)) return;
 
-        if (!isVisible(input)) return;
+          const tag = input.tagName.toLowerCase();
+          const type = (input.getAttribute("type") || tag).toLowerCase();
+          const name = input.getAttribute("name") || input.id || "";
+          const label = getLabel(input);
+          const required =
+            input.hasAttribute("required") ||
+            input.getAttribute("aria-required") === "true" ||
+            (label && /(\*|задължително|required)/i.test(label));
 
-        const tag = input.tagName.toLowerCase();
-        const type = (input.getAttribute("type") || tag).toLowerCase();
-        const name = input.getAttribute("name") || input.id || "";
-        const label = getLabel(input);
-        const required =
-          input.hasAttribute("required") ||
-          input.getAttribute("aria-required") === "true" ||
-          (label && /(\*|задължително|required)/i.test(label));
+          // RADIO = CHOICE
+          if (type === "radio") {
+            const groupName = name || label;
+            let group = choices.find(c => c.name === groupName);
+            if (!group) {
+              group = {
+                name: groupName,
+                label,
+                required,
+                type: "radio",
+                options: []
+              };
+              choices.push(group);
+            }
 
-        if (type === "radio") {
-          const groupName = name || label;
+            group.options.push({
+              value: input.value || label,
+              label: getLabel(input) || input.value,
+              selector_candidates: selectorCandidates(input)
+            });
+
+            return;
+          }
+
+          fields.push({
+            tag,
+            type,
+            name,
+            label,
+            required,
+            selector_candidates: selectorCandidates(input),
+          });
+        });
+
+      // ================= BUTTON CHOICES =================
+      root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button')
+        .forEach(btn => {
+          if (!isVisible(btn)) return;
+
+          const text = (btn.textContent || "").trim();
+          if (!text || text.length < 2) return;
+
+          const parentLabel = getLabel(btn.parentElement) || "";
+          const groupName = parentLabel || "button_group";
+
           let group = choices.find(c => c.name === groupName);
           if (!group) {
             group = {
               name: groupName,
-              label,
-              required,
-              type: "radio",
+              label: parentLabel,
+              required: false,
+              type: "button_group",
               options: []
             };
             choices.push(group);
           }
 
           group.options.push({
-            value: input.value || label,
-            label: getLabel(input) || input.value,
-            selector_candidates: selectorCandidates(input)
+            value: text,
+            label: text,
+            selector_candidates: selectorCandidates(btn)
           });
-
-          return;
-        }
-
-        fields.push({
-          tag,
-          type,
-          name,
-          label,
-          required,
-          selector_candidates: selectorCandidates(input),
         });
-      });
-
-      root.querySelectorAll(
-        'button[aria-pressed], [role="radio"], .segmented button'
-      ).forEach(btn => {
-        if (!isVisible(btn)) return;
-
-        const text = (btn.textContent || "").trim();
-        if (!text || text.length < 2) return;
-
-        let group = choices.find(c => c.name === "button_group");
-        if (!group) {
-          group = {
-            name: "button_group",
-            label: "",
-            required: false,
-            type: "button_group",
-            options: []
-          };
-          choices.push(group);
-        }
-
-        group.options.push({
-          value: text,
-          label: text,
-          selector_candidates: selectorCandidates(btn)
-        });
-      });
 
       if (fields.length === 0 && choices.length === 0) continue;
 
@@ -978,17 +925,16 @@ async function extractCapabilitiesFromPage(page) {
           fields,
           choices,
           is_multi_step: true,
-        },
-        dom_snapshot: (root.outerHTML || "").slice(0, 4000),
+        }
       });
     }
 
     return {
       url: window.location.href,
-      forms,
+      forms: [],
       wizards,
-      iframes,
-      availability,
+      iframes: [],
+      availability: []
     };
   });
 }
