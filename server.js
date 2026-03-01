@@ -790,10 +790,12 @@ function guessVendorFromText(s = "") {
 
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
+
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 &&
+      return rect.width > 0 &&
+             rect.height > 0 &&
              style.display !== "none" &&
              style.visibility !== "hidden";
     };
@@ -829,93 +831,144 @@ async function extractCapabilitiesFromPage(page) {
       return Array.from(new Set(out)).slice(0, 5);
     };
 
+    const forms = [];
     const wizards = [];
+    const iframes = [];
+    const availability = [];
 
-    const wizardRoots = Array.from(document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]'))
-      .filter(el => isVisible(el) && !el.closest("form"));
+    // ===========================
+    // STANDARD FORMS
+    // ===========================
+
+    document.querySelectorAll("form").forEach((form) => {
+      if (!isVisible(form)) return;
+
+      const fields = [];
+
+      form.querySelectorAll(
+        "input:not([type='hidden']):not([type='submit']), select, textarea"
+      ).forEach((input) => {
+        if (!isVisible(input)) return;
+
+        const tag = input.tagName.toLowerCase();
+        const type = (input.getAttribute("type") || tag).toLowerCase();
+        const name = input.getAttribute("name") || input.id || "";
+        const label = getLabel(input);
+        const required =
+          input.hasAttribute("required") ||
+          input.getAttribute("aria-required") === "true" ||
+          (label && /(\*|задължително|required)/i.test(label));
+
+        fields.push({
+          tag,
+          type,
+          name,
+          label,
+          required,
+          selector_candidates: selectorCandidates(input),
+        });
+      });
+
+      if (fields.length === 0) return;
+
+      forms.push({
+        kind: "form",
+        schema: {
+          fields,
+          action: form.getAttribute("action") || "",
+          method: (form.getAttribute("method") || "post").toLowerCase(),
+        },
+        dom_snapshot: (form.outerHTML || "").slice(0, 4000),
+      });
+    });
+
+    // ===========================
+    // WIZARD / MULTI-STEP (div-based)
+    // ===========================
+
+    const wizardRoots = Array.from(
+      document.querySelectorAll('[class*="step"],[class*="wizard"],[class*="multistep"]')
+    ).filter(el => isVisible(el) && !el.closest("form"));
 
     for (const root of wizardRoots) {
 
       const fields = [];
       const choices = [];
 
-      // ================= NORMAL INPUTS =================
-      root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea')
-        .forEach(input => {
-          if (!isVisible(input)) return;
+      root.querySelectorAll(
+        'input:not([type="hidden"]):not([type="submit"]), select, textarea'
+      ).forEach(input => {
 
-          const tag = input.tagName.toLowerCase();
-          const type = (input.getAttribute("type") || tag).toLowerCase();
-          const name = input.getAttribute("name") || input.id || "";
-          const label = getLabel(input);
-          const required =
-            input.hasAttribute("required") ||
-            input.getAttribute("aria-required") === "true" ||
-            (label && /(\*|задължително|required)/i.test(label));
+        if (!isVisible(input)) return;
 
-          // RADIO = CHOICE
-          if (type === "radio") {
-            const groupName = name || label;
-            let group = choices.find(c => c.name === groupName);
-            if (!group) {
-              group = {
-                name: groupName,
-                label,
-                required,
-                type: "radio",
-                options: []
-              };
-              choices.push(group);
-            }
+        const tag = input.tagName.toLowerCase();
+        const type = (input.getAttribute("type") || tag).toLowerCase();
+        const name = input.getAttribute("name") || input.id || "";
+        const label = getLabel(input);
+        const required =
+          input.hasAttribute("required") ||
+          input.getAttribute("aria-required") === "true" ||
+          (label && /(\*|задължително|required)/i.test(label));
 
-            group.options.push({
-              value: input.value || label,
-              label: getLabel(input) || input.value,
-              selector_candidates: selectorCandidates(input)
-            });
-
-            return;
-          }
-
-          fields.push({
-            tag,
-            type,
-            name,
-            label,
-            required,
-            selector_candidates: selectorCandidates(input),
-          });
-        });
-
-      // ================= BUTTON CHOICES =================
-      root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button')
-        .forEach(btn => {
-          if (!isVisible(btn)) return;
-
-          const text = (btn.textContent || "").trim();
-          if (!text || text.length < 2) return;
-
-          const parentLabel = getLabel(btn.parentElement) || "";
-          const groupName = parentLabel || "button_group";
-
+        if (type === "radio") {
+          const groupName = name || label;
           let group = choices.find(c => c.name === groupName);
           if (!group) {
             group = {
               name: groupName,
-              label: parentLabel,
-              required: false,
-              type: "button_group",
+              label,
+              required,
+              type: "radio",
               options: []
             };
             choices.push(group);
           }
 
           group.options.push({
-            value: text,
-            label: text,
-            selector_candidates: selectorCandidates(btn)
+            value: input.value || label,
+            label: getLabel(input) || input.value,
+            selector_candidates: selectorCandidates(input)
           });
+
+          return;
+        }
+
+        fields.push({
+          tag,
+          type,
+          name,
+          label,
+          required,
+          selector_candidates: selectorCandidates(input),
         });
+      });
+
+      root.querySelectorAll(
+        'button[aria-pressed], [role="radio"], .segmented button'
+      ).forEach(btn => {
+        if (!isVisible(btn)) return;
+
+        const text = (btn.textContent || "").trim();
+        if (!text || text.length < 2) return;
+
+        let group = choices.find(c => c.name === "button_group");
+        if (!group) {
+          group = {
+            name: "button_group",
+            label: "",
+            required: false,
+            type: "button_group",
+            options: []
+          };
+          choices.push(group);
+        }
+
+        group.options.push({
+          value: text,
+          label: text,
+          selector_candidates: selectorCandidates(btn)
+        });
+      });
 
       if (fields.length === 0 && choices.length === 0) continue;
 
@@ -925,394 +978,9 @@ async function extractCapabilitiesFromPage(page) {
           fields,
           choices,
           is_multi_step: true,
-        }
-      });
-    }
-
-    return {
-      url: window.location.href,
-      forms: [],
-      wizards,
-      iframes: [],
-      availability: []
-    };
-  });
-}
-
-    const getLabel = (el) => {
-      const id = el.id;
-      if (id) {
-        const label = document.querySelector(`label[for="${id}"]`);
-        if (label) return label.textContent?.trim() || "";
-      }
-      const parent = el.closest("label");
-      if (parent) return parent.textContent?.trim() || "";
-      const aria = el.getAttribute("aria-label");
-      if (aria) return aria.trim();
-      const prev = el.previousElementSibling;
-      if (prev?.tagName === "LABEL") return prev.textContent?.trim() || "";
-      return "";
-    };
-
-    const selectorCandidates = (el) => {
-      const out = [];
-      try {
-        if (el.id) out.push(`#${CSS.escape(el.id)}`);
-      } catch {}
-      try {
-        const name = el.getAttribute("name");
-        if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
-      } catch {}
-      try {
-        const type = el.getAttribute("type");
-        if (type) out.push(`${el.tagName.toLowerCase()}[type="${CSS.escape(type)}"]`);
-      } catch {}
-      try {
-        const ph = el.getAttribute("placeholder");
-        if (ph && ph.length >= 2) out.push(`${el.tagName.toLowerCase()}[placeholder*="${ph.slice(0, 12).replace(/"/g, "")}"]`);
-      } catch {}
-      try {
-        const ac = el.getAttribute("autocomplete");
-        if (ac) out.push(`${el.tagName.toLowerCase()}[autocomplete="${CSS.escape(ac)}"]`);
-      } catch {}
-      try {
-        const cls = (el.className && typeof el.className === "string")
-          ? el.className.trim().split(/\s+/).filter(Boolean)[0]
-          : "";
-        if (cls) out.push(`${el.tagName.toLowerCase()}.${cls}`);
-      } catch {}
-      return Array.from(new Set(out)).slice(0, 6);
-    };
-
-    const forms = [];
-    document.querySelectorAll("form").forEach((form) => {
-      if (!isVisible(form)) return;
-
-      const fields = [];
-      form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
-        .forEach((input) => {
-          if (!isVisible(input)) return;
-
-          const tag = input.tagName.toLowerCase();
-          const type = (input.getAttribute("type") || tag).toLowerCase();
-          const name = input.getAttribute("name") || input.id || "";
-          const placeholder = input.getAttribute("placeholder") || "";
-          const label = getLabel(input);
-          const required =
-            input.hasAttribute("required") ||
-            input.getAttribute("aria-required") === "true" ||
-            (label && /(\*|задължително|required)/i.test(label));
-
-          const autocomplete = input.getAttribute("autocomplete") || "";
-          const ariaLabel = input.getAttribute("aria-label") || "";
-          const ariaDesc = input.getAttribute("aria-describedby") || "";
-
-          fields.push({
-            tag,
-            type,
-            name,
-            label,
-            placeholder,
-            required,
-            autocomplete,
-            aria_label: ariaLabel,
-            aria_describedby: ariaDesc,
-            selector_candidates: selectorCandidates(input),
-          });
-        });
-
-      if (fields.length === 0) return;
-
-      // ✅ NEW: require at least 1 meaningful input (not just buttons/checkboxes)
-      const meaningfulFields = fields.filter(f =>
-        !['hidden','submit','button','reset','image'].includes(f.type)
-      );
-      if (meaningfulFields.length === 0) return;
-
-      const submitCandidates = [];
-      form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
-        if (!isVisible(btn)) return;
-        const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
-        if (!text) return;
-        submitCandidates.push({
-          text,
-          selector_candidates: selectorCandidates(btn),
-        });
-      });
-
-      const bestSubmit =
-        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
-        submitCandidates[0] ||
-        null;
-
-      let dom_snapshot = "";
-      try {
-        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
-      } catch {}
-
-      forms.push({
-        kind: "form",
-        schema: {
-          fields,
-          submit: bestSubmit,
-          action: form.getAttribute("action") || "",
-          method: (form.getAttribute("method") || "get").toLowerCase(),
         },
-        dom_snapshot,
+        dom_snapshot: (root.outerHTML || "").slice(0, 4000),
       });
-    });
-
-    const iframes = [];
-    document.querySelectorAll("iframe").forEach((fr) => {
-      const src = fr.getAttribute("src") || "";
-      if (!src) return;
-      iframes.push({
-        kind: "booking_widget",
-        schema: {
-          src,
-          title: fr.getAttribute("title") || "",
-          name: fr.getAttribute("name") || "",
-        },
-      });
-    });
-
-    const availability = [];
-    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
-      .filter(isVisible)
-      .slice(0, 10);
-
-    if (dateInputs.length > 0) {
-      availability.push({
-        kind: "availability",
-        schema: {
-          date_inputs: dateInputs.map(inp => ({
-            name: inp.getAttribute("name") || inp.id || "",
-            label: getLabel(inp),
-            selector_candidates: selectorCandidates(inp),
-            required:
-              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
-          })),
-        },
-      });
-    }
-
-    const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
-      .filter(isVisible)
-      .slice(0, 8);
-
-    if (calendarLike.length > 0) {
-      availability.push({
-        kind: "availability",
-        schema: {
-          calendar_containers: calendarLike.map(el => ({
-            selector_candidates: selectorCandidates(el),
-            text_hint: (el.textContent || "").trim().slice(0, 120),
-          })),
-        },
-      });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // ✅ NEW: Detect wizard/multi-step forms (div-based, not <form>)
-    // Catches forms like DentaSay's 6-step wizard with step indicators
-    // ═══════════════════════════════════════════════════════════
-    const wizards = [];
-    try {
-      // Strategy: find containers with step indicators that contain inputs
-      // but are NOT inside a <form> tag
-      const stepSelectors = [
-        '[class*="step"]',
-        '[class*="wizard"]',
-        '[data-step]',
-        '[class*="multi-step"]',
-        '[class*="multistep"]',
-        '[class*="form-step"]',
-        '[class*="stepper"]',
-      ];
-
-      // Also detect step indicators (progress bars, step numbers)
-      const stepIndicatorSelectors = [
-        '[class*="step-indicator"]',
-        '[class*="progress-step"]',
-        '[class*="step-nav"]',
-        '[class*="stepper"]',
-        '[class*="step-number"]',
-        '[class*="form-progress"]',
-      ];
-
-      const wizardRoots = new Set();
-
-      // Method 1: Find step containers with inputs
-      for (const sel of stepSelectors) {
-        try {
-          document.querySelectorAll(sel).forEach(el => {
-            // Skip if inside a <form> (already captured by form extraction)
-            if (el.closest('form')) return;
-            if (!isVisible(el)) return;
-
-            // Look for the outermost wizard container
-            const root = el.closest(
-              '[class*="wizard"],[class*="step-container"],[class*="form-wrapper"],' +
-              '[class*="multistep"],[class*="multi-step"],[class*="stepper"]'
-            ) || el;
-
-            if (root.closest('form')) return;
-
-            // Must have visible inputs inside
-            const inputs = root.querySelectorAll(
-              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-            );
-            const visibleInputs = Array.from(inputs).filter(isVisible);
-            if (visibleInputs.length >= 1) {
-              wizardRoots.add(root);
-            }
-          });
-        } catch {}
-      }
-
-      // Method 2: Find step indicators near inputs (not in form)
-      for (const sel of stepIndicatorSelectors) {
-        try {
-          document.querySelectorAll(sel).forEach(indicator => {
-            if (indicator.closest('form')) return;
-            if (!isVisible(indicator)) return;
-
-            // The wizard is likely a parent/sibling container
-            const parent = indicator.parentElement;
-            if (!parent || parent.closest('form')) return;
-
-            // Walk up to find a container with inputs
-            let container = parent;
-            for (let i = 0; i < 5; i++) {
-              if (!container) break;
-              const inputs = container.querySelectorAll(
-                'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-              );
-              const visibleInputs = Array.from(inputs).filter(isVisible);
-              if (visibleInputs.length >= 1) {
-                wizardRoots.add(container);
-                break;
-              }
-              container = container.parentElement;
-            }
-          });
-        } catch {}
-      }
-
-      // Method 3: Look for navigation buttons (Напред/Назад, Next/Back)
-      // near input fields, not inside <form>
-      const navButtonRe = /напред|назад|next|back|previous|стъпка|step/i;
-      document.querySelectorAll('button, [role="button"], a[class*="btn"]').forEach(btn => {
-        try {
-          if (btn.closest('form')) return;
-          if (!isVisible(btn)) return;
-          const text = (btn.textContent || "").trim();
-          if (!navButtonRe.test(text)) return;
-
-          // Walk up to find a container with inputs
-          let container = btn.parentElement;
-          for (let i = 0; i < 6; i++) {
-            if (!container) break;
-            if (container.closest('form')) break;
-            const inputs = container.querySelectorAll(
-              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-            );
-            const visibleInputs = Array.from(inputs).filter(isVisible);
-            if (visibleInputs.length >= 2) {
-              wizardRoots.add(container);
-              break;
-            }
-            container = container.parentElement;
-          }
-        } catch {}
-      });
-
-      // Extract fields from each wizard root
-      for (const root of wizardRoots) {
-        const fields = [];
-        root.querySelectorAll(
-          'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-        ).forEach(input => {
-          if (!isVisible(input)) return;
-
-          const tag = input.tagName.toLowerCase();
-          const type = (input.getAttribute("type") || tag).toLowerCase();
-          const name = input.getAttribute("name") || input.id || "";
-          const placeholder = input.getAttribute("placeholder") || "";
-          const label = getLabel(input);
-          const required =
-            input.hasAttribute("required") ||
-            input.getAttribute("aria-required") === "true" ||
-            (label && /(\*|задължително|required)/i.test(label));
-
-          fields.push({
-            tag,
-            type,
-            name,
-            label,
-            placeholder,
-            required,
-            autocomplete: input.getAttribute("autocomplete") || "",
-            aria_label: input.getAttribute("aria-label") || "",
-            aria_describedby: input.getAttribute("aria-describedby") || "",
-            selector_candidates: selectorCandidates(input),
-          });
-        });
-
-        if (fields.length === 0) continue;
-
-        // Detect step indicators text
-        const stepIndicators = [];
-        root.querySelectorAll(
-          '[class*="step"], [data-step], [class*="progress"]'
-        ).forEach(el => {
-          const t = (el.textContent || "").trim().slice(0, 80);
-          if (t && t.length > 1 && t.length < 80) stepIndicators.push(t);
-        });
-
-        // Find submit/next buttons
-        const submitCandidates = [];
-        root.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
-          if (!isVisible(btn)) return;
-          const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
-          if (!text) return;
-          submitCandidates.push({
-            text,
-            selector_candidates: selectorCandidates(btn),
-          });
-        });
-
-        const bestSubmit =
-          submitCandidates.find(b => /изпрати|send|submit|запази|напред|next|резерв|book/i.test(b.text)) ||
-          submitCandidates[0] ||
-          null;
-
-        // Detect total steps from text like "Стъпка 1 от 6" or "Step 1/6"
-        const rootText = (root.textContent || "").slice(0, 500);
-        const stepsMatch = rootText.match(/(?:стъпка|step)\s*\d+\s*(?:от|of|\/)\s*(\d+)/i);
-        const totalSteps = stepsMatch ? parseInt(stepsMatch[1], 10) : null;
-
-        let dom_snapshot = "";
-        try {
-          dom_snapshot = (root.outerHTML || "").slice(0, 4000);
-        } catch {}
-
-        wizards.push({
-          kind: "wizard",
-          schema: {
-            fields,
-            submit: bestSubmit,
-            is_multi_step: true,
-            total_steps: totalSteps,
-            step_indicators: [...new Set(stepIndicators)].slice(0, 10),
-            action: "",
-            method: "post",
-          },
-          dom_snapshot,
-        });
-      }
-    } catch (e) {
-      // wizard detection is best-effort, never crash
     }
 
     return {
