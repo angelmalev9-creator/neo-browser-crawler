@@ -23,8 +23,8 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 2;
-const PARALLEL_OCR = 5;
+const PARALLEL_TABS = 5;
+const PARALLEL_OCR = 10;
 const OCR_TIMEOUT_MS = 6000;
 
 const SKIP_URL_RE =
@@ -1839,7 +1839,7 @@ async function crawlSmart(startUrl, siteId = null) {
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: 30000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
