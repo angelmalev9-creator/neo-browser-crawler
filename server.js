@@ -23,9 +23,9 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 10; // ⚡ was 5
+const PARALLEL_TABS = 5;
 const PARALLEL_OCR = 10;
-const OCR_TIMEOUT_MS = 3000; // ⚡ was 6000
+const OCR_TIMEOUT_MS = 6000;
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -577,7 +577,7 @@ async function saveSiteMapToSupabase(siteMap) {
 }
 
 // Send SiteMap to Worker to prepare hot session
-async function sendSiteMapToWorker(siteMap, capabilities = []) {
+async function sendSiteMapToWorker(siteMap) {
   if (!WORKER_URL || !WORKER_SECRET) {
     console.log("[SITEMAP] Worker not configured, skipping");
     return false;
@@ -589,8 +589,6 @@ async function sendSiteMapToWorker(siteMap, capabilities = []) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
-    // ⚡ Send both siteMap (buttons/forms/prices) AND capabilities (full field schemas)
-    // Worker uses capabilities to fill forms deterministically without guessing selectors
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
       headers: {
@@ -600,7 +598,6 @@ async function sendSiteMapToWorker(siteMap, capabilities = []) {
       body: JSON.stringify({
         site_id: siteMap.site_id,
         site_map: siteMap,
-        capabilities, // ⚡ NEW: full form schemas with selector_candidates
       }),
       signal: controller.signal,
     });
@@ -618,6 +615,196 @@ async function sendSiteMapToWorker(siteMap, capabilities = []) {
   } catch (error) {
     console.error(`[SITEMAP] ✗ Worker send error:`, error.message);
     return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW: BUTTON CLICK CRAWLING
+// Clicks every clickable button/link that could open a widget, modal or
+// redirect to an external booking/reservation page and captures the result.
+// Handles cross-domain widget redirects (e.g. clock-software, bookero, etc.)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Keywords that indicate a button worth clicking for widget/booking discovery
+const WIDGET_BUTTON_RE = /резерв|запази|запитване|book|reserve|inquiry|contact|контакт|свържи|цени|price|виж|покажи|детайли|повече|more|details|offer|оферт/i;
+
+// Known external widget/booking domains to always crawl even if cross-domain
+const WIDGET_DOMAIN_RE = /clock-software|simplybook|bookero|calendly|cloudbeds|beds24|channelmanager|siteminder|freetobook|eviivo|lodgify|hostaway|guesty|rentlio|smoobu|avvio|travelclick|rezovation|booking\.com\/widget|expedia.*widget/i;
+
+async function crawlButtonDestinations(page, pageUrl, base, externalPagesMap, browser) {
+  // externalPagesMap: Map<url, { url, title, content, source_button_text }>
+  // Already-visited external widget URLs are stored here to avoid re-processing.
+
+  let clickableButtons = [];
+  try {
+    clickableButtons = await page.evaluate((widgetBtnRe) => {
+      const re = new RegExp(widgetBtnRe, "i");
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+      };
+      const results = [];
+      const seen = new Set();
+
+      document.querySelectorAll(
+        'a[href], button, [role="button"], input[type="submit"], input[type="button"], .btn, .button'
+      ).forEach((el) => {
+        if (!isVisible(el)) return;
+        const text = (el.textContent?.trim() || el.value || "").slice(0, 120);
+        if (!text || !re.test(text)) return;
+
+        const href = el.tagName === "A" ? (el.getAttribute("href") || "") : "";
+        const key = text.toLowerCase() + "|" + href;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        results.push({ text, href, tag: el.tagName.toLowerCase() });
+      });
+      return results.slice(0, 25);
+    }, WIDGET_BUTTON_RE.source);
+  } catch (e) {
+    console.error("[BTN_CRAWL] evaluate error:", e.message);
+    return;
+  }
+
+  if (clickableButtons.length === 0) return;
+  console.log(`[BTN_CRAWL] ${clickableButtons.length} buttons to click on ${pageUrl}`);
+
+  for (const btn of clickableButtons) {
+    // If it's a plain anchor with absolute href pointing to external widget domain, fetch directly
+    if (btn.href && btn.href.startsWith("http")) {
+      const targetUrl = btn.href;
+      if (externalPagesMap.has(targetUrl)) continue;
+
+      const isKnownWidget = WIDGET_DOMAIN_RE.test(targetUrl);
+      const isSameDomain = targetUrl.startsWith(base);
+
+      if (!isKnownWidget && !isSameDomain) continue; // skip unrelated external links
+
+      if (isKnownWidget) {
+        console.log(`[BTN_CRAWL] Direct widget URL: ${targetUrl} (from "${btn.text}")`);
+        const widgetContent = await fetchWidgetPage(targetUrl, btn.text, browser);
+        if (widgetContent) externalPagesMap.set(targetUrl, widgetContent);
+        continue;
+      }
+    }
+
+    // For buttons (no href or javascript), click them and observe navigation/new tab
+    try {
+      const newPagePromise = page.context().waitForEvent("page", { timeout: 4000 }).catch(() => null);
+
+      // Re-find the element to click (DOM may have changed)
+      const el = await page.$(`button:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i"), a:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i"), [role="button"]:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i")`).catch(() => null);
+      if (!el) continue;
+
+      // Click and capture any navigation
+      const navigationPromise = page.waitForNavigation({ timeout: 4000, waitUntil: "domcontentloaded" }).catch(() => null);
+      await el.click({ timeout: 3000 }).catch(() => null);
+
+      // Check if a new tab was opened (widget in new window)
+      const newTab = await newPagePromise;
+      if (newTab) {
+        try {
+          await newTab.waitForLoadState("domcontentloaded", { timeout: 5000 });
+          const tabUrl = newTab.url();
+          const tabTitle = await newTab.title().catch(() => "");
+
+          if (!externalPagesMap.has(tabUrl)) {
+            console.log(`[BTN_CRAWL] New tab opened: ${tabUrl} (from "${btn.text}")`);
+            const content = await extractStructured(newTab).catch(() => ({ rawContent: "" }));
+            externalPagesMap.set(tabUrl, {
+              url: tabUrl,
+              title: tabTitle,
+              content: content.rawContent || "",
+              source_button_text: btn.text,
+            });
+          }
+          await newTab.close().catch(() => null);
+        } catch {}
+      }
+
+      // Check for navigation on main page
+      const navResult = await navigationPromise;
+      if (navResult) {
+        const newUrl = page.url();
+        if (newUrl !== pageUrl) {
+          if (!externalPagesMap.has(newUrl) && (WIDGET_DOMAIN_RE.test(newUrl) || !newUrl.startsWith(base))) {
+            console.log(`[BTN_CRAWL] Redirected to: ${newUrl} (from "${btn.text}")`);
+            const title = await page.title().catch(() => "");
+            const content = await extractStructured(page).catch(() => ({ rawContent: "" }));
+            externalPagesMap.set(newUrl, {
+              url: newUrl,
+              title,
+              content: content.rawContent || "",
+              source_button_text: btn.text,
+            });
+          }
+          // Navigate back to original page
+          await page.goto(pageUrl, { timeout: 8000, waitUntil: "domcontentloaded" }).catch(() => null);
+        }
+      }
+
+      // Check for modal/dialog that appeared (in-page widget)
+      try {
+        const modalVisible = await page.evaluate(() => {
+          const modals = document.querySelectorAll('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="overlay"],[class*="popup"]');
+          for (const m of modals) {
+            const r = m.getBoundingClientRect();
+            const s = window.getComputedStyle(m);
+            if (r.width > 100 && r.height > 100 && s.display !== "none" && s.visibility !== "hidden") {
+              // Check for iframes inside (likely widget)
+              const iframe = m.querySelector("iframe");
+              if (iframe) return iframe.src || "modal_with_iframe";
+              return "modal_visible";
+            }
+          }
+          return null;
+        });
+
+        if (modalVisible && modalVisible !== "modal_visible") {
+          // iframe inside modal
+          const iframeSrc = modalVisible;
+          if (!externalPagesMap.has(iframeSrc)) {
+            console.log(`[BTN_CRAWL] Modal iframe: ${iframeSrc} (from "${btn.text}")`);
+            const widgetContent = await fetchWidgetPage(iframeSrc, btn.text, browser);
+            if (widgetContent) externalPagesMap.set(iframeSrc, widgetContent);
+          }
+        }
+        // Close modal
+        await page.keyboard.press("Escape").catch(() => null);
+      } catch {}
+
+    } catch (e) {
+      // best-effort, skip errors per button
+    }
+  }
+}
+
+// Fetch an external widget page (cross-domain) and extract its text content
+async function fetchWidgetPage(url, sourceButtonText, browser) {
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const pg = await ctx.newPage();
+
+    await pg.goto(url, { timeout: 12000, waitUntil: "domcontentloaded" });
+    await pg.waitForTimeout(1500);
+
+    const title = await pg.title().catch(() => "");
+    const content = await extractStructured(pg).catch(() => ({ rawContent: "" }));
+
+    await pg.close().catch(() => null);
+    await ctx.close().catch(() => null);
+
+    return {
+      url,
+      title,
+      content: content.rawContent || "",
+      source_button_text: sourceButtonText,
+    };
+  } catch (e) {
+    console.error(`[BTN_CRAWL] fetchWidgetPage error for ${url}:`, e.message);
+    return null;
   }
 }
 
@@ -1428,6 +1615,10 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
 
 async function extractStructured(page) {
   try {
+    await page.waitForSelector("body", { timeout: 1500 });
+  } catch {}
+
+  try {
     return await page.evaluate(() => {
       const seenTexts = new Set();
 
@@ -1462,8 +1653,46 @@ async function extractStructured(page) {
         processedElements.add(el);
       });
 
-      // ⚡ Removed: pseudo-elements getComputedStyle loop (iterates ALL DOM elements, very slow)
-      // ⚡ Removed: waitForSelector("body") — unnecessary
+      const overlaySelectors = [
+        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
+        '[class*="alert"]', '[style*="position: fixed"]',
+        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
+      ];
+
+      const overlayTexts = [];
+      overlaySelectors.forEach(selector => {
+        try {
+          document.querySelectorAll(selector).forEach(el => {
+            if (processedElements.has(el)) return;
+            const text = el.innerText?.trim();
+            if (!text) return;
+            const uniqueText = addUniqueText(text);
+            if (uniqueText) {
+              overlayTexts.push(uniqueText);
+              processedElements.add(el);
+            }
+          });
+        } catch {}
+      });
+
+      const pseudoTexts = [];
+      try {
+        document.querySelectorAll("*").forEach(el => {
+          const before = window.getComputedStyle(el, "::before").content;
+          const after = window.getComputedStyle(el, "::after").content;
+          if (before && before !== "none" && before !== '""') {
+            const cleaned = before.replace(/^["']|["']$/g, "");
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
+          }
+          if (after && after !== "none" && after !== '""') {
+            const cleaned = after.replace(/^["']|["']$/g, "");
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
+          }
+        });
+      } catch {}
 
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
@@ -1476,6 +1705,8 @@ async function extractStructured(page) {
         rawContent: [
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
+          overlayTexts.join("\n"),
+          pseudoTexts.join(" "),
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -1517,6 +1748,37 @@ async function fastOCR(buffer) {
   } catch { return ""; }
 }
 
+// ================= SMART OCR - pricing images only =================
+// Scores an image element on how likely it contains pricing/package text.
+// Returns true if the image should be OCR-ed.
+async function isPricingRelevantImage(imgInfo) {
+  // Must be visible and reasonable size
+  if (!imgInfo || !imgInfo.visible) return false;
+  if (imgInfo.w < 80 || imgInfo.h < 40) return false;
+  // Skip giant hero/banner images (unlikely pure text cards)
+  if (imgInfo.w > 1800 && imgInfo.h > 900) return false;
+  // Skip obvious non-text images by filename
+  if (SKIP_OCR_RE.test(imgInfo.src)) return false;
+
+  // Positive signals: src/alt contains price-related keywords
+  const hint = (imgInfo.src + " " + imgInfo.alt).toLowerCase();
+  if (/pric|price|cena|ceni|paketi|package|plan|offer|tarif|rate|лв|eur|€/i.test(hint)) return true;
+
+  // Positive signal: image is inside a pricing/package container (checked via contextClass)
+  if (imgInfo.contextClass && /pric|package|plan|card|tier|paketi|offer/i.test(imgInfo.contextClass)) return true;
+
+  // Positive signal: image dimensions look like a pricing card/table (landscape card shape)
+  const ratio = imgInfo.w / imgInfo.h;
+  if (imgInfo.w >= 150 && imgInfo.w <= 1200 && imgInfo.h >= 80 && ratio >= 0.5 && ratio <= 5) {
+    // Medium-sized image that is NOT a portrait photo (likely infographic/card)
+    // Additional guard: skip if alt clearly says photo/background
+    if (/photo|фото|background|bg|hero|banner|декор/i.test(hint)) return false;
+    return true;
+  }
+
+  return false;
+}
+
 async function ocrAllImages(page, stats) {
   const results = [];
 
@@ -1527,33 +1789,37 @@ async function ocrAllImages(page, stats) {
     const imgInfos = await Promise.all(
       imgElements.map(async (img, i) => {
         try {
-          const info = await img.evaluate(el => ({
-            src: el.src || "",
-            alt: el.alt || "",
-            w: Math.round(el.getBoundingClientRect().width),
-            h: Math.round(el.getBoundingClientRect().height),
-            visible: el.getBoundingClientRect().width > 0
-          }));
+          const info = await img.evaluate(el => {
+            const rect = el.getBoundingClientRect();
+            // Capture closest pricing container class for context
+            const container = el.closest(
+              '[class*="pric"],[class*="package"],[class*="plan"],[class*="card"],[class*="paketi"],[class*="offer"],[class*="tier"]'
+            );
+            return {
+              src: el.src || "",
+              alt: el.alt || "",
+              w: Math.round(rect.width),
+              h: Math.round(rect.height),
+              visible: rect.width > 0,
+              contextClass: container ? (container.className || "") : "",
+            };
+          });
           return { ...info, element: img, index: i };
         } catch { return null; }
       })
     );
 
-    const validImages = imgInfos.filter(info => {
-      if (!info || !info.visible) return false;
-      if (info.w < 50 || info.h < 25) return false;
-      if (info.w > 1800 && info.h > 700) return false;
-      if (SKIP_OCR_RE.test(info.src)) return false;
-      // ⚡ Skip images where alt has 0-1 words — very likely decorative/photo with no text
-      const altWords = (info.alt || "").trim().split(/\s+/).filter(Boolean).length;
-      if (altWords < 2) return false;
-      return true;
-    });
+    // Smart filter: only OCR pricing-relevant images
+    const validImages = [];
+    for (const info of imgInfos) {
+      if (await isPricingRelevantImage(info)) {
+        validImages.push(info);
+      }
+    }
 
-    console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
+    console.log(`[OCR] ${validImages.length}/${imgElements.length} images selected for smart OCR`);
     if (validImages.length === 0) return results;
 
-    // ⚡ Screenshots in parallel (was sequential map with individual awaits)
     const screenshots = await Promise.all(
       validImages.map(async (img) => {
         try {
@@ -1561,8 +1827,9 @@ async function ocrAllImages(page, stats) {
             const cachedText = globalOcrCache.get(img.src);
             return { ...img, buffer: null, cached: true, text: cachedText };
           }
+
           if (page.isClosed()) return null;
-          const buffer = await img.element.screenshot({ type: 'png', timeout: 2000 }); // ⚡ was 2500
+          const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
           return { ...img, buffer, cached: false };
         } catch { return null; }
       })
@@ -1624,17 +1891,25 @@ async function collectAllLinks(page, base) {
 }
 
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, browser, externalPagesMap) {
   const startTime = Date.now();
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
-    // ⚡ Minimal scroll for lazy-load (2 steps, no sleep between)
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight / 2);
-      window.scrollTo(0, document.body.scrollHeight);
+    // Scroll for lazy load
+    await page.evaluate(async () => {
+      const scrollStep = window.innerHeight;
+      const maxScroll = document.body.scrollHeight;
+
+      for (let pos = 0; pos < maxScroll; pos += scrollStep) {
+        window.scrollTo(0, pos);
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      window.scrollTo(0, maxScroll);
+
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
@@ -1642,37 +1917,60 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       });
     });
 
-    await page.waitForTimeout(150); // ⚡ was 500
+    await page.waitForTimeout(500);
 
     try {
-      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ⚡ was 3000
+      await page.waitForLoadState('networkidle', { timeout: 3000 });
     } catch {}
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    // ⚡ Run all extractions in parallel instead of sequentially
-    const [data, ocrResults, pricing, rawSiteMap, caps] = await Promise.all([
-      extractStructured(page),
-      ocrAllImages(page, stats),
-      extractPricingFromPage(page).catch(e => { console.error("[PRICING] Extract error:", e.message); return null; }),
-      extractSiteMapFromPage(page).catch(e => { console.error("[SITEMAP] Extract error:", e.message); return null; }),
-      extractCapabilitiesFromPage(page).catch(e => { console.error("[CAPS] Extract error:", e.message); return null; }),
-    ]);
+    // Extract structured content
+    const data = await extractStructured(page);
 
-    if (rawSiteMap && (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0)) {
-      siteMaps.push(rawSiteMap);
-      console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+    // OCR images
+    const ocrResults = await ocrAllImages(page, stats);
+
+    // NEW: Pricing/package structured extraction (cards + installment)
+    let pricing = null;
+    try {
+      pricing = await extractPricingFromPage(page);
+      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+      }
+    } catch (e) {
+      console.error("[PRICING] Extract error:", e.message);
     }
 
-    if (caps && ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0)) {
-      capabilitiesMaps.push(caps);
-      console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+    // *** EXISTING: Extract SiteMap from this page ***
+    try {
+      const rawSiteMap = await extractSiteMapFromPage(page);
+      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
+        siteMaps.push(rawSiteMap);
+        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+      }
+    } catch (e) {
+      console.error("[SITEMAP] Extract error:", e.message);
     }
 
-    if (pricing && ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0)) {
-      console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
+    try {
+      const caps = await extractCapabilitiesFromPage(page);
+      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+        capabilitiesMaps.push(caps);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+      }
+    } catch (e) {
+      console.error("[CAPS] Extract error:", e.message);
+    }
+
+    // *** NEW: Click buttons and crawl widget/booking destinations ***
+    try {
+      await crawlButtonDestinations(page, url, base, externalPagesMap, browser);
+    } catch (e) {
+      console.error("[BTN_CRAWL] Error:", e.message);
     }
 
     // Format content
@@ -1690,11 +1988,8 @@ ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
 
-    // ⚡ contacts + links in parallel
-    const [domContacts, links] = await Promise.all([
-      extractContactsFromPage(page),
-      collectAllLinks(page, base),
-    ]);
+    // ✅ NEW: contacts extraction (DOM + combined text)
+    const domContacts = await extractContactsFromPage(page);
     const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
@@ -1717,11 +2012,11 @@ ${ocrContent}
     console.log(`[PAGE] ✓ ${totalWords}w (${htmlWords}+${ocrWords}ocr, ${ocrResults.length} imgs) ${elapsed}ms`);
 
     if (pageType !== "services" && totalWords < MIN_WORDS) {
-      return { links, page: null };
+      return { links: await collectAllLinks(page, base), page: null };
     }
 
     return {
-      links,
+      links: await collectAllLinks(page, base),
       page: {
         url,
         title,
@@ -1766,6 +2061,7 @@ async function crawlSmart(startUrl, siteId = null) {
   const queue = [];
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
+  const externalPagesMap = new Map(); // cross-domain widget/booking pages discovered via button clicks
   let base = "";
 
   // ✅ NEW: aggregate contacts across pages
@@ -1778,7 +2074,7 @@ async function crawlSmart(startUrl, siteId = null) {
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: 8000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
@@ -1822,7 +2118,7 @@ async function crawlSmart(startUrl, siteId = null) {
 
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, browser, externalPagesMap);
 
         if (result.page) {
           // ✅ collect contacts
@@ -1854,6 +2150,12 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
+  const externalPages = Array.from(externalPagesMap.values());
+  if (externalPages.length > 0) {
+    console.log(`\n[BTN_CRAWL] ${externalPages.length} external widget/booking pages discovered:`);
+    externalPages.forEach(p => console.log(`  → ${p.url} (via "${p.source_button_text}")`));
+  }
+
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
@@ -1862,7 +2164,7 @@ async function crawlSmart(startUrl, siteId = null) {
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
     await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap, combinedCapabilities); // ⚡ pass capabilities
+    await sendSiteMapToWorker(combinedSiteMap);
   }
 
   let combinedCapabilities = [];
@@ -1880,7 +2182,7 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts, externalPages };
 }
 
 // ================= HTTP SERVER =================
@@ -1897,6 +2199,7 @@ http
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
+        externalPagesCount: lastResult?.externalPages?.length || 0,
         contacts: lastResult?.contacts || null,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
       }));
