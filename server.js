@@ -1807,12 +1807,11 @@ async function ocrAllImages(page, stats) {
         try {
           const info = await img.evaluate(el => {
             const rect = el.getBoundingClientRect();
-            // Capture closest pricing container class for context
             const container = el.closest(
               '[class*="pric"],[class*="package"],[class*="plan"],[class*="card"],[class*="paketi"],[class*="offer"],[class*="tier"]'
             );
             return {
-              src: el.src || "",
+              src: el.src || el.getAttribute("data-src") || "",
               alt: el.alt || "",
               w: Math.round(rect.width),
               h: Math.round(rect.height),
@@ -1836,46 +1835,64 @@ async function ocrAllImages(page, stats) {
     console.log(`[OCR] ${validImages.length}/${imgElements.length} images selected for smart OCR`);
     if (validImages.length === 0) return results;
 
-    const screenshots = await Promise.all(
+    // ── Fetch image bytes directly via URL (more reliable than element.screenshot) ──
+    // This avoids viewport/layout issues where element.screenshot returns blank.
+    const fetchedImages = await Promise.all(
       validImages.map(async (img) => {
+        if (!img.src) return null;
         try {
           if (globalOcrCache.has(img.src)) {
-            const cachedText = globalOcrCache.get(img.src);
-            return { ...img, buffer: null, cached: true, text: cachedText };
+            return { ...img, buffer: null, cached: true, text: globalOcrCache.get(img.src) };
+          }
+          if (page.isClosed()) return null;
+
+          // Try direct URL fetch first (full resolution, no viewport clip)
+          let buffer = null;
+          try {
+            const response = await page.request.get(img.src, { timeout: 5000 });
+            if (response.ok()) {
+              buffer = await response.body();
+            }
+          } catch {}
+
+          // Fallback: element screenshot
+          if (!buffer) {
+            try {
+              // Scroll element into view first
+              await img.element.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+              buffer = await img.element.screenshot({ type: 'png', timeout: 3000 });
+            } catch {}
           }
 
-          if (page.isClosed()) return null;
-          const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
+          if (!buffer || buffer.length < 500) return null;
           return { ...img, buffer, cached: false };
         } catch { return null; }
       })
     );
 
-    const validScreenshots = screenshots.filter(s => s !== null);
+    const validFetched = fetchedImages.filter(s => s !== null);
+    console.log(`[OCR] ${validFetched.length} images fetched, sending to OCR`);
 
-    for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
-      const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
+    for (let i = 0; i < validFetched.length; i += PARALLEL_OCR) {
+      const batch = validFetched.slice(i, i + PARALLEL_OCR);
 
       const batchResults = await Promise.all(
         batch.map(async (img) => {
           if (img.cached) {
-            if (img.text && img.text.length > 2) {
-              return { text: img.text, src: img.src, alt: img.alt };
-            }
-            return null;
+            return (img.text && img.text.length > 2) ? { text: img.text, src: img.src, alt: img.alt } : null;
           }
-
           if (!img.buffer) return null;
 
           const text = await fastOCR(img.buffer);
-
-          globalOcrCache.set(img.src, text);
+          globalOcrCache.set(img.src, text || "");
 
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
+            console.log(`[OCR] ✓ ${img.src.split("/").pop()} → ${text.length} chars`);
             return { text, src: img.src, alt: img.alt };
           }
+          console.log(`[OCR] ✗ ${img.src.split("/").pop()} → empty result`);
           return null;
         })
       );
