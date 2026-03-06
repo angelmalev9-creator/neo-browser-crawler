@@ -1960,6 +1960,53 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
       console.error("[PRICING] Extract error:", e.message);
     }
 
+    // ── OCR PRICING MERGE ────────────────────────────────────────────────────
+    // Parse pricing cards directly from OCR text of whitelisted images.
+    // This handles sites like boutiquehome-bg.com where prices exist ONLY as images.
+    if (ocrResults.length > 0) {
+      if (!pricing) pricing = { pricing_cards: [], installment_plans: [] };
+      if (!pricing.pricing_cards) pricing.pricing_cards = [];
+
+      for (const ocr of ocrResults) {
+        // Only process images that matched the whitelist (src contains ceni- pattern)
+        if (!OCR_FILENAME_WHITELIST_RE.test(ocr.src || "")) continue;
+
+        const text = ocr.text || "";
+        if (!text) continue;
+
+        // Extract title: first non-empty line that looks like a package name
+        const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
+        const title = lines.find(l => /basic|standart|standard|premium|light|pro|plus|starter|business|enterprise/i.test(l)) || lines[0] || "";
+
+        // Extract price: look for currency patterns
+        const priceMatch = text.match(/(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/i)
+          || text.match(/(€|лв\.?|BGN|EUR)\s*(\d[\d\s.,]*)/i);
+        const price_text = priceMatch ? priceMatch[0].replace(/\s+/g, " ").trim() : "";
+
+        // Extract per-unit suffix (кв.м, /m², etc.)
+        const unitMatch = text.match(/\/\s*(кв\.?\s*м\.?|m²|sqm|кв\.м)/i);
+        const unit = unitMatch ? unitMatch[0] : "";
+
+        // Features: remaining lines that aren't the title or price
+        const features = lines.filter(l =>
+          l !== title &&
+          !priceMatch?.[0].includes(l) &&
+          l.length > 2 && l.length < 120
+        ).slice(0, 20);
+
+        const key = `${title}|${price_text}`;
+        const alreadyExists = pricing.pricing_cards.some(c =>
+          c.title?.toLowerCase() === title.toLowerCase() ||
+          (price_text && c.price_text === price_text)
+        );
+
+        if (!alreadyExists && (title || price_text)) {
+          pricing.pricing_cards.push({ title, price_text: price_text + unit, features, source: "ocr" });
+          console.log(`[PRICING] OCR card: "${title}" → ${price_text}${unit}`);
+        }
+      }
+    }
+
     // *** EXISTING: Extract SiteMap from this page ***
     try {
       const rawSiteMap = await extractSiteMapFromPage(page);
