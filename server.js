@@ -19,7 +19,6 @@ let lastCrawlUrl = null;
 let lastCrawlTime = 0;
 const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
-const visitedExternal = new Set(); // tracks external widget URLs to avoid duplicates
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
@@ -359,11 +358,8 @@ async function extractSiteMapFromPage(page) {
     // EXTRACT BUTTONS
     const buttons = [];
     const btnElements = document.querySelectorAll(
-      "button, a, [role='button'], input[type='submit'], input[type='button'], .btn, .button, [class*='btn'], [class*='book'], [class*='reserv']"
+      "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
     );
-
-    // Keywords that suggest a booking/reservation action leading to external widget
-    const BOOKING_RE = /резерв|reserv|book|запази|наличност|availability|check.?in|check.?out/i;
 
     btnElements.forEach((el, i) => {
       if (!isVisible(el)) return;
@@ -373,29 +369,11 @@ async function extractSiteMapFromPage(page) {
 
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
-
-      // Check href-based external
-      const isExternalHref = href && !href.includes(window.location.hostname);
-
-      // Check onclick / data attributes for external URLs
-      const onclick = el.getAttribute("onclick") || "";
-      const dataUrl = el.getAttribute("data-url") || el.getAttribute("data-href") || el.getAttribute("data-link") || "";
-      const externalAttrMatch = (onclick + " " + dataUrl).match(/https?:\/\/([^\s"']+)/);
-      const isExternalAttr = externalAttrMatch && !externalAttrMatch[0].includes(window.location.hostname);
-
-      // Booking buttons without href are likely JS-driven external widgets — flag them for click-detection
-      const isBookingButton = BOOKING_RE.test(text) && !href;
-
-      const isExternal = isExternalHref || isExternalAttr;
-      const externalUrl = isExternalHref ? href : (isExternalAttr ? externalAttrMatch[0] : null);
+      if (href && !href.includes(window.location.hostname)) return;
 
       buttons.push({
         text,
         selector: getSelector(el, i),
-        is_external: isExternal,
-        external_url: externalUrl,
-        // Flag JS-driven booking buttons so processPage can click them and detect navigation
-        is_booking_button: isBookingButton,
       });
     });
 
@@ -473,7 +451,7 @@ async function extractSiteMapFromPage(page) {
     return {
       url: window.location.href,
       title: document.title,
-      buttons: buttons.slice(0, 100),
+      buttons: buttons.slice(0, 30),
       forms: forms.slice(0, 10),
       prices: prices.slice(0, 20),
     };
@@ -1685,168 +1663,8 @@ async function collectAllLinks(page, base) {
   } catch { return []; }
 }
 
-// ================= EXTERNAL WIDGET CRAWLER =================
-// Crawls pages opened by buttons that lead to external domains (e.g. booking widgets).
-// Results are sent ONLY to the worker, not merged into the main sitemap.
-
-async function sendExternalPageToWorker(payload) {
-  if (!WORKER_URL || !WORKER_SECRET) return;
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-    const response = await fetch(`${WORKER_URL}/external-page`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${WORKER_SECRET}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    if (response.ok) {
-      console.log(`[EXT] ✓ Worker received external page: ${payload.url}`);
-    } else {
-      console.error(`[EXT] ✗ Worker error ${response.status} for: ${payload.url}`);
-    }
-  } catch (e) {
-    console.error(`[EXT] ✗ Send error:`, e.message);
-  }
-}
-
-// Crawls an external URL and sends result to worker.
-// Two modes:
-//   1. externalUrl is known (from href/data attr) → navigate directly
-//   2. externalUrl is null + clickSelector given → click button, detect navigation/new tab
-async function crawlExternalWidget(browser, sourceUrl, buttonText, externalUrl, siteId, clickSelector) {
-  // Deduplicate by externalUrl if known, otherwise by sourceUrl+buttonText
-  const dedupeKey = externalUrl || `click:${sourceUrl}::${buttonText}`;
-  if (visitedExternal.has(dedupeKey)) return;
-  visitedExternal.add(dedupeKey);
-
-  console.log(`[EXT] Button "${buttonText}" → ${externalUrl || "(click to discover)"}`);
-
-  let ctx;
-  try {
-    ctx = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    });
-    const pg = await ctx.newPage();
-
-    let finalUrl = externalUrl;
-
-    if (externalUrl) {
-      // Mode 1: direct navigation to known external URL
-      await pg.goto(externalUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
-    } else if (clickSelector) {
-      // Mode 2: navigate to source page, click the button, detect where it goes
-      await pg.goto(sourceUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
-      try { await pg.waitForLoadState("networkidle", { timeout: 4000 }); } catch {}
-      await pg.waitForTimeout(800);
-
-      // Listen for new tab opened by window.open()
-      const [newPage] = await Promise.all([
-        ctx.waitForEvent("page", { timeout: 8000 }).catch(() => null),
-        pg.evaluate((sel) => {
-          const el = document.querySelector(sel);
-          if (el) { el.click(); return true; }
-          // Fallback: find by text
-          return false;
-        }, clickSelector).catch(() => false),
-      ]);
-
-      if (newPage) {
-        // Button opened a new tab
-        console.log(`[EXT] Button "${buttonText}" opened new tab`);
-        await newPage.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
-        finalUrl = newPage.url();
-        console.log(`[EXT] New tab URL: ${finalUrl}`);
-
-        // Switch to the new tab for extraction
-        await crawlPageAndSend(newPage, siteId, sourceUrl, buttonText, finalUrl);
-        await newPage.close().catch(() => {});
-        return;
-      } else {
-        // Button navigated in same tab
-        try {
-          await pg.waitForNavigation({ timeout: 6000, waitUntil: "domcontentloaded" });
-        } catch {}
-        finalUrl = pg.url();
-        console.log(`[EXT] Button "${buttonText}" navigated same tab to: ${finalUrl}`);
-
-        // If stayed on same domain — не е external widget, пропускаме
-        try {
-          const sourceDomain = new URL(sourceUrl).hostname.replace(/^www\./, "");
-          const destDomain = new URL(finalUrl).hostname.replace(/^www\./, "");
-          if (sourceDomain === destDomain) {
-            console.log(`[EXT] Same domain after click — skipping`);
-            return;
-          }
-        } catch {}
-      }
-    } else {
-      return; // нищо за правене
-    }
-
-    await crawlPageAndSend(pg, siteId, sourceUrl, buttonText, finalUrl);
-
-  } catch (e) {
-    console.error(`[EXT] Error for "${buttonText}": ${e.message}`);
-  } finally {
-    if (ctx) await ctx.close().catch(() => {});
-  }
-}
-
-// Извлича данни от вече заредена страница и ги изпраща на worker
-async function crawlPageAndSend(pg, siteId, sourceUrl, buttonText, finalUrl) {
-  // Wait for JS-heavy SPAs/booking engines to render
-  try { await pg.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
-  await pg.waitForTimeout(1000);
-
-  // Scroll to trigger lazy content
-  await pg.evaluate(async () => {
-    for (let pos = 0; pos < document.body.scrollHeight; pos += window.innerHeight) {
-      window.scrollTo(0, pos);
-      await new Promise(r => setTimeout(r, 80));
-    }
-  }).catch(() => {});
-
-  const title = await pg.title().catch(() => "");
-  console.log(`[EXT] Crawling: ${finalUrl} title="${title}"`);
-
-  const data = await extractStructured(pg).catch(() => ({ rawContent: "" }));
-  const htmlContent = normalizeNumbers(clean(data.rawContent));
-
-  const caps = await extractCapabilitiesFromPage(pg).catch(() => ({ forms: [], wizards: [], iframes: [], availability: [] }));
-  const rawSiteMap = await extractSiteMapFromPage(pg).catch(() => ({ buttons: [], forms: [], prices: [] }));
-  const enrichedSiteMap = enrichSiteMap(rawSiteMap, siteId, finalUrl);
-
-  const domContacts = await extractContactsFromPage(pg).catch(() => ({ emails: [], phones: [], textHints: "" }));
-  const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
-  const contacts = {
-    emails: Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12),
-    phones: Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12),
-  };
-
-  const combinedCaps = buildCombinedCapabilities([caps], finalUrl);
-  console.log(`[EXT] ✓ "${buttonText}": ${combinedCaps.length} caps, ${contacts.phones.length} phones`);
-
-  await sendExternalPageToWorker({
-    site_id: siteId,
-    source_url: sourceUrl,
-    button_text: buttonText,
-    url: finalUrl,
-    title,
-    content: htmlContent.slice(0, 20000),
-    site_map: enrichedSiteMap,
-    capabilities: combinedCaps,
-    contacts,
-  });
-}
-
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, browser, siteId) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
   try {
@@ -1900,92 +1718,14 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
     }
 
     // *** EXISTING: Extract SiteMap from this page ***
-    let rawSiteMap = null;
     try {
-      rawSiteMap = await extractSiteMapFromPage(page);
+      const rawSiteMap = await extractSiteMapFromPage(page);
       if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
         siteMaps.push(rawSiteMap);
         console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
       }
     } catch (e) {
       console.error("[SITEMAP] Extract error:", e.message);
-    }
-
-    // *** NEW: Crawl external widgets (buttons leading to other domains) ***
-    if (browser) {
-      // Mode 1: бутони с известен external href/data-url (от sitemap)
-      const externalButtons = (rawSiteMap?.buttons || []).filter(b => b.is_external && b.external_url);
-      for (const btn of externalButtons) {
-        crawlExternalWidget(browser, url, btn.text, btn.external_url, siteId, null).catch(e =>
-          console.error("[EXT] Unhandled error:", e.message)
-        );
-      }
-
-      // Mode 2: Сканираме живата страница директно за booking бутони
-      // (по-надеждно от sitemap парсинга — хваща и <a> без href, <div>, <span> и т.н.)
-      const liveBookingButtons = await page.evaluate(() => {
-        const BOOKING_RE = /резерв|reserv|book|запази|наличност|availability/i;
-        const found = [];
-        const seen = new Set();
-
-        const candidates = Array.from(document.querySelectorAll(
-          'button, a, [role="button"], [class*="btn"], [class*="book"], [class*="reserv"], span, div'
-        ));
-
-        for (const el of candidates) {
-          const text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80);
-          if (!BOOKING_RE.test(text)) continue;
-          if (text.length > 40) continue; // прекалено дълъг текст — не е бутон
-          if (seen.has(text.toLowerCase())) continue;
-
-          // Проверка за видимост
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          if (rect.width === 0 || rect.height === 0) continue;
-          if (style.display === "none" || style.visibility === "hidden") continue;
-          if (style.pointerEvents === "none") continue;
-
-          // Генерираме selector
-          let sel = "";
-          if (el.id) {
-            sel = "#" + CSS.escape(el.id);
-          } else if (el.className && typeof el.className === "string") {
-            const cls = el.className.trim().split(/\s+/).filter(c => c.length > 1 && !c.includes(":")).slice(0, 2).join(".");
-            if (cls) sel = el.tagName.toLowerCase() + "." + cls;
-          }
-          if (!sel) {
-            // XPath-style nth-child fallback
-            const parent = el.parentElement;
-            if (parent) {
-              const siblings = Array.from(parent.children);
-              const idx = siblings.indexOf(el) + 1;
-              sel = el.tagName.toLowerCase() + ":nth-child(" + idx + ")";
-            } else {
-              sel = el.tagName.toLowerCase();
-            }
-          }
-
-          seen.add(text.toLowerCase());
-          found.push({ text, selector: sel });
-        }
-        return found;
-      }).catch(() => []);
-
-      console.log(`[EXT] Found ${liveBookingButtons.length} booking button(s) on page: ${liveBookingButtons.map(b => '"' + b.text + '"').join(", ")}`);
-
-      for (const btn of liveBookingButtons) {
-        // Пропускаме ако вече имаме external url за него
-        const alreadyKnown = externalButtons.some(e => e.text.toLowerCase() === btn.text.toLowerCase());
-        if (alreadyKnown) continue;
-        crawlExternalWidget(browser, url, btn.text, null, siteId, btn.selector).catch(e =>
-          console.error("[EXT] Unhandled error:", e.message)
-        );
-      }
-
-      const total = externalButtons.length + liveBookingButtons.length;
-      if (total > 0) {
-        console.log(`[EXT] Queued ${externalButtons.length} href-external + ${liveBookingButtons.length} click-booking from: ${url}`);
-      }
     }
 
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
@@ -2143,7 +1883,7 @@ async function crawlSmart(startUrl, siteId = null) {
 
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, browser, siteId);
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
           // ✅ collect contacts
@@ -2280,7 +2020,6 @@ http
         crawlFinished = false;
         lastCrawlUrl = requestedUrl;
         visited.clear();
-        visitedExternal.clear();
         globalOcrCache.clear();
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
