@@ -1428,10 +1428,6 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
 
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("body", { timeout: 1500 });
-  } catch {}
-
-  try {
     return await page.evaluate(() => {
       const seenTexts = new Set();
 
@@ -1466,46 +1462,8 @@ async function extractStructured(page) {
         processedElements.add(el);
       });
 
-      const overlaySelectors = [
-        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
-        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
-        '[class*="alert"]', '[style*="position: fixed"]',
-        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
-      ];
-
-      const overlayTexts = [];
-      overlaySelectors.forEach(selector => {
-        try {
-          document.querySelectorAll(selector).forEach(el => {
-            if (processedElements.has(el)) return;
-            const text = el.innerText?.trim();
-            if (!text) return;
-            const uniqueText = addUniqueText(text);
-            if (uniqueText) {
-              overlayTexts.push(uniqueText);
-              processedElements.add(el);
-            }
-          });
-        } catch {}
-      });
-
-      const pseudoTexts = [];
-      try {
-        document.querySelectorAll("*").forEach(el => {
-          const before = window.getComputedStyle(el, "::before").content;
-          const after = window.getComputedStyle(el, "::after").content;
-          if (before && before !== "none" && before !== '""') {
-            const cleaned = before.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-          if (after && after !== "none" && after !== '""') {
-            const cleaned = after.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-        });
-      } catch {}
+      // ⚡ Removed: pseudo-elements getComputedStyle loop (iterates ALL DOM elements, very slow)
+      // ⚡ Removed: waitForSelector("body") — unnecessary
 
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
@@ -1518,8 +1476,6 @@ async function extractStructured(page) {
         rawContent: [
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
-          overlayTexts.join("\n"),
-          pseudoTexts.join(" "),
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -1587,15 +1543,17 @@ async function ocrAllImages(page, stats) {
       if (!info || !info.visible) return false;
       if (info.w < 50 || info.h < 25) return false;
       if (info.w > 1800 && info.h > 700) return false;
-      if (SKIP_OCR_RE.test(info.src)) {
-        return false;
-      }
+      if (SKIP_OCR_RE.test(info.src)) return false;
+      // ⚡ Skip images where alt has 0-1 words — very likely decorative/photo with no text
+      const altWords = (info.alt || "").trim().split(/\s+/).filter(Boolean).length;
+      if (altWords < 2) return false;
       return true;
     });
 
     console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
     if (validImages.length === 0) return results;
 
+    // ⚡ Screenshots in parallel (was sequential map with individual awaits)
     const screenshots = await Promise.all(
       validImages.map(async (img) => {
         try {
@@ -1603,9 +1561,8 @@ async function ocrAllImages(page, stats) {
             const cachedText = globalOcrCache.get(img.src);
             return { ...img, buffer: null, cached: true, text: cachedText };
           }
-
           if (page.isClosed()) return null;
-          const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
+          const buffer = await img.element.screenshot({ type: 'png', timeout: 2000 }); // ⚡ was 2500
           return { ...img, buffer, cached: false };
         } catch { return null; }
       })
@@ -1695,43 +1652,27 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    // Extract structured content
-    const data = await extractStructured(page);
+    // ⚡ Run all extractions in parallel instead of sequentially
+    const [data, ocrResults, pricing, rawSiteMap, caps] = await Promise.all([
+      extractStructured(page),
+      ocrAllImages(page, stats),
+      extractPricingFromPage(page).catch(e => { console.error("[PRICING] Extract error:", e.message); return null; }),
+      extractSiteMapFromPage(page).catch(e => { console.error("[SITEMAP] Extract error:", e.message); return null; }),
+      extractCapabilitiesFromPage(page).catch(e => { console.error("[CAPS] Extract error:", e.message); return null; }),
+    ]);
 
-    // OCR images
-    const ocrResults = await ocrAllImages(page, stats);
-
-    // NEW: Pricing/package structured extraction (cards + installment)
-    let pricing = null;
-    try {
-      pricing = await extractPricingFromPage(page);
-      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
-      }
-    } catch (e) {
-      console.error("[PRICING] Extract error:", e.message);
+    if (rawSiteMap && (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0)) {
+      siteMaps.push(rawSiteMap);
+      console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
     }
 
-    // *** EXISTING: Extract SiteMap from this page ***
-    try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
-      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
-        siteMaps.push(rawSiteMap);
-        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
-      }
-    } catch (e) {
-      console.error("[SITEMAP] Extract error:", e.message);
+    if (caps && ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0)) {
+      capabilitiesMaps.push(caps);
+      console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
     }
 
-    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
-    try {
-      const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
-        capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
-      }
-    } catch (e) {
-      console.error("[CAPS] Extract error:", e.message);
+    if (pricing && ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0)) {
+      console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
     }
 
     // Format content
@@ -1749,8 +1690,11 @@ ${ocrContent}
 === OCR_CONTENT_END ===
 `.trim();
 
-    // ✅ NEW: contacts extraction (DOM + combined text)
-    const domContacts = await extractContactsFromPage(page);
+    // ⚡ contacts + links in parallel
+    const [domContacts, links] = await Promise.all([
+      extractContactsFromPage(page),
+      collectAllLinks(page, base),
+    ]);
     const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
@@ -1773,11 +1717,11 @@ ${ocrContent}
     console.log(`[PAGE] ✓ ${totalWords}w (${htmlWords}+${ocrWords}ocr, ${ocrResults.length} imgs) ${elapsed}ms`);
 
     if (pageType !== "services" && totalWords < MIN_WORDS) {
-      return { links: await collectAllLinks(page, base), page: null };
+      return { links, page: null };
     }
 
     return {
-      links: await collectAllLinks(page, base),
+      links,
       page: {
         url,
         title,
