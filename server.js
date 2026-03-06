@@ -1751,9 +1751,25 @@ async function fastOCR(buffer) {
 // ================= SMART OCR - pricing images only =================
 // Scores an image element on how likely it contains pricing/package text.
 // Returns true if the image should be OCR-ed.
+
+// ── FILENAME WHITELIST ────────────────────────────────────────────────────
+// Any image whose filename matches this pattern is ALWAYS OCR-ed,
+// regardless of size, context, or any other filter.
+// Add site-specific pricing image names here (case-insensitive, matches anywhere in URL).
+// Examples already included: ceni-basic1, ceni-standart1, ceni-premium1
+const OCR_FILENAME_WHITELIST_RE = /ceni[-_]?(basic|standart|standard|premium|light|pro|plus|starter|business|enterprise)\d*\.(jpe?g|png|webp)/i;
+
 async function isPricingRelevantImage(imgInfo) {
+  if (!imgInfo) return false;
+
+  // ── WHITELIST CHECK (highest priority — always OCR these filenames) ──────
+  if (imgInfo.src && OCR_FILENAME_WHITELIST_RE.test(imgInfo.src)) {
+    console.log(`[OCR] ✓ Whitelist match: ${imgInfo.src}`);
+    return true;
+  }
+
   // Must be visible and reasonable size
-  if (!imgInfo || !imgInfo.visible) return false;
+  if (!imgInfo.visible) return false;
   if (imgInfo.w < 80 || imgInfo.h < 40) return false;
   // Skip giant hero/banner images (unlikely pure text cards)
   if (imgInfo.w > 1800 && imgInfo.h > 900) return false;
