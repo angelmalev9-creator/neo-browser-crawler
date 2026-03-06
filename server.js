@@ -359,7 +359,7 @@ async function extractSiteMapFromPage(page) {
     // EXTRACT BUTTONS
     const buttons = [];
     const btnElements = document.querySelectorAll(
-      "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
+      "button, a, [role='button'], input[type='submit'], input[type='button'], .btn, .button, [class*='btn'], [class*='book'], [class*='reserv']"
     );
 
     // Keywords that suggest a booking/reservation action leading to external widget
@@ -473,7 +473,7 @@ async function extractSiteMapFromPage(page) {
     return {
       url: window.location.href,
       title: document.title,
-      buttons: buttons.slice(0, 30),
+      buttons: buttons.slice(0, 100),
       forms: forms.slice(0, 10),
       prices: prices.slice(0, 20),
     };
@@ -1912,26 +1912,79 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
     }
 
     // *** NEW: Crawl external widgets (buttons leading to other domains) ***
-    if (rawSiteMap && browser) {
-      // Mode 1: бутони с известен external href/data-url
-      const externalButtons = (rawSiteMap.buttons || []).filter(b => b.is_external && b.external_url);
+    if (browser) {
+      // Mode 1: бутони с известен external href/data-url (от sitemap)
+      const externalButtons = (rawSiteMap?.buttons || []).filter(b => b.is_external && b.external_url);
       for (const btn of externalButtons) {
         crawlExternalWidget(browser, url, btn.text, btn.external_url, siteId, null).catch(e =>
           console.error("[EXT] Unhandled error:", e.message)
         );
       }
 
-      // Mode 2: JS-driven booking бутони без href — кликваме ги и хващаме навигацията
-      const bookingButtons = (rawSiteMap.buttons || []).filter(b => b.is_booking_button && !b.is_external);
-      for (const btn of bookingButtons) {
+      // Mode 2: Сканираме живата страница директно за booking бутони
+      // (по-надеждно от sitemap парсинга — хваща и <a> без href, <div>, <span> и т.н.)
+      const liveBookingButtons = await page.evaluate(() => {
+        const BOOKING_RE = /резерв|reserv|book|запази|наличност|availability/i;
+        const found = [];
+        const seen = new Set();
+
+        const candidates = Array.from(document.querySelectorAll(
+          'button, a, [role="button"], [class*="btn"], [class*="book"], [class*="reserv"], span, div'
+        ));
+
+        for (const el of candidates) {
+          const text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80);
+          if (!BOOKING_RE.test(text)) continue;
+          if (text.length > 40) continue; // прекалено дълъг текст — не е бутон
+          if (seen.has(text.toLowerCase())) continue;
+
+          // Проверка за видимост
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          if (rect.width === 0 || rect.height === 0) continue;
+          if (style.display === "none" || style.visibility === "hidden") continue;
+          if (style.pointerEvents === "none") continue;
+
+          // Генерираме selector
+          let sel = "";
+          if (el.id) {
+            sel = "#" + CSS.escape(el.id);
+          } else if (el.className && typeof el.className === "string") {
+            const cls = el.className.trim().split(/\s+/).filter(c => c.length > 1 && !c.includes(":")).slice(0, 2).join(".");
+            if (cls) sel = el.tagName.toLowerCase() + "." + cls;
+          }
+          if (!sel) {
+            // XPath-style nth-child fallback
+            const parent = el.parentElement;
+            if (parent) {
+              const siblings = Array.from(parent.children);
+              const idx = siblings.indexOf(el) + 1;
+              sel = el.tagName.toLowerCase() + ":nth-child(" + idx + ")";
+            } else {
+              sel = el.tagName.toLowerCase();
+            }
+          }
+
+          seen.add(text.toLowerCase());
+          found.push({ text, selector: sel });
+        }
+        return found;
+      }).catch(() => []);
+
+      console.log(`[EXT] Found ${liveBookingButtons.length} booking button(s) on page: ${liveBookingButtons.map(b => '"' + b.text + '"').join(", ")}`);
+
+      for (const btn of liveBookingButtons) {
+        // Пропускаме ако вече имаме external url за него
+        const alreadyKnown = externalButtons.some(e => e.text.toLowerCase() === btn.text.toLowerCase());
+        if (alreadyKnown) continue;
         crawlExternalWidget(browser, url, btn.text, null, siteId, btn.selector).catch(e =>
           console.error("[EXT] Unhandled error:", e.message)
         );
       }
 
-      const total = externalButtons.length + bookingButtons.length;
+      const total = externalButtons.length + liveBookingButtons.length;
       if (total > 0) {
-        console.log(`[EXT] Queued ${externalButtons.length} external + ${bookingButtons.length} booking buttons from: ${url}`);
+        console.log(`[EXT] Queued ${externalButtons.length} href-external + ${liveBookingButtons.length} click-booking from: ${url}`);
       }
     }
 
