@@ -362,6 +362,9 @@ async function extractSiteMapFromPage(page) {
       "button, a[href], [role='button'], input[type='submit'], input[type='button'], .btn, .button"
     );
 
+    // Keywords that suggest a booking/reservation action leading to external widget
+    const BOOKING_RE = /резерв|reserv|book|запази|наличност|availability|check.?in|check.?out/i;
+
     btnElements.forEach((el, i) => {
       if (!isVisible(el)) return;
 
@@ -371,13 +374,28 @@ async function extractSiteMapFromPage(page) {
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
 
-      const isExternal = href && !href.includes(window.location.hostname);
+      // Check href-based external
+      const isExternalHref = href && !href.includes(window.location.hostname);
+
+      // Check onclick / data attributes for external URLs
+      const onclick = el.getAttribute("onclick") || "";
+      const dataUrl = el.getAttribute("data-url") || el.getAttribute("data-href") || el.getAttribute("data-link") || "";
+      const externalAttrMatch = (onclick + " " + dataUrl).match(/https?:\/\/([^\s"']+)/);
+      const isExternalAttr = externalAttrMatch && !externalAttrMatch[0].includes(window.location.hostname);
+
+      // Booking buttons without href are likely JS-driven external widgets — flag them for click-detection
+      const isBookingButton = BOOKING_RE.test(text) && !href;
+
+      const isExternal = isExternalHref || isExternalAttr;
+      const externalUrl = isExternalHref ? href : (isExternalAttr ? externalAttrMatch[0] : null);
 
       buttons.push({
         text,
         selector: getSelector(el, i),
         is_external: isExternal,
-        external_url: isExternal ? href : null,
+        external_url: externalUrl,
+        // Flag JS-driven booking buttons so processPage can click them and detect navigation
+        is_booking_button: isBookingButton,
       });
     });
 
@@ -1696,12 +1714,17 @@ async function sendExternalPageToWorker(payload) {
   }
 }
 
-async function crawlExternalWidget(browser, sourceUrl, buttonText, externalUrl, siteId) {
-  // Deduplicate: track visited external URLs globally per crawl session
-  if (visitedExternal.has(externalUrl)) return;
-  visitedExternal.add(externalUrl);
+// Crawls an external URL and sends result to worker.
+// Two modes:
+//   1. externalUrl is known (from href/data attr) → navigate directly
+//   2. externalUrl is null + clickSelector given → click button, detect navigation/new tab
+async function crawlExternalWidget(browser, sourceUrl, buttonText, externalUrl, siteId, clickSelector) {
+  // Deduplicate by externalUrl if known, otherwise by sourceUrl+buttonText
+  const dedupeKey = externalUrl || `click:${sourceUrl}::${buttonText}`;
+  if (visitedExternal.has(dedupeKey)) return;
+  visitedExternal.add(dedupeKey);
 
-  console.log(`[EXT] Button "${buttonText}" → ${externalUrl}`);
+  console.log(`[EXT] Button "${buttonText}" → ${externalUrl || "(click to discover)"}`);
 
   let ctx;
   try {
@@ -1711,63 +1734,115 @@ async function crawlExternalWidget(browser, sourceUrl, buttonText, externalUrl, 
     });
     const pg = await ctx.newPage();
 
-    // Navigate to the external URL
-    await pg.goto(externalUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+    let finalUrl = externalUrl;
 
-    // Wait for JS-heavy widgets to render (SPAs, booking engines)
-    try { await pg.waitForLoadState("networkidle", { timeout: 5000 }); } catch {}
-    await pg.waitForTimeout(1000);
+    if (externalUrl) {
+      // Mode 1: direct navigation to known external URL
+      await pg.goto(externalUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+    } else if (clickSelector) {
+      // Mode 2: navigate to source page, click the button, detect where it goes
+      await pg.goto(sourceUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+      try { await pg.waitForLoadState("networkidle", { timeout: 4000 }); } catch {}
+      await pg.waitForTimeout(800);
 
-    // Scroll to trigger lazy content
-    await pg.evaluate(async () => {
-      for (let pos = 0; pos < document.body.scrollHeight; pos += window.innerHeight) {
-        window.scrollTo(0, pos);
-        await new Promise(r => setTimeout(r, 80));
+      // Listen for new tab opened by window.open()
+      const [newPage] = await Promise.all([
+        ctx.waitForEvent("page", { timeout: 8000 }).catch(() => null),
+        pg.evaluate((sel) => {
+          const el = document.querySelector(sel);
+          if (el) { el.click(); return true; }
+          // Fallback: find by text
+          return false;
+        }, clickSelector).catch(() => false),
+      ]);
+
+      if (newPage) {
+        // Button opened a new tab
+        console.log(`[EXT] Button "${buttonText}" opened new tab`);
+        await newPage.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+        finalUrl = newPage.url();
+        console.log(`[EXT] New tab URL: ${finalUrl}`);
+
+        // Switch to the new tab for extraction
+        await crawlPageAndSend(newPage, siteId, sourceUrl, buttonText, finalUrl);
+        await newPage.close().catch(() => {});
+        return;
+      } else {
+        // Button navigated in same tab
+        try {
+          await pg.waitForNavigation({ timeout: 6000, waitUntil: "domcontentloaded" });
+        } catch {}
+        finalUrl = pg.url();
+        console.log(`[EXT] Button "${buttonText}" navigated same tab to: ${finalUrl}`);
+
+        // If stayed on same domain — не е external widget, пропускаме
+        try {
+          const sourceDomain = new URL(sourceUrl).hostname.replace(/^www\./, "");
+          const destDomain = new URL(finalUrl).hostname.replace(/^www\./, "");
+          if (sourceDomain === destDomain) {
+            console.log(`[EXT] Same domain after click — skipping`);
+            return;
+          }
+        } catch {}
       }
-    });
+    } else {
+      return; // нищо за правене
+    }
 
-    const finalUrl = pg.url();
-    const title = await pg.title().catch(() => "");
-
-    // Extract structured content (text)
-    const data = await extractStructured(pg).catch(() => ({ rawContent: "" }));
-    const htmlContent = normalizeNumbers(clean(data.rawContent));
-
-    // Extract capabilities (forms, wizards, iframes)
-    const caps = await extractCapabilitiesFromPage(pg).catch(() => ({ forms: [], wizards: [], iframes: [], availability: [] }));
-
-    // Extract raw sitemap (buttons & forms on widget page)
-    const rawSiteMap = await extractSiteMapFromPage(pg).catch(() => ({ buttons: [], forms: [], prices: [] }));
-    const enrichedSiteMap = enrichSiteMap(rawSiteMap, siteId, finalUrl);
-
-    // Extract contacts
-    const domContacts = await extractContactsFromPage(pg).catch(() => ({ emails: [], phones: [], textHints: "" }));
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
-    const contacts = {
-      emails: Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12),
-      phones: Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12),
-    };
-
-    await pg.close();
-
-    // Send everything to the worker
-    await sendExternalPageToWorker({
-      site_id: siteId,
-      source_url: sourceUrl,
-      button_text: buttonText,
-      url: finalUrl,
-      title,
-      content: htmlContent.slice(0, 20000),
-      site_map: enrichedSiteMap,
-      capabilities: buildCombinedCapabilities([caps], finalUrl),
-      contacts,
-    });
+    await crawlPageAndSend(pg, siteId, sourceUrl, buttonText, finalUrl);
 
   } catch (e) {
-    console.error(`[EXT] Error crawling ${externalUrl}:`, e.message);
+    console.error(`[EXT] Error for "${buttonText}": ${e.message}`);
   } finally {
     if (ctx) await ctx.close().catch(() => {});
   }
+}
+
+// Извлича данни от вече заредена страница и ги изпраща на worker
+async function crawlPageAndSend(pg, siteId, sourceUrl, buttonText, finalUrl) {
+  // Wait for JS-heavy SPAs/booking engines to render
+  try { await pg.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
+  await pg.waitForTimeout(1000);
+
+  // Scroll to trigger lazy content
+  await pg.evaluate(async () => {
+    for (let pos = 0; pos < document.body.scrollHeight; pos += window.innerHeight) {
+      window.scrollTo(0, pos);
+      await new Promise(r => setTimeout(r, 80));
+    }
+  }).catch(() => {});
+
+  const title = await pg.title().catch(() => "");
+  console.log(`[EXT] Crawling: ${finalUrl} title="${title}"`);
+
+  const data = await extractStructured(pg).catch(() => ({ rawContent: "" }));
+  const htmlContent = normalizeNumbers(clean(data.rawContent));
+
+  const caps = await extractCapabilitiesFromPage(pg).catch(() => ({ forms: [], wizards: [], iframes: [], availability: [] }));
+  const rawSiteMap = await extractSiteMapFromPage(pg).catch(() => ({ buttons: [], forms: [], prices: [] }));
+  const enrichedSiteMap = enrichSiteMap(rawSiteMap, siteId, finalUrl);
+
+  const domContacts = await extractContactsFromPage(pg).catch(() => ({ emails: [], phones: [], textHints: "" }));
+  const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
+  const contacts = {
+    emails: Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12),
+    phones: Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12),
+  };
+
+  const combinedCaps = buildCombinedCapabilities([caps], finalUrl);
+  console.log(`[EXT] ✓ "${buttonText}": ${combinedCaps.length} caps, ${contacts.phones.length} phones`);
+
+  await sendExternalPageToWorker({
+    site_id: siteId,
+    source_url: sourceUrl,
+    button_text: buttonText,
+    url: finalUrl,
+    title,
+    content: htmlContent.slice(0, 20000),
+    site_map: enrichedSiteMap,
+    capabilities: combinedCaps,
+    contacts,
+  });
 }
 
 // ================= PROCESS SINGLE PAGE =================
@@ -1838,15 +1913,25 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
 
     // *** NEW: Crawl external widgets (buttons leading to other domains) ***
     if (rawSiteMap && browser) {
+      // Mode 1: бутони с известен external href/data-url
       const externalButtons = (rawSiteMap.buttons || []).filter(b => b.is_external && b.external_url);
       for (const btn of externalButtons) {
-        // Fire-and-forget: don't await, run in background so main crawl isn't blocked
-        crawlExternalWidget(browser, url, btn.text, btn.external_url, siteId).catch(e =>
+        crawlExternalWidget(browser, url, btn.text, btn.external_url, siteId, null).catch(e =>
           console.error("[EXT] Unhandled error:", e.message)
         );
       }
-      if (externalButtons.length > 0) {
-        console.log(`[EXT] Queued ${externalButtons.length} external widget(s) from: ${url}`);
+
+      // Mode 2: JS-driven booking бутони без href — кликваме ги и хващаме навигацията
+      const bookingButtons = (rawSiteMap.buttons || []).filter(b => b.is_booking_button && !b.is_external);
+      for (const btn of bookingButtons) {
+        crawlExternalWidget(browser, url, btn.text, null, siteId, btn.selector).catch(e =>
+          console.error("[EXT] Unhandled error:", e.message)
+        );
+      }
+
+      const total = externalButtons.length + bookingButtons.length;
+      if (total > 0) {
+        console.log(`[EXT] Queued ${externalButtons.length} external + ${bookingButtons.length} booking buttons from: ${url}`);
       }
     }
 
