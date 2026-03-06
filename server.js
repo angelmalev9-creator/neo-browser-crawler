@@ -19,6 +19,7 @@ let lastCrawlUrl = null;
 let lastCrawlTime = 0;
 const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
+const visitedExternal = new Set(); // tracks external widget URLs to avoid duplicates
 
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
@@ -369,11 +370,14 @@ async function extractSiteMapFromPage(page) {
 
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
-      if (href && !href.includes(window.location.hostname)) return;
+
+      const isExternal = href && !href.includes(window.location.hostname);
 
       buttons.push({
         text,
         selector: getSelector(el, i),
+        is_external: isExternal,
+        external_url: isExternal ? href : null,
       });
     });
 
@@ -615,196 +619,6 @@ async function sendSiteMapToWorker(siteMap) {
   } catch (error) {
     console.error(`[SITEMAP] ✗ Worker send error:`, error.message);
     return false;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW: BUTTON CLICK CRAWLING
-// Clicks every clickable button/link that could open a widget, modal or
-// redirect to an external booking/reservation page and captures the result.
-// Handles cross-domain widget redirects (e.g. clock-software, bookero, etc.)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Keywords that indicate a button worth clicking for widget/booking discovery
-const WIDGET_BUTTON_RE = /резерв|запази|запитване|book|reserve|inquiry|contact|контакт|свържи|цени|price|виж|покажи|детайли|повече|more|details|offer|оферт/i;
-
-// Known external widget/booking domains to always crawl even if cross-domain
-const WIDGET_DOMAIN_RE = /clock-software|simplybook|bookero|calendly|cloudbeds|beds24|channelmanager|siteminder|freetobook|eviivo|lodgify|hostaway|guesty|rentlio|smoobu|avvio|travelclick|rezovation|booking\.com\/widget|expedia.*widget/i;
-
-async function crawlButtonDestinations(page, pageUrl, base, externalPagesMap, browser) {
-  // externalPagesMap: Map<url, { url, title, content, source_button_text }>
-  // Already-visited external widget URLs are stored here to avoid re-processing.
-
-  let clickableButtons = [];
-  try {
-    clickableButtons = await page.evaluate((widgetBtnRe) => {
-      const re = new RegExp(widgetBtnRe, "i");
-      const isVisible = (el) => {
-        const r = el.getBoundingClientRect();
-        const s = window.getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-      };
-      const results = [];
-      const seen = new Set();
-
-      document.querySelectorAll(
-        'a[href], button, [role="button"], input[type="submit"], input[type="button"], .btn, .button'
-      ).forEach((el) => {
-        if (!isVisible(el)) return;
-        const text = (el.textContent?.trim() || el.value || "").slice(0, 120);
-        if (!text || !re.test(text)) return;
-
-        const href = el.tagName === "A" ? (el.getAttribute("href") || "") : "";
-        const key = text.toLowerCase() + "|" + href;
-        if (seen.has(key)) return;
-        seen.add(key);
-
-        results.push({ text, href, tag: el.tagName.toLowerCase() });
-      });
-      return results.slice(0, 25);
-    }, WIDGET_BUTTON_RE.source);
-  } catch (e) {
-    console.error("[BTN_CRAWL] evaluate error:", e.message);
-    return;
-  }
-
-  if (clickableButtons.length === 0) return;
-  console.log(`[BTN_CRAWL] ${clickableButtons.length} buttons to click on ${pageUrl}`);
-
-  for (const btn of clickableButtons) {
-    // If it's a plain anchor with absolute href pointing to external widget domain, fetch directly
-    if (btn.href && btn.href.startsWith("http")) {
-      const targetUrl = btn.href;
-      if (externalPagesMap.has(targetUrl)) continue;
-
-      const isKnownWidget = WIDGET_DOMAIN_RE.test(targetUrl);
-      const isSameDomain = targetUrl.startsWith(base);
-
-      if (!isKnownWidget && !isSameDomain) continue; // skip unrelated external links
-
-      if (isKnownWidget) {
-        console.log(`[BTN_CRAWL] Direct widget URL: ${targetUrl} (from "${btn.text}")`);
-        const widgetContent = await fetchWidgetPage(targetUrl, btn.text, browser);
-        if (widgetContent) externalPagesMap.set(targetUrl, widgetContent);
-        continue;
-      }
-    }
-
-    // For buttons (no href or javascript), click them and observe navigation/new tab
-    try {
-      const newPagePromise = page.context().waitForEvent("page", { timeout: 4000 }).catch(() => null);
-
-      // Re-find the element to click (DOM may have changed)
-      const el = await page.$(`button:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i"), a:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i"), [role="button"]:text-matches("${btn.text.replace(/"/g, "").slice(0, 40)}", "i")`).catch(() => null);
-      if (!el) continue;
-
-      // Click and capture any navigation
-      const navigationPromise = page.waitForNavigation({ timeout: 4000, waitUntil: "domcontentloaded" }).catch(() => null);
-      await el.click({ timeout: 3000 }).catch(() => null);
-
-      // Check if a new tab was opened (widget in new window)
-      const newTab = await newPagePromise;
-      if (newTab) {
-        try {
-          await newTab.waitForLoadState("domcontentloaded", { timeout: 5000 });
-          const tabUrl = newTab.url();
-          const tabTitle = await newTab.title().catch(() => "");
-
-          if (!externalPagesMap.has(tabUrl)) {
-            console.log(`[BTN_CRAWL] New tab opened: ${tabUrl} (from "${btn.text}")`);
-            const content = await extractStructured(newTab).catch(() => ({ rawContent: "" }));
-            externalPagesMap.set(tabUrl, {
-              url: tabUrl,
-              title: tabTitle,
-              content: content.rawContent || "",
-              source_button_text: btn.text,
-            });
-          }
-          await newTab.close().catch(() => null);
-        } catch {}
-      }
-
-      // Check for navigation on main page
-      const navResult = await navigationPromise;
-      if (navResult) {
-        const newUrl = page.url();
-        if (newUrl !== pageUrl) {
-          if (!externalPagesMap.has(newUrl) && (WIDGET_DOMAIN_RE.test(newUrl) || !newUrl.startsWith(base))) {
-            console.log(`[BTN_CRAWL] Redirected to: ${newUrl} (from "${btn.text}")`);
-            const title = await page.title().catch(() => "");
-            const content = await extractStructured(page).catch(() => ({ rawContent: "" }));
-            externalPagesMap.set(newUrl, {
-              url: newUrl,
-              title,
-              content: content.rawContent || "",
-              source_button_text: btn.text,
-            });
-          }
-          // Navigate back to original page
-          await page.goto(pageUrl, { timeout: 8000, waitUntil: "domcontentloaded" }).catch(() => null);
-        }
-      }
-
-      // Check for modal/dialog that appeared (in-page widget)
-      try {
-        const modalVisible = await page.evaluate(() => {
-          const modals = document.querySelectorAll('[class*="modal"],[class*="dialog"],[role="dialog"],[class*="overlay"],[class*="popup"]');
-          for (const m of modals) {
-            const r = m.getBoundingClientRect();
-            const s = window.getComputedStyle(m);
-            if (r.width > 100 && r.height > 100 && s.display !== "none" && s.visibility !== "hidden") {
-              // Check for iframes inside (likely widget)
-              const iframe = m.querySelector("iframe");
-              if (iframe) return iframe.src || "modal_with_iframe";
-              return "modal_visible";
-            }
-          }
-          return null;
-        });
-
-        if (modalVisible && modalVisible !== "modal_visible") {
-          // iframe inside modal
-          const iframeSrc = modalVisible;
-          if (!externalPagesMap.has(iframeSrc)) {
-            console.log(`[BTN_CRAWL] Modal iframe: ${iframeSrc} (from "${btn.text}")`);
-            const widgetContent = await fetchWidgetPage(iframeSrc, btn.text, browser);
-            if (widgetContent) externalPagesMap.set(iframeSrc, widgetContent);
-          }
-        }
-        // Close modal
-        await page.keyboard.press("Escape").catch(() => null);
-      } catch {}
-
-    } catch (e) {
-      // best-effort, skip errors per button
-    }
-  }
-}
-
-// Fetch an external widget page (cross-domain) and extract its text content
-async function fetchWidgetPage(url, sourceButtonText, browser) {
-  try {
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    const pg = await ctx.newPage();
-
-    await pg.goto(url, { timeout: 12000, waitUntil: "domcontentloaded" });
-    await pg.waitForTimeout(1500);
-
-    const title = await pg.title().catch(() => "");
-    const content = await extractStructured(pg).catch(() => ({ rawContent: "" }));
-
-    await pg.close().catch(() => null);
-    await ctx.close().catch(() => null);
-
-    return {
-      url,
-      title,
-      content: content.rawContent || "",
-      source_button_text: sourceButtonText,
-    };
-  } catch (e) {
-    console.error(`[BTN_CRAWL] fetchWidgetPage error for ${url}:`, e.message);
-    return null;
   }
 }
 
@@ -1748,53 +1562,6 @@ async function fastOCR(buffer) {
   } catch { return ""; }
 }
 
-// ================= SMART OCR - pricing images only =================
-// Scores an image element on how likely it contains pricing/package text.
-// Returns true if the image should be OCR-ed.
-
-// ── FILENAME WHITELIST ────────────────────────────────────────────────────
-// Any image whose filename matches this pattern is ALWAYS OCR-ed,
-// regardless of size, context, or any other filter.
-// Add site-specific pricing image names here (case-insensitive, matches anywhere in URL).
-// Examples already included: ceni-basic1, ceni-standart1, ceni-premium1
-const OCR_FILENAME_WHITELIST_RE = /ceni[-_]?(basic|standart|standard|premium|light|pro|plus|starter|business|enterprise)\d*\.(jpe?g|png|webp)/i;
-
-async function isPricingRelevantImage(imgInfo) {
-  if (!imgInfo) return false;
-
-  // ── WHITELIST CHECK (highest priority — always OCR these filenames) ──────
-  if (imgInfo.src && OCR_FILENAME_WHITELIST_RE.test(imgInfo.src)) {
-    console.log(`[OCR] ✓ Whitelist match: ${imgInfo.src}`);
-    return true;
-  }
-
-  // Must be visible and reasonable size
-  if (!imgInfo.visible) return false;
-  if (imgInfo.w < 80 || imgInfo.h < 40) return false;
-  // Skip giant hero/banner images (unlikely pure text cards)
-  if (imgInfo.w > 1800 && imgInfo.h > 900) return false;
-  // Skip obvious non-text images by filename
-  if (SKIP_OCR_RE.test(imgInfo.src)) return false;
-
-  // Positive signals: src/alt contains price-related keywords
-  const hint = (imgInfo.src + " " + imgInfo.alt).toLowerCase();
-  if (/pric|price|cena|ceni|paketi|package|plan|offer|tarif|rate|лв|eur|€/i.test(hint)) return true;
-
-  // Positive signal: image is inside a pricing/package container (checked via contextClass)
-  if (imgInfo.contextClass && /pric|package|plan|card|tier|paketi|offer/i.test(imgInfo.contextClass)) return true;
-
-  // Positive signal: image dimensions look like a pricing card/table (landscape card shape)
-  const ratio = imgInfo.w / imgInfo.h;
-  if (imgInfo.w >= 150 && imgInfo.w <= 1200 && imgInfo.h >= 80 && ratio >= 0.5 && ratio <= 5) {
-    // Medium-sized image that is NOT a portrait photo (likely infographic/card)
-    // Additional guard: skip if alt clearly says photo/background
-    if (/photo|фото|background|bg|hero|banner|декор/i.test(hint)) return false;
-    return true;
-  }
-
-  return false;
-}
-
 async function ocrAllImages(page, stats) {
   const results = [];
 
@@ -1805,94 +1572,71 @@ async function ocrAllImages(page, stats) {
     const imgInfos = await Promise.all(
       imgElements.map(async (img, i) => {
         try {
-          const info = await img.evaluate(el => {
-            const rect = el.getBoundingClientRect();
-            const container = el.closest(
-              '[class*="pric"],[class*="package"],[class*="plan"],[class*="card"],[class*="paketi"],[class*="offer"],[class*="tier"]'
-            );
-            return {
-              src: el.src || el.getAttribute("data-src") || "",
-              alt: el.alt || "",
-              w: Math.round(rect.width),
-              h: Math.round(rect.height),
-              visible: rect.width > 0,
-              contextClass: container ? (container.className || "") : "",
-            };
-          });
+          const info = await img.evaluate(el => ({
+            src: el.src || "",
+            alt: el.alt || "",
+            w: Math.round(el.getBoundingClientRect().width),
+            h: Math.round(el.getBoundingClientRect().height),
+            visible: el.getBoundingClientRect().width > 0
+          }));
           return { ...info, element: img, index: i };
         } catch { return null; }
       })
     );
 
-    // Smart filter: only OCR pricing-relevant images
-    const validImages = [];
-    for (const info of imgInfos) {
-      if (await isPricingRelevantImage(info)) {
-        validImages.push(info);
+    const validImages = imgInfos.filter(info => {
+      if (!info || !info.visible) return false;
+      if (info.w < 50 || info.h < 25) return false;
+      if (info.w > 1800 && info.h > 700) return false;
+      if (SKIP_OCR_RE.test(info.src)) {
+        return false;
       }
-    }
+      return true;
+    });
 
-    console.log(`[OCR] ${validImages.length}/${imgElements.length} images selected for smart OCR`);
+    console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
     if (validImages.length === 0) return results;
 
-    // ── Fetch image bytes directly via URL (more reliable than element.screenshot) ──
-    // This avoids viewport/layout issues where element.screenshot returns blank.
-    const fetchedImages = await Promise.all(
+    const screenshots = await Promise.all(
       validImages.map(async (img) => {
-        if (!img.src) return null;
         try {
           if (globalOcrCache.has(img.src)) {
-            return { ...img, buffer: null, cached: true, text: globalOcrCache.get(img.src) };
+            const cachedText = globalOcrCache.get(img.src);
+            return { ...img, buffer: null, cached: true, text: cachedText };
           }
+
           if (page.isClosed()) return null;
-
-          // Try direct URL fetch first (full resolution, no viewport clip)
-          let buffer = null;
-          try {
-            const response = await page.request.get(img.src, { timeout: 5000 });
-            if (response.ok()) {
-              buffer = await response.body();
-            }
-          } catch {}
-
-          // Fallback: element screenshot
-          if (!buffer) {
-            try {
-              // Scroll element into view first
-              await img.element.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
-              buffer = await img.element.screenshot({ type: 'png', timeout: 3000 });
-            } catch {}
-          }
-
-          if (!buffer || buffer.length < 500) return null;
+          const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
           return { ...img, buffer, cached: false };
         } catch { return null; }
       })
     );
 
-    const validFetched = fetchedImages.filter(s => s !== null);
-    console.log(`[OCR] ${validFetched.length} images fetched, sending to OCR`);
+    const validScreenshots = screenshots.filter(s => s !== null);
 
-    for (let i = 0; i < validFetched.length; i += PARALLEL_OCR) {
-      const batch = validFetched.slice(i, i + PARALLEL_OCR);
+    for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
+      const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
 
       const batchResults = await Promise.all(
         batch.map(async (img) => {
           if (img.cached) {
-            return (img.text && img.text.length > 2) ? { text: img.text, src: img.src, alt: img.alt } : null;
+            if (img.text && img.text.length > 2) {
+              return { text: img.text, src: img.src, alt: img.alt };
+            }
+            return null;
           }
+
           if (!img.buffer) return null;
 
           const text = await fastOCR(img.buffer);
-          globalOcrCache.set(img.src, text || "");
+
+          globalOcrCache.set(img.src, text);
 
           if (text && text.length > 2) {
             stats.ocrElementsProcessed++;
             stats.ocrCharsExtracted += text.length;
-            console.log(`[OCR] ✓ ${img.src.split("/").pop()} → ${text.length} chars`);
             return { text, src: img.src, alt: img.alt };
           }
-          console.log(`[OCR] ✗ ${img.src.split("/").pop()} → empty result`);
           return null;
         })
       );
@@ -1923,8 +1667,111 @@ async function collectAllLinks(page, base) {
   } catch { return []; }
 }
 
+// ================= EXTERNAL WIDGET CRAWLER =================
+// Crawls pages opened by buttons that lead to external domains (e.g. booking widgets).
+// Results are sent ONLY to the worker, not merged into the main sitemap.
+
+async function sendExternalPageToWorker(payload) {
+  if (!WORKER_URL || !WORKER_SECRET) return;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const response = await fetch(`${WORKER_URL}/external-page`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${WORKER_SECRET}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (response.ok) {
+      console.log(`[EXT] ✓ Worker received external page: ${payload.url}`);
+    } else {
+      console.error(`[EXT] ✗ Worker error ${response.status} for: ${payload.url}`);
+    }
+  } catch (e) {
+    console.error(`[EXT] ✗ Send error:`, e.message);
+  }
+}
+
+async function crawlExternalWidget(browser, sourceUrl, buttonText, externalUrl, siteId) {
+  // Deduplicate: track visited external URLs globally per crawl session
+  if (visitedExternal.has(externalUrl)) return;
+  visitedExternal.add(externalUrl);
+
+  console.log(`[EXT] Button "${buttonText}" → ${externalUrl}`);
+
+  let ctx;
+  try {
+    ctx = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    });
+    const pg = await ctx.newPage();
+
+    // Navigate to the external URL
+    await pg.goto(externalUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+
+    // Wait for JS-heavy widgets to render (SPAs, booking engines)
+    try { await pg.waitForLoadState("networkidle", { timeout: 5000 }); } catch {}
+    await pg.waitForTimeout(1000);
+
+    // Scroll to trigger lazy content
+    await pg.evaluate(async () => {
+      for (let pos = 0; pos < document.body.scrollHeight; pos += window.innerHeight) {
+        window.scrollTo(0, pos);
+        await new Promise(r => setTimeout(r, 80));
+      }
+    });
+
+    const finalUrl = pg.url();
+    const title = await pg.title().catch(() => "");
+
+    // Extract structured content (text)
+    const data = await extractStructured(pg).catch(() => ({ rawContent: "" }));
+    const htmlContent = normalizeNumbers(clean(data.rawContent));
+
+    // Extract capabilities (forms, wizards, iframes)
+    const caps = await extractCapabilitiesFromPage(pg).catch(() => ({ forms: [], wizards: [], iframes: [], availability: [] }));
+
+    // Extract raw sitemap (buttons & forms on widget page)
+    const rawSiteMap = await extractSiteMapFromPage(pg).catch(() => ({ buttons: [], forms: [], prices: [] }));
+    const enrichedSiteMap = enrichSiteMap(rawSiteMap, siteId, finalUrl);
+
+    // Extract contacts
+    const domContacts = await extractContactsFromPage(pg).catch(() => ({ emails: [], phones: [], textHints: "" }));
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
+    const contacts = {
+      emails: Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12),
+      phones: Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12),
+    };
+
+    await pg.close();
+
+    // Send everything to the worker
+    await sendExternalPageToWorker({
+      site_id: siteId,
+      source_url: sourceUrl,
+      button_text: buttonText,
+      url: finalUrl,
+      title,
+      content: htmlContent.slice(0, 20000),
+      site_map: enrichedSiteMap,
+      capabilities: buildCombinedCapabilities([caps], finalUrl),
+      contacts,
+    });
+
+  } catch (e) {
+    console.error(`[EXT] Error crawling ${externalUrl}:`, e.message);
+  } finally {
+    if (ctx) await ctx.close().catch(() => {});
+  }
+}
+
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, browser, externalPagesMap) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, browser, siteId) {
   const startTime = Date.now();
 
   try {
@@ -1977,62 +1824,30 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
       console.error("[PRICING] Extract error:", e.message);
     }
 
-    // ── OCR PRICING MERGE ────────────────────────────────────────────────────
-    // Parse pricing cards directly from OCR text of whitelisted images.
-    // This handles sites like boutiquehome-bg.com where prices exist ONLY as images.
-    if (ocrResults.length > 0) {
-      if (!pricing) pricing = { pricing_cards: [], installment_plans: [] };
-      if (!pricing.pricing_cards) pricing.pricing_cards = [];
-
-      for (const ocr of ocrResults) {
-        // Only process images that matched the whitelist (src contains ceni- pattern)
-        if (!OCR_FILENAME_WHITELIST_RE.test(ocr.src || "")) continue;
-
-        const text = ocr.text || "";
-        if (!text) continue;
-
-        // Extract title: first non-empty line that looks like a package name
-        const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
-        const title = lines.find(l => /basic|standart|standard|premium|light|pro|plus|starter|business|enterprise/i.test(l)) || lines[0] || "";
-
-        // Extract price: look for currency patterns
-        const priceMatch = text.match(/(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/i)
-          || text.match(/(€|лв\.?|BGN|EUR)\s*(\d[\d\s.,]*)/i);
-        const price_text = priceMatch ? priceMatch[0].replace(/\s+/g, " ").trim() : "";
-
-        // Extract per-unit suffix (кв.м, /m², etc.)
-        const unitMatch = text.match(/\/\s*(кв\.?\s*м\.?|m²|sqm|кв\.м)/i);
-        const unit = unitMatch ? unitMatch[0] : "";
-
-        // Features: remaining lines that aren't the title or price
-        const features = lines.filter(l =>
-          l !== title &&
-          !priceMatch?.[0].includes(l) &&
-          l.length > 2 && l.length < 120
-        ).slice(0, 20);
-
-        const key = `${title}|${price_text}`;
-        const alreadyExists = pricing.pricing_cards.some(c =>
-          c.title?.toLowerCase() === title.toLowerCase() ||
-          (price_text && c.price_text === price_text)
-        );
-
-        if (!alreadyExists && (title || price_text)) {
-          pricing.pricing_cards.push({ title, price_text: price_text + unit, features, source: "ocr" });
-          console.log(`[PRICING] OCR card: "${title}" → ${price_text}${unit}`);
-        }
-      }
-    }
-
     // *** EXISTING: Extract SiteMap from this page ***
+    let rawSiteMap = null;
     try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
+      rawSiteMap = await extractSiteMapFromPage(page);
       if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
         siteMaps.push(rawSiteMap);
         console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
       }
     } catch (e) {
       console.error("[SITEMAP] Extract error:", e.message);
+    }
+
+    // *** NEW: Crawl external widgets (buttons leading to other domains) ***
+    if (rawSiteMap && browser) {
+      const externalButtons = (rawSiteMap.buttons || []).filter(b => b.is_external && b.external_url);
+      for (const btn of externalButtons) {
+        // Fire-and-forget: don't await, run in background so main crawl isn't blocked
+        crawlExternalWidget(browser, url, btn.text, btn.external_url, siteId).catch(e =>
+          console.error("[EXT] Unhandled error:", e.message)
+        );
+      }
+      if (externalButtons.length > 0) {
+        console.log(`[EXT] Queued ${externalButtons.length} external widget(s) from: ${url}`);
+      }
     }
 
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
@@ -2044,13 +1859,6 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, b
       }
     } catch (e) {
       console.error("[CAPS] Extract error:", e.message);
-    }
-
-    // *** NEW: Click buttons and crawl widget/booking destinations ***
-    try {
-      await crawlButtonDestinations(page, url, base, externalPagesMap, browser);
-    } catch (e) {
-      console.error("[BTN_CRAWL] Error:", e.message);
     }
 
     // Format content
@@ -2141,7 +1949,6 @@ async function crawlSmart(startUrl, siteId = null) {
   const queue = [];
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
-  const externalPagesMap = new Map(); // cross-domain widget/booking pages discovered via button clicks
   let base = "";
 
   // ✅ NEW: aggregate contacts across pages
@@ -2198,7 +2005,7 @@ async function crawlSmart(startUrl, siteId = null) {
 
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, browser, externalPagesMap);
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, browser, siteId);
 
         if (result.page) {
           // ✅ collect contacts
@@ -2230,12 +2037,6 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
-  const externalPages = Array.from(externalPagesMap.values());
-  if (externalPages.length > 0) {
-    console.log(`\n[BTN_CRAWL] ${externalPages.length} external widget/booking pages discovered:`);
-    externalPages.forEach(p => console.log(`  → ${p.url} (via "${p.source_button_text}")`));
-  }
-
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
@@ -2262,7 +2063,7 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts, externalPages };
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
 }
 
 // ================= HTTP SERVER =================
@@ -2279,7 +2080,6 @@ http
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
-        externalPagesCount: lastResult?.externalPages?.length || 0,
         contacts: lastResult?.contacts || null,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
       }));
@@ -2342,6 +2142,7 @@ http
         crawlFinished = false;
         lastCrawlUrl = requestedUrl;
         visited.clear();
+        visitedExternal.clear();
         globalOcrCache.clear();
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
