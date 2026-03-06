@@ -23,9 +23,9 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 5;
+const PARALLEL_TABS = 10; // ⚡ was 5
 const PARALLEL_OCR = 10;
-const OCR_TIMEOUT_MS = 6000;
+const OCR_TIMEOUT_MS = 3000; // ⚡ was 6000
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -577,7 +577,7 @@ async function saveSiteMapToSupabase(siteMap) {
 }
 
 // Send SiteMap to Worker to prepare hot session
-async function sendSiteMapToWorker(siteMap) {
+async function sendSiteMapToWorker(siteMap, capabilities = []) {
   if (!WORKER_URL || !WORKER_SECRET) {
     console.log("[SITEMAP] Worker not configured, skipping");
     return false;
@@ -589,6 +589,8 @@ async function sendSiteMapToWorker(siteMap) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
+    // ⚡ Send both siteMap (buttons/forms/prices) AND capabilities (full field schemas)
+    // Worker uses capabilities to fill forms deterministically without guessing selectors
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
       headers: {
@@ -598,6 +600,7 @@ async function sendSiteMapToWorker(siteMap) {
       body: JSON.stringify({
         site_id: siteMap.site_id,
         site_map: siteMap,
+        capabilities, // ⚡ NEW: full form schemas with selector_candidates
       }),
       signal: controller.signal,
     });
@@ -1669,20 +1672,12 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
 
-    // Scroll for lazy load
-    await page.evaluate(async () => {
-      const scrollStep = window.innerHeight;
-      const maxScroll = document.body.scrollHeight;
-
-      for (let pos = 0; pos < maxScroll; pos += scrollStep) {
-        window.scrollTo(0, pos);
-        await new Promise(r => setTimeout(r, 100));
-      }
-
-      window.scrollTo(0, maxScroll);
-
+    // ⚡ Minimal scroll for lazy-load (2 steps, no sleep between)
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight / 2);
+      window.scrollTo(0, document.body.scrollHeight);
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
@@ -1690,10 +1685,10 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       });
     });
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(150); // ⚡ was 500
 
     try {
-      await page.waitForLoadState('networkidle', { timeout: 3000 });
+      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ⚡ was 3000
     } catch {}
 
     const title = clean(await page.title());
@@ -1839,7 +1834,7 @@ async function crawlSmart(startUrl, siteId = null) {
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 8000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
@@ -1923,7 +1918,7 @@ async function crawlSmart(startUrl, siteId = null) {
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
     await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap);
+    await sendSiteMapToWorker(combinedSiteMap, combinedCapabilities); // ⚡ pass capabilities
   }
 
   let combinedCapabilities = [];
