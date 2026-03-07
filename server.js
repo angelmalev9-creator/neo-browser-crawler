@@ -750,6 +750,90 @@ async function extractPricingFromPage(page) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// OCR-BASED PRICING EXTRACTION
+// Parses pricing cards from raw OCR text when prices are rendered as images
+// ═══════════════════════════════════════════════════════════════════════════
+
+function extractPricingFromOcr(ocrResults) {
+  const pricing_cards = [];
+  const seen = new Set();
+
+  // Money regex: €350, 350 лв, 650 EUR, etc.
+  const moneyRe = /([€$])\s*(\d[\d\s.,]*)|\b(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/gi;
+
+  for (const { text, alt } of ocrResults) {
+    if (!text || text.length < 3) continue;
+
+    // Split OCR text into lines for context
+    const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+
+    // Find all money matches
+    let m;
+    const localRe = /([€$])\s*(\d[\d\s.,]*)|\b(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/gi;
+    while ((m = localRe.exec(text)) !== null) {
+      const price_text = m[0].replace(/\s+/g, "").trim();
+
+      // Look for a title near the price in the OCR text
+      // Find line index of the match
+      let charPos = 0;
+      let titleLine = "";
+      for (const line of lines) {
+        if (charPos + line.length >= m.index) {
+          // Use nearby lines as title candidates
+          const lineIdx = lines.indexOf(line);
+          // Look at lines before/after the price line for a title
+          for (let delta = -3; delta <= 3; delta++) {
+            const candidate = lines[lineIdx + delta];
+            if (!candidate) continue;
+            // Title: short, no digits or currency symbols, not the price itself
+            if (candidate.length >= 3 && candidate.length <= 60 && !/\d/.test(candidate) && candidate !== price_text) {
+              titleLine = candidate;
+              break;
+            }
+          }
+          break;
+        }
+        charPos += line.length + 1;
+      }
+
+      // Fallback to alt text as title
+      if (!titleLine && alt && alt.length <= 60) titleLine = alt;
+      if (!titleLine) titleLine = price_text; // last resort
+
+      const key = `${titleLine}|${price_text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Extract features from remaining lines (non-price, non-title lines)
+      const features = lines.filter(l => {
+        if (l === titleLine) return false;
+        if (l === price_text) return false;
+        if (/([€$])\s*\d|\d\s*(лв\.?|лева|BGN|EUR)/i.test(l)) return false;
+        return l.length >= 3 && l.length <= 140;
+      }).slice(0, 20);
+
+      const period = /\/\s*месец|на месец|месец/i.test(text) ? "monthly"
+                   : /еднократно|one[-\s]?time/i.test(text) ? "one_time"
+                   : null;
+
+      pricing_cards.push({
+        title: titleLine,
+        price_text,
+        period,
+        badge: "",
+        features,
+        source: "ocr",
+      });
+    }
+  }
+
+  return {
+    pricing_cards: pricing_cards.slice(0, 12),
+    installment_plans: pricing_cards.filter(c => c.period === "monthly").slice(0, 12),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // NEW: CAPABILITIES EXTRACTION (FOR form_schemas)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1710,6 +1794,23 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     let pricing = null;
     try {
       pricing = await extractPricingFromPage(page);
+
+      // ✅ FIX: Also extract pricing from OCR results (for sites where prices are rendered as images, not DOM text)
+      if (ocrResults.length > 0) {
+        const ocrPricing = extractPricingFromOcr(ocrResults);
+        if (ocrPricing.pricing_cards.length > 0) {
+          console.log(`[PRICING OCR] ${ocrPricing.pricing_cards.length} cards from OCR`);
+          const domPriceTexts = new Set((pricing?.pricing_cards || []).map(c => c.price_text));
+          const newOcrCards = ocrPricing.pricing_cards.filter(c => !domPriceTexts.has(c.price_text));
+          pricing = pricing || { pricing_cards: [], installment_plans: [] };
+          pricing.pricing_cards = [...(pricing.pricing_cards || []), ...newOcrCards].slice(0, 12);
+          pricing.installment_plans = [
+            ...(pricing.installment_plans || []),
+            ...ocrPricing.installment_plans.filter(c => !domPriceTexts.has(c.price_text))
+          ].slice(0, 12);
+        }
+      }
+
       if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
         console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
       }
