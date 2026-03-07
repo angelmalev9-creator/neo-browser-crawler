@@ -1611,7 +1611,7 @@ async function extractStructured(page) {
 
 // ================= GLOBAL OCR CACHE =================
 const globalOcrCache = new Map();
-const API_KEY = "AIzaSyCoai4BCKJtnnryHbhsPKxJN35UMcMAKrk";
+const API_KEY = process.env.GOOGLE_VISION_API_KEY || "AIzaSyBngqUxV-Rc8kLhfMp651fqHTEQ9eVLDgg";
 
 async function fastOCR(buffer) {
   try {
