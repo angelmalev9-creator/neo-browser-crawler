@@ -1635,11 +1635,29 @@ async function fastOCR(buffer) {
     );
 
     clearTimeout(timeout);
-    if (!res.ok) return "";
+
+    if (!res.ok) {
+      let errBody = "";
+      try { errBody = await res.text(); } catch {}
+      console.error(`[OCR ERROR] HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+      return "";
+    }
 
     const json = await res.json();
-    return json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
-  } catch { return ""; }
+
+    // Log Vision API errors (e.g. quota exceeded, invalid key)
+    const apiError = json.responses?.[0]?.error;
+    if (apiError) {
+      console.error(`[OCR API ERROR] code=${apiError.code} msg=${apiError.message}`);
+      return "";
+    }
+
+    const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
+    return text;
+  } catch (e) {
+    console.error(`[OCR EXCEPTION] ${e.message}`);
+    return "";
+  }
 }
 
 async function ocrAllImages(page, stats) {
