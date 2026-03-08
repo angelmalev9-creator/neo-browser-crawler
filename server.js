@@ -1744,20 +1744,12 @@ async function extractStructured(page) {
 
       return {
         rawContent: [
-          sections.map(s => `${s.heading}
-${s.text}`).join("
-
-"),
+          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
-          overlayTexts.join("
-"),
+          overlayTexts.join("\n"),
           pseudoTexts.join(" "),
-          topControlTexts.length ? `TOP_CONTROLS
-${topControlTexts.join("
-")}` : "",
-        ].filter(Boolean).join("
-
-"),
+          topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
+        ].filter(Boolean).join("\n\n"),
       };
     });
   } catch (e) {
