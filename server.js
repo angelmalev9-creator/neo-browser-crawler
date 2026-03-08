@@ -1205,26 +1205,47 @@ async function extractCapabilitiesFromPage(page) {
     });
 
     // ═══════════════════════════════════════════════════════════
-    // AVAILABILITY EXTRACTION (unchanged)
+    // AVAILABILITY EXTRACTION (native + additive custom booking bars)
     // ═══════════════════════════════════════════════════════════
     const availability = [];
+    const availabilityDedupe = new Set();
+
+    const pushAvailability = (schema, keySeed = "") => {
+      try {
+        const key = JSON.stringify({
+          ui_type: schema?.ui_type || "native",
+          keySeed,
+          selectors: (schema?.selector_candidates || []).slice(0, 3),
+          text_hint: (schema?.text_hint || "").slice(0, 80),
+          dates: (schema?.date_inputs || []).map(d => d?.name || d?.label || "").slice(0, 4),
+          guests: (schema?.guest_fields || []).map(g => g?.label || g?.text || "").slice(0, 4),
+          actions: (schema?.action_buttons || []).map(a => a?.text || "").slice(0, 4),
+        });
+        if (availabilityDedupe.has(key)) return;
+        availabilityDedupe.add(key);
+      } catch {}
+
+      availability.push({
+        kind: "availability",
+        schema,
+      });
+    };
+
     const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
       .filter(isVisible)
       .slice(0, 10);
 
     if (dateInputs.length > 0) {
-      availability.push({
-        kind: "availability",
-        schema: {
-          date_inputs: dateInputs.map(inp => ({
-            name: inp.getAttribute("name") || inp.id || "",
-            label: getLabel(inp),
-            selector_candidates: selectorCandidates(inp),
-            required:
-              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
-          })),
-        },
-      });
+      pushAvailability({
+        ui_type: "native_date_inputs",
+        date_inputs: dateInputs.map(inp => ({
+          name: inp.getAttribute("name") || inp.id || "",
+          label: getLabel(inp),
+          selector_candidates: selectorCandidates(inp),
+          required:
+            inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+        })),
+      }, "native_date_inputs");
     }
 
     const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
@@ -1232,16 +1253,150 @@ async function extractCapabilitiesFromPage(page) {
       .slice(0, 8);
 
     if (calendarLike.length > 0) {
-      availability.push({
-        kind: "availability",
-        schema: {
-          calendar_containers: calendarLike.map(el => ({
-            selector_candidates: selectorCandidates(el),
-            text_hint: (el.textContent || "").trim().slice(0, 120),
-          })),
-        },
-      });
+      pushAvailability({
+        ui_type: "calendar_container",
+        calendar_containers: calendarLike.map(el => ({
+          selector_candidates: selectorCandidates(el),
+          text_hint: (el.textContent || "").trim().slice(0, 120),
+        })),
+      }, "calendar_like");
     }
+
+    const bookingText = (value) => (value || "").replace(/\s+/g, " ").trim();
+    const bookingPatterns = {
+      checkIn: /(пристигане|настаняване|check\s*in|check-in|arrival|arrive)/i,
+      checkOut: /(напускане|заминаване|check\s*out|check-out|departure|depart)/i,
+      guests: /(възрастни|гости|guests?|adults?|деца|children|child|стаи|rooms?|persons?|лица)/i,
+      action: /(резервирай|резервац|book\s*now|book|reserve|search|check\s*availability|availability|провери|търси|виж)/i,
+      noise: /(начало|home|контакти|contact|ресторант|restaurant|оферти|offers|конферентна зала|about|за нас)/i,
+    };
+
+    const candidateSelectors = [
+      "section",
+      "div",
+      "aside",
+      "header",
+      "main",
+      "[class*='book']",
+      "[class*='reserv']",
+      "[class*='search']",
+      "[class*='hero']",
+      "[class*='widget']",
+      "[data-testid*='book']",
+      "[data-testid*='reserv']",
+      "[data-testid*='search']",
+    ];
+
+    const candidateContainers = Array.from(new Set(
+      candidateSelectors.flatMap(sel => {
+        try {
+          return Array.from(document.querySelectorAll(sel));
+        } catch {
+          return [];
+        }
+      })
+    )).filter(el => {
+      if (!el || !isVisible(el)) return false;
+      if (el.tagName === "FORM") return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 180 || rect.height < 40) return false;
+      return true;
+    });
+
+    candidateContainers.slice(0, 120).forEach(container => {
+      const fullText = bookingText(container.textContent || "");
+      if (!fullText || fullText.length < 12 || fullText.length > 1000) return;
+
+      const checkInMatch = bookingPatterns.checkIn.test(fullText);
+      const checkOutMatch = bookingPatterns.checkOut.test(fullText);
+      const guestsMatch = bookingPatterns.guests.test(fullText);
+      const actionMatch = bookingPatterns.action.test(fullText);
+
+      const fieldSignals = [checkInMatch, checkOutMatch, guestsMatch].filter(Boolean).length;
+      if (fieldSignals < 2 || !actionMatch) return;
+
+      const directChildren = Array.from(container.querySelectorAll("button, a, input, select, [role='button'], [role='combobox'], [aria-haspopup='listbox']"))
+        .filter(isVisible)
+        .slice(0, 20);
+
+      const actionButtons = [];
+      const dateFields = [];
+      const guestFields = [];
+
+      directChildren.forEach(el => {
+        const text = bookingText(
+          el.textContent ||
+          el.getAttribute("aria-label") ||
+          el.getAttribute("placeholder") ||
+          el.getAttribute("value") || ""
+        ).slice(0, 120);
+        if (!text) return;
+
+        const selectors = selectorCandidates(el);
+        if (bookingPatterns.action.test(text) && !bookingPatterns.noise.test(text)) {
+          actionButtons.push({ text, selector_candidates: selectors });
+        }
+        if (bookingPatterns.checkIn.test(text) || bookingPatterns.checkOut.test(text)) {
+          dateFields.push({
+            text,
+            label: text,
+            selector_candidates: selectors,
+          });
+        }
+        if (bookingPatterns.guests.test(text)) {
+          guestFields.push({
+            text,
+            label: text,
+            selector_candidates: selectors,
+          });
+        }
+      });
+
+      if (dateFields.length + guestFields.length < 2) {
+        const chunks = fullText.split(/\s{2,}|\n+/).map(bookingText).filter(Boolean).slice(0, 20);
+        chunks.forEach(chunk => {
+          if ((bookingPatterns.checkIn.test(chunk) || bookingPatterns.checkOut.test(chunk)) && dateFields.length < 6) {
+            dateFields.push({ text: chunk, label: chunk, selector_candidates: selectorCandidates(container) });
+          }
+          if (bookingPatterns.guests.test(chunk) && guestFields.length < 6) {
+            guestFields.push({ text: chunk, label: chunk, selector_candidates: selectorCandidates(container) });
+          }
+          if (bookingPatterns.action.test(chunk) && actionButtons.length < 6 && !bookingPatterns.noise.test(chunk)) {
+            actionButtons.push({ text: chunk, selector_candidates: selectorCandidates(container) });
+          }
+        });
+      }
+
+      const uniqueByText = (items) => {
+        const seen = new Set();
+        return items.filter(item => {
+          const key = (item.text || item.label || "").toLowerCase();
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }).slice(0, 6);
+      };
+
+      const cleanDateFields = uniqueByText(dateFields);
+      const cleanGuestFields = uniqueByText(guestFields);
+      const cleanActions = uniqueByText(actionButtons);
+
+      if (cleanDateFields.length + cleanGuestFields.length < 2 || cleanActions.length === 0) return;
+
+      pushAvailability({
+        ui_type: "inline_booking_bar",
+        selector_candidates: selectorCandidates(container),
+        text_hint: fullText.slice(0, 220),
+        detected_fields: {
+          check_in: checkInMatch,
+          check_out: checkOutMatch,
+          guests: guestsMatch,
+        },
+        date_inputs: cleanDateFields,
+        guest_fields: cleanGuestFields,
+        action_buttons: cleanActions,
+      }, fullText.slice(0, 160));
+    });
 
     // ═══════════════════════════════════════════════════════════
     // WIZARD / MULTI-STEP DETECTION (enriched with choices)
