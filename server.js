@@ -1570,24 +1570,16 @@ async function extractCapabilitiesFromPage(page) {
 
 function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUrl = "") {
   const empty = { forms: [], wizards: [], iframes: [], availability: [] };
-  const text = String(rawContent || "").replace(/
-/g, "");
+  const text = String(rawContent || "").replace(/\r/g, "");
   if (!text.trim()) return empty;
 
-  const topMatch = text.match(/(?:^|
-
-)TOP_CONTROLS
-([\s\S]*?)(?=
-
-|$)/i);
+  const topMatch = text.match(/(?:^|\n\n)TOP_CONTROLS\n([\s\S]*?)(?=\n\n|$)/i);
   const topLines = topMatch
-    ? topMatch[1].split(/
-+/).map((s) => s.trim()).filter(Boolean).slice(0, 20)
+    ? topMatch[1].split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 20)
     : [];
 
   const scopeText = [pageTitle, pageUrl, ...topLines, text.slice(0, 5000)]
-    .join(" 
- ")
+    .join(" \n ")
     .replace(/\s+/g, " ")
     .trim();
   const hasTopControls = topLines.length > 0;
@@ -1690,59 +1682,6 @@ function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUr
   };
 }
 
-function buildCombinedCapabilities(perPageCaps, baseOrigin) {
-  const combined = [];
-  const seen = new Set();
-
-  for (const p of perPageCaps) {
-    const url = p.url || "";
-    const domain = normalizeDomain(url || baseOrigin || "");
-
-    const pushCap = (kind, schema, dom_snapshot) => {
-      // ✅ FIX: fingerprint based ONLY on kind + schema (not url)
-      // Same form on 15 pages → single fingerprint → single capability
-      const normalized = { kind, schema };
-      const fp = sha256Hex(stableStringify(normalized));
-      const key = `${kind}|${fp}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-
-      combined.push({
-        url,
-        domain,
-        kind,
-        fingerprint: fp,
-        schema,
-        dom_snapshot: dom_snapshot || null,
-      });
-    };
-
-    for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
-
-    // ✅ NEW: Process wizard capabilities
-    for (const w of p.wizards || []) pushCap("wizard", w.schema, w.dom_snapshot);
-
-    for (const w of p.iframes || []) {
-      const src = w.schema?.src || "";
-      pushCap("booking_widget", { ...w.schema, vendor: guessVendorFromText(src) });
-    }
-
-    for (const a of p.availability || []) pushCap("availability", a.schema);
-  }
-
-  // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
-  const forms = combined.filter(c => c.kind === "form").slice(0, 8);
-  const wizards = combined.filter(c => c.kind === "wizard").slice(0, 5);
-  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 5);
-  const avail = combined.filter(c => c.kind === "availability").slice(0, 5);
-  const other = combined.filter(c => !["form","wizard","booking_widget","availability"].includes(c.kind)).slice(0, 10);
-
-  return [...forms, ...wizards, ...widgets, ...avail, ...other];
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// EXISTING EXTRACTION FUNCTIONS (unchanged)
-// ═══════════════════════════════════════════════════════════════════════════
 
 async function extractStructured(page) {
   try {
