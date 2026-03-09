@@ -1245,11 +1245,10 @@ async function extractCapabilitiesFromPage(page) {
 
     // ═══════════════════════════════════════════════════════════
     // INTERACTIVE BOOKING BAR DETECTION (additive, non-destructive)
-    // Universal v3:
-    // - keep discovery-first behavior
-    // - refine winning container to a local booking row/cluster
-    // - never use nav/menu/page wrappers as final field sources
-    // - preserve availability writes to form_schemas
+    // Hybrid universal stable:
+    // - keep discovery-first behavior from hybrid
+    // - add penalties/filters for nav, footer, wrappers, room listings
+    // - do NOT hard-fail early, so form_schemas keeps filling
     // ═══════════════════════════════════════════════════════════
     const pushAvailability = (schema) => {
       const key = JSON.stringify(schema || {});
@@ -1281,7 +1280,7 @@ async function extractCapabilitiesFromPage(page) {
         .trim()
         .split(/\s+/)
         .filter(Boolean)
-        .slice(0, 5)
+        .slice(0, 4)
         .join(".");
       return `${tag} ${id} ${cls}`.trim();
     };
@@ -1289,7 +1288,7 @@ async function extractCapabilitiesFromPage(page) {
     const bookingRe = {
       checkIn: /(пристигане|настаняване|check\s*-?in|arrival|checkin)/i,
       checkOut: /(напускане|заминаване|check\s*-?out|departure|checkout)/i,
-      guests: /(възрастни|adults?|guests?|гости|деца|children|persons?|pax|promo\s*code|промо\s*код|rooms?\b|стаи?\b)/i,
+      guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?\b|стаи?\b|promo\s*code|промо\s*код)/i,
       action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)/i,
       noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|owl-carousel|slick-track)/i,
       menuNoise: /(начало|home|за нас|about|контакти|contact|галерия|gallery|оферти|offers|цени|pricing|blog|новини|faq|конферентна зала|ресторант|restaurant|всички стаи|стаи и апартаменти|rooms?\s*&\s*suites|accommodation|^en$|^bg$)/i,
@@ -1301,27 +1300,52 @@ async function extractCapabilitiesFromPage(page) {
       headingNoise: /^(настаняване|нашите стаи|ресторант|контакти|оферти|начало)$/i,
     };
 
+
+
     const isBadSignalText = (txt) => {
-      const t = safeText(txt || "", 220);
+      const t = safeText(txt || '', 220);
       if (!t) return true;
       if (bookingRe.noise.test(t)) return true;
       if (bookingRe.embedNoise.test(t)) return true;
       if (bookingRe.socialNoise.test(t)) return true;
-      if (/https?:\/\//i.test(t) || /src=|width=|height=|\.js\b/i.test(t)) return true;
-      if (t.length > 130 &&
-          !bookingRe.checkIn.test(t) &&
-          !bookingRe.checkOut.test(t) &&
-          !bookingRe.guests.test(t) &&
-          !bookingRe.action.test(t)) return true;
+      if (t.length > 130 && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t) && !bookingRe.action.test(t)) return true;
+      if (/https?:\/\//i.test(t) || /src=|width=|height=|\.js/i.test(t)) return true;
       return false;
     };
 
     const isWeakGenericSelector = (selectors = []) => {
       if (!selectors || !selectors.length) return true;
       return selectors.every(sel =>
-        /^div\b/i.test(sel) ||
-        /elementor-element|elementor-widget-container|elementor-widget-wrap|e-con-inner|\bsite\b|\bpage\b|shortcode|icon-box/i.test(sel)
+        /^div/i.test(sel) ||
+        /elementor-element|elementor-widget-container|elementor-widget-wrap|e-con-inner|site|page|shortcode|icon-box/i.test(sel)
       );
+    };
+
+    const filterUsableSignals = (items = [], bucket = 'field') => {
+      return (items || []).filter((item) => {
+        const text = safeText(item?.text || item?.label || '', 140);
+        if (!text) return false;
+        if (isBadSignalText(text)) return false;
+        if (bookingRe.marketingNoise.test(text)) return false;
+        if (bookingRe.menuNoise.test(text) && !item?.concrete) return false;
+        if (bucket === 'action') {
+          if (!bookingRe.action.test(text)) return false;
+          if (bookingRe.genericActionNoise.test(text)) return false;
+          if (isWeakGenericSelector(item?.selector_candidates || []) && !item?.concrete) return false;
+          return true;
+        }
+        if (bucket === 'guests') {
+          if (!bookingRe.guests.test(text)) return false;
+          if (bookingRe.roomNoise.test(text) && !/възрастни|гости|деца|adults?|guests?|children/i.test(text)) return false;
+        }
+        if (bucket === 'date') {
+          if (!(bookingRe.checkIn.test(text) || bookingRe.checkOut.test(text))) return false;
+          if (bookingRe.headingNoise.test(text) && !item?.concrete) return false;
+          if (text.split(/\s+/).length > 6 && !item?.concrete) return false;
+        }
+        if (isWeakGenericSelector(item?.selector_candidates || []) && !item?.concrete && text.split(/\s+/).length > 5) return false;
+        return true;
+      });
     };
 
     const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], [aria-label], [placeholder]';
@@ -1359,28 +1383,19 @@ async function extractCapabilitiesFromPage(page) {
         /тип легло|максимална заетост|детайли|details|научете повече|learn more/.test(txt);
     };
 
-    const isMenuLikeElement = (el) => {
-      if (!el) return false;
-      const iden = getElementIdentity(el).toLowerCase();
-      const txt = safeText(getInteractiveText(el), 120).toLowerCase();
-      if (el.matches?.('a.menu-link, .menu-link, .menu-text, .submenu-parent-icon, .skip-link, a.skip-link')) return true;
-      if (isHeaderLike(el) && bookingRe.menuNoise.test(txt)) return true;
-      return /(menu-link|menu-text|submenu|nav-link|skip-link|breadcrumb)/i.test(iden);
-    };
-
     const getNearbyLabel = (el) => {
       if (!el) return "";
       const base = [
         getLabel(el),
-        el.getAttribute?.("aria-label") || "",
-        el.getAttribute?.("placeholder") || "",
-        el.getAttribute?.("title") || "",
+        el.getAttribute?.('aria-label') || '',
+        el.getAttribute?.('placeholder') || '',
+        el.getAttribute?.('title') || '',
       ].find(Boolean);
       if (base) return safeText(base, 120);
 
       const prev = el.previousElementSibling;
       if (prev) {
-        const t = safeText(prev.textContent || "", 120);
+        const t = safeText(prev.textContent || '', 120);
         if (t && t.length <= 120) return t;
       }
 
@@ -1388,7 +1403,7 @@ async function extractCapabilitiesFromPage(page) {
       if (parent) {
         const labelish = parent.querySelector('label, .label, [class*="label"], [class*="title"], [class*="caption"], span');
         if (labelish && labelish !== el) {
-          const t = safeText(labelish.textContent || "", 120);
+          const t = safeText(labelish.textContent || '', 120);
           if (t && t.length <= 120) return t;
         }
       }
@@ -1397,17 +1412,18 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const getSignalText = (el) => {
-      if (!el) return "";
-      const tag = (el.tagName || "").toLowerCase();
-      return safeText([
+      if (!el) return '';
+      const tag = (el.tagName || '').toLowerCase();
+      const own = safeText([
         getNearbyLabel(el),
-        el.textContent || "",
-        el.getAttribute?.("aria-label") || "",
-        el.getAttribute?.("placeholder") || "",
-        el.getAttribute?.("value") || "",
-        el.getAttribute?.("title") || "",
-        tag === "input" ? getLabel(el) : "",
-      ].filter(Boolean).join(" "), 140);
+        el.textContent || '',
+        el.getAttribute?.('aria-label') || '',
+        el.getAttribute?.('placeholder') || '',
+        el.getAttribute?.('value') || '',
+        el.getAttribute?.('title') || '',
+        tag === 'input' ? getLabel(el) : '',
+      ].filter(Boolean).join(' '), 140);
+      return own;
     };
 
     const isConcreteSelectorSet = (selectors = []) => {
@@ -1422,18 +1438,8 @@ async function extractCapabilitiesFromPage(page) {
       if (!el) return false;
       const txt = getSignalText(el);
       if (bookingRe.genericActionNoise.test(txt) || bookingRe.socialNoise.test(txt)) return false;
-      if (isMenuLikeElement(el)) return false;
+      if (bookingRe.menuNoise.test(txt) && isHeaderLike(el)) return false;
       return isConcreteSelectorSet(selectorCandidates(el));
-    };
-
-    const stripMeta = (item) => {
-      if (!item) return item;
-      return {
-        text: item.text,
-        ...(item.label ? { label: item.label } : {}),
-        ...(typeof item.concrete === "boolean" ? { concrete: item.concrete } : {}),
-        selector_candidates: item.selector_candidates || [],
-      };
     };
 
     const classifyControl = (el, text) => {
@@ -1443,44 +1449,24 @@ async function extractCapabilitiesFromPage(page) {
       if (bookingRe.embedNoise.test(t)) return null;
       if (bookingRe.genericActionNoise.test(t)) return null;
       if (bookingRe.socialNoise.test(t)) return null;
-      if (bookingRe.marketingNoise.test(t) &&
-          !bookingRe.checkIn.test(t) &&
-          !bookingRe.checkOut.test(t) &&
-          !bookingRe.guests.test(t) &&
-          !bookingRe.action.test(t)) return null;
-      if (bookingRe.menuNoise.test(t) && isMenuLikeElement(el)) return null;
-      if (bookingRe.roomNoise.test(t) &&
-          !bookingRe.checkIn.test(t) &&
-          !bookingRe.checkOut.test(t) &&
-          !bookingRe.guests.test(t)) return null;
+      if (bookingRe.marketingNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t) && !bookingRe.action.test(t)) return null;
+      if (bookingRe.menuNoise.test(t) && isHeaderLike(el)) return null;
+      if (bookingRe.roomNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t)) return null;
 
       const selectors = selectorCandidates(el);
       const concrete = elementIsConcrete(el);
-      const menu_like = isMenuLikeElement(el);
-      const weak_selector = isWeakGenericSelector(selectors);
       const base = {
         text: t.slice(0, 120),
         label: t.slice(0, 120),
         selector_candidates: selectors,
         concrete,
-        menu_like,
-        weak_selector,
       };
 
-      if (bookingRe.checkIn.test(t)) return { bucket: "check_in", item: base };
-      if (bookingRe.checkOut.test(t)) return { bucket: "check_out", item: base };
-      if (bookingRe.guests.test(t)) return { bucket: "guests", item: base };
+      if (bookingRe.checkIn.test(t)) return { bucket: 'check_in', item: base };
+      if (bookingRe.checkOut.test(t)) return { bucket: 'check_out', item: base };
+      if (bookingRe.guests.test(t)) return { bucket: 'guests', item: base };
       if (bookingRe.action.test(t)) {
-        return {
-          bucket: "action",
-          item: {
-            text: t.slice(0, 80),
-            selector_candidates: selectors,
-            concrete,
-            menu_like,
-            weak_selector,
-          }
-        };
+        return { bucket: 'action', item: { text: t.slice(0, 80), selector_candidates: selectors, concrete } };
       }
       return null;
     };
@@ -1489,44 +1475,13 @@ async function extractCapabilitiesFromPage(page) {
       const seenItems = new Set();
       const out = [];
       for (const item of items) {
-        const key = `${item.text || ""}|${(item.selector_candidates || []).join("|")}`;
+        const key = `${item.text || ''}|${(item.selector_candidates || []).join('|')}`;
         if (!item.text || seenItems.has(key)) continue;
         seenItems.add(key);
         out.push(item);
         if (out.length >= max) break;
       }
       return out;
-    };
-
-    const filterUsableSignals = (items = [], bucket = "field") => {
-      return (items || []).filter((item) => {
-        const text = safeText(item?.text || item?.label || "", 140);
-        if (!text) return false;
-        if (item?.menu_like) return false;
-        if (isBadSignalText(text)) return false;
-        if (bookingRe.marketingNoise.test(text)) return false;
-
-        if (bucket === "action") {
-          if (!bookingRe.action.test(text)) return false;
-          if (bookingRe.genericActionNoise.test(text)) return false;
-          if (item?.weak_selector && !item?.concrete) return false;
-          return true;
-        }
-
-        if (bucket === "guests") {
-          if (!bookingRe.guests.test(text)) return false;
-          if (bookingRe.roomNoise.test(text) && !/възрастни|гости|деца|adults?|guests?|children/i.test(text)) return false;
-        }
-
-        if (bucket === "date") {
-          if (!(bookingRe.checkIn.test(text) || bookingRe.checkOut.test(text))) return false;
-          if (bookingRe.headingNoise.test(text) && !item?.concrete) return false;
-          if (text.split(/\s+/).length > 6 && !item?.concrete) return false;
-        }
-
-        if (item?.weak_selector && !item?.concrete && text.split(/\s+/).length > 5) return false;
-        return true;
-      });
     };
 
     const getSignalNodes = (container) => {
@@ -1536,16 +1491,13 @@ async function extractCapabilitiesFromPage(page) {
           const rect = el.getBoundingClientRect();
           if (rect.width < 10 || rect.height < 10) return false;
           if (rect.width > window.innerWidth * 0.95 || rect.height > 180) return false;
-          if (isMenuLikeElement(el)) return false;
           const txt = getSignalText(el);
           if (!txt) return false;
           if (txt.length > 140) return false;
-          if (bookingRe.noise.test(txt) || bookingRe.socialNoise.test(txt) || bookingRe.embedNoise.test(txt)) return false;
-          if (bookingRe.marketingNoise.test(txt) &&
-              !bookingRe.checkIn.test(txt) &&
-              !bookingRe.checkOut.test(txt) &&
-              !bookingRe.guests.test(txt) &&
-              !bookingRe.action.test(txt)) return false;
+          if (bookingRe.noise.test(txt)) return false;
+          if (bookingRe.socialNoise.test(txt)) return false;
+          if (bookingRe.embedNoise.test(txt)) return false;
+          if (bookingRe.marketingNoise.test(txt) && !bookingRe.checkIn.test(txt) && !bookingRe.checkOut.test(txt) && !bookingRe.guests.test(txt) && !bookingRe.action.test(txt)) return false;
           return bookingRe.checkIn.test(txt) || bookingRe.checkOut.test(txt) || bookingRe.guests.test(txt) || bookingRe.action.test(txt);
         })
         .slice(0, 100);
@@ -1556,7 +1508,6 @@ async function extractCapabilitiesFromPage(page) {
         .filter(isVisible)
         .filter(el => {
           const rect = el.getBoundingClientRect();
-          if (isMenuLikeElement(el)) return false;
           return rect.width >= 8 && rect.height >= 8 && rect.width <= window.innerWidth * 0.95 && rect.height <= 120;
         })
         .slice(0, 60);
@@ -1567,7 +1518,6 @@ async function extractCapabilitiesFromPage(page) {
         const controls = Array.from(container.querySelectorAll(interactiveSelectors))
           .filter(isVisible)
           .filter(el => {
-            if (isMenuLikeElement(el)) return false;
             const r = el.getBoundingClientRect();
             return r.width >= 24 && r.height >= 20 && r.width <= 420 && r.height <= 90;
           })
@@ -1590,78 +1540,6 @@ async function extractCapabilitiesFromPage(page) {
       }
     };
 
-    const scoreLocalCluster = (cluster, ctaEl = null) => {
-      if (!cluster || !isVisible(cluster)) return null;
-      const rect = cluster.getBoundingClientRect();
-      if (rect.width < 240 || rect.height < 28 || rect.height > 240) return null;
-      if (rect.top > Math.max(window.innerHeight + 260, 1200)) return null;
-      if (isFooterLike(cluster) || isListingLike(cluster)) return null;
-
-      const controls = gatherInteractiveControls(cluster);
-      if (ctaEl && cluster.contains(ctaEl) && !controls.includes(ctaEl)) controls.unshift(ctaEl);
-      if (controls.length < 2) return null;
-
-      const texts = controls.map(el => getSignalText(el)).filter(Boolean);
-      const joined = texts.join(" | ");
-
-      const hasCheckIn = texts.some(t => bookingRe.checkIn.test(t));
-      const hasCheckOut = texts.some(t => bookingRe.checkOut.test(t));
-      const hasGuests = texts.some(t => bookingRe.guests.test(t));
-      const hasAction = texts.some(t => bookingRe.action.test(t));
-
-      const rows = new Map();
-      controls.forEach(el => {
-        const r = el.getBoundingClientRect();
-        const key = Math.round(r.top / 16) * 16;
-        rows.set(key, (rows.get(key) || 0) + 1);
-      });
-      const maxInRow = Math.max(...Array.from(rows.values()));
-
-      let score = 0;
-      if (hasCheckIn) score += 3;
-      if (hasCheckOut) score += 3;
-      if (hasGuests) score += 2;
-      if (hasAction) score += 3;
-      if (controls.length >= 3) score += 2;
-      if (maxInRow >= 3) score += 3;
-      if (hasCompactBookingShape(cluster)) score += 3;
-      if (rect.width >= 300 && rect.width <= window.innerWidth * 0.92) score += 1;
-      if (rect.height <= 120) score += 2;
-      if (isHeaderLike(cluster)) score -= 4;
-      if (isPageWrapperLike(cluster)) score -= 6;
-      if (safeText(cluster.textContent || "", 600).length > 420) score -= 2;
-      if (texts.some(t => bookingRe.menuNoise.test(t))) score -= 3;
-      if (texts.some(t => bookingRe.socialNoise.test(t))) score -= 4;
-      if (controls.some(el => isMenuLikeElement(el))) score -= 5;
-
-      if (!hasAction || !hasCheckIn || !(hasCheckOut || hasGuests)) return null;
-      return { score, controls };
-    };
-
-    const findBestLocalCluster = (container, ctaEl = null) => {
-      const candidates = [container];
-      const descendants = Array.from(container.querySelectorAll("form, section, div, aside"))
-        .filter(isVisible)
-        .filter(el => {
-          const rect = el.getBoundingClientRect();
-          return rect.width >= 240 && rect.height >= 28 && rect.height <= 240;
-        })
-        .slice(0, 140);
-
-      descendants.forEach(el => candidates.push(el));
-
-      let best = null;
-      candidates.forEach(candidate => {
-        const scored = scoreLocalCluster(candidate, ctaEl);
-        if (!scored) return;
-        if (!best || scored.score > best.score) {
-          best = { el: candidate, score: scored.score, controls: scored.controls };
-        }
-      });
-
-      return best;
-    };
-
     const ctaCandidates = Array.from(document.querySelectorAll(interactiveSelectors))
       .filter(isVisible)
       .filter(el => {
@@ -1679,48 +1557,52 @@ async function extractCapabilitiesFromPage(page) {
       const rect = container.getBoundingClientRect();
       if (rect.width < 220 || rect.height < 35) return null;
       if (rect.top > Math.max(window.innerHeight + 220, 1200)) return null;
-
-      const local = findBestLocalCluster(container, ctaEl);
-      const working = local?.el || container;
-      const workingRect = working.getBoundingClientRect();
-      const raw = safeText(working.innerText || working.textContent || "", 1800);
-      if (!raw || raw.length < 8) return null;
+      const raw = safeText(container.innerText || container.textContent || '', 1800);
+      if (!raw || raw.length < 16) return null;
       if (bookingRe.noise.test(raw)) return null;
 
-      const headerLike = isHeaderLike(working);
-      const footerLike = isFooterLike(working);
-      const listingLike = isListingLike(working);
-      const pageWrapperLike = isPageWrapperLike(working);
-      const compactShape = hasCompactBookingShape(working);
+      const headerLike = isHeaderLike(container);
+      const footerLike = isFooterLike(container);
+      const listingLike = isListingLike(container);
+      const pageWrapperLike = isPageWrapperLike(container);
+      const compactShape = hasCompactBookingShape(container);
 
-      const nodes = getSignalNodes(working);
-      const interactiveControls = local?.controls || gatherInteractiveControls(working);
+      const nodes = getSignalNodes(container);
+      if (ctaEl && !nodes.includes(ctaEl)) nodes.unshift(ctaEl);
 
-      const texts = [
-        ...nodes.map(getSignalText).filter(Boolean),
-        ...interactiveControls.map(getSignalText).filter(Boolean),
-      ];
-      const joined = texts.join(" | ");
+      const interactiveControls = gatherInteractiveControls(container);
+      if (ctaEl && !interactiveControls.includes(ctaEl)) interactiveControls.unshift(ctaEl);
 
-      const hasCheckIn = texts.some(t => bookingRe.checkIn.test(t));
-      const hasCheckOut = texts.some(t => bookingRe.checkOut.test(t));
-      const hasGuests = texts.some(t => bookingRe.guests.test(t));
-      const hasAction = texts.some(t => bookingRe.action.test(t));
+      const texts = nodes.map(getSignalText).filter(Boolean);
+      const interactiveTexts = interactiveControls.map(getSignalText).filter(Boolean);
+      if (ctaEl) texts.unshift(getInteractiveText(ctaEl));
+      texts.push(raw.slice(0, 300));
+      const joined = [...texts, ...interactiveTexts].join(' | ');
 
-      let score = local?.score || 0;
+      const hasCheckIn = bookingRe.checkIn.test(joined);
+      const hasCheckOut = bookingRe.checkOut.test(joined);
+      const hasGuests = bookingRe.guests.test(joined);
+      const hasAction = bookingRe.action.test(joined);
+
+      let score = 0;
       if (hasCheckIn) score += 2;
       if (hasCheckOut) score += 2;
       if (hasGuests) score += 1;
       if (hasAction) score += 2;
+      if (rect.top < Math.max(window.innerHeight + 120, 900)) score += 1;
+      if (nodes.length >= 3) score += 1;
+      if (interactiveControls.length >= 2) score += 1;
       if (compactShape) score += 2;
-      if (workingRect.height <= 140) score += 1;
-      if (workingRect.width <= window.innerWidth * 0.92) score += 1;
+      if (rect.width <= window.innerWidth * 0.88) score += 1;
+      if (rect.height <= 190) score += 1;
 
-      if (headerLike) score -= 2;
+      if (headerLike) score -= 3;
       if (footerLike) score -= 6;
       if (listingLike) score -= 4;
       if (pageWrapperLike) score -= 5;
-      if (raw.length > 500) score -= 2;
+      if (bookingRe.menuNoise.test(raw) && headerLike) score -= 2;
+      if (bookingRe.socialNoise.test(raw)) score -= 4;
+      if (raw.length > 900) score -= 2;
 
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 3) return null;
 
@@ -1729,45 +1611,59 @@ async function extractCapabilitiesFromPage(page) {
       const guestFields = [];
       const actionButtons = [];
 
-      [...nodes, ...interactiveControls].forEach((el) => {
+      nodes.forEach((el) => {
         const hit = classifyControl(el);
         if (!hit) return;
-        if (hit.bucket === "check_in") checkIn.push(hit.item);
-        if (hit.bucket === "check_out") checkOut.push(hit.item);
-        if (hit.bucket === "guests") guestFields.push(hit.item);
-        if (hit.bucket === "action") actionButtons.push(hit.item);
+        if (hit.bucket === 'check_in') checkIn.push(hit.item);
+        if (hit.bucket === 'check_out') checkOut.push(hit.item);
+        if (hit.bucket === 'guests') guestFields.push(hit.item);
+        if (hit.bucket === 'action') actionButtons.push(hit.item);
       });
 
-      const dedupedCheckIn = filterUsableSignals(dedupeSignals(checkIn, 6), "date").slice(0, 4);
-      const dedupedCheckOut = filterUsableSignals(dedupeSignals(checkOut, 6), "date").slice(0, 4);
-      const dedupedGuests = filterUsableSignals(dedupeSignals(guestFields, 8), "guests").slice(0, 6);
-      const dedupedActions = filterUsableSignals(dedupeSignals(actionButtons, 6), "action").slice(0, 4);
-      const dateInputs = [...dedupedCheckIn, ...dedupedCheckOut].slice(0, 6);
+      interactiveControls.forEach((el) => {
+        const hit = classifyControl(el);
+        if (!hit) return;
+        if (hit.bucket === 'check_in') checkIn.push(hit.item);
+        if (hit.bucket === 'check_out') checkOut.push(hit.item);
+        if (hit.bucket === 'guests') guestFields.push(hit.item);
+        if (hit.bucket === 'action') actionButtons.push(hit.item);
+      });
+
+      if (ctaEl) {
+        const hit = classifyControl(ctaEl, getInteractiveText(ctaEl));
+        if (hit?.bucket === 'action') actionButtons.unshift(hit.item);
+      }
+
+      const dedupedCheckIn = filterUsableSignals(dedupeSignals(checkIn, 6), 'date').slice(0, 4);
+      const dedupedCheckOut = filterUsableSignals(dedupeSignals(checkOut, 6), 'date').slice(0, 4);
+      const dedupedGuests = filterUsableSignals(dedupeSignals(guestFields, 8), 'guests').slice(0, 6);
+      const dedupedActions = filterUsableSignals(dedupeSignals(actionButtons, 6), 'action').slice(0, 4);
+      const dateInputs = filterUsableSignals(dedupeSignals([...dedupedCheckIn, ...dedupedCheckOut], 8), 'date').slice(0, 6);
 
       const concreteFieldCount = [...dedupedCheckIn, ...dedupedCheckOut, ...dedupedGuests].filter(x => x.concrete).length;
       const concreteActionCount = dedupedActions.filter(x => x.concrete).length;
       const concreteControlCount = concreteFieldCount + concreteActionCount;
 
       const navContaminated =
-        headerLike ||
+        (headerLike && !compactShape) ||
         footerLike ||
-        pageWrapperLike ||
-        dedupedCheckIn.some(x => x.menu_like) ||
-        dedupedActions.some(x => x.menu_like);
+        dedupedCheckIn.some(x => bookingRe.menuNoise.test(x.text) && x.selector_candidates.some(sel => /^a\b/i.test(sel))) ||
+        dedupedActions.some(x => bookingRe.socialNoise.test(x.text));
 
       const detectionGrade =
         (dedupedCheckIn.length > 0 || dedupedCheckOut.length > 0) &&
         dedupedActions.length > 0 &&
-        (dedupedCheckIn.length + dedupedCheckOut.length + dedupedGuests.length) >= 2;
+        (dedupedCheckIn.length + dedupedCheckOut.length + dedupedGuests.length) >= 2 &&
+        !dedupedActions.some(x => isBadSignalText(x.text));
 
       const executionGrade =
         !navContaminated &&
         !listingLike &&
-        concreteFieldCount >= 2 &&
+        !pageWrapperLike &&
+        concreteFieldCount >= 1 &&
         concreteActionCount >= 1 &&
-        concreteControlCount >= 3 &&
-        dedupedCheckIn.length >= 1 &&
-        (dedupedCheckOut.length >= 1 || dedupedGuests.length >= 1);
+        concreteControlCount >= 2 &&
+        (dedupedCheckIn.some(c => c.concrete) || dedupedCheckOut.some(c => c.concrete));
 
       if (!detectionGrade) return null;
 
@@ -1775,32 +1671,28 @@ async function extractCapabilitiesFromPage(page) {
         ...dateInputs.map(x => x.text),
         ...dedupedGuests.map(x => x.text),
         ...dedupedActions.map(x => x.text),
-      ])).join(" | ").slice(0, 260);
-
-      const finalSelectors = selectorCandidates(working);
-      const fallbackSelectors = selectorCandidates(container);
-      const selectorOut = isWeakGenericSelector(finalSelectors) ? fallbackSelectors : finalSelectors;
+      ])).join(' | ').slice(0, 260);
 
       return {
         score: score + (executionGrade ? 2 : 0),
         schema: {
           ui_type: "interactive_booking_bar",
-          extraction_mode: executionGrade ? "hybrid_universal_cleanup_v3" : "hybrid_universal_cleanup_v3_detection",
+          extraction_mode: executionGrade ? "hybrid_universal_cleanup_v2" : "hybrid_universal_cleanup_v2_detection",
           detection_grade: true,
           execution_grade: executionGrade,
           text_hint: compact || raw.slice(0, 260),
-          date_inputs: dateInputs.map(stripMeta).slice(0, 6),
-          guest_fields: dedupedGuests.map(stripMeta).slice(0, 6),
-          action_buttons: dedupedActions.map(stripMeta).slice(0, 4),
+          date_inputs: dateInputs.slice(0, 6),
+          guest_fields: dedupedGuests.slice(0, 6),
+          action_buttons: dedupedActions.slice(0, 4),
           detected_fields: { check_in: hasCheckIn, check_out: hasCheckOut, guests: hasGuests },
-          selector_candidates: selectorOut,
+          selector_candidates: selectorCandidates(container),
         },
       };
     };
 
     const seenContainers = new Set();
     const scored = [];
-    const containerSelectors = "section, form, div, aside, header, main";
+    const containerSelectors = 'section, form, div, aside, header, main';
     ctaCandidates.forEach((cta) => {
       let node = cta;
       for (let i = 0; i < 8 && node; i++) {
