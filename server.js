@@ -1243,13 +1243,13 @@ async function extractCapabilitiesFromPage(page) {
       });
     }
 
-    
-// ═══════════════════════════════════════════════════════════
-    // INTERACTIVE BOOKING BAR DETECTION (universal + non-destructive)
-    // IMPORTANT:
-    // - never remove old availability paths
-    // - strict pass first
-    // - relaxed fallback second so custom hotel bars do not disappear
+    // ═══════════════════════════════════════════════════════════
+    // INTERACTIVE BOOKING BAR DETECTION (additive, non-destructive)
+    // Hybrid universal v4:
+    // - keep discovery broad
+    // - reduce nav/header/page-wrapper contamination
+    // - prefer compact local booking bars
+    // - never hardcode per-site selectors
     // ═══════════════════════════════════════════════════════════
     const pushAvailability = (schema) => {
       const key = JSON.stringify(schema || {});
@@ -1260,8 +1260,13 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
-    const safeText = (s, max = 140) =>
-      normText(String(s || "").replace(/<[^>]+>/g, " ").replace(/data:image\/[^\s]+/gi, " ")).slice(0, max);
+
+    const safeText = (s, max = 140) => {
+      const cleaned = normText(String(s || "").replace(/<[^>]+>/g, " "));
+      if (!cleaned) return "";
+      if (/^(javascript:|data:)/i.test(cleaned)) return "";
+      return cleaned.slice(0, max);
+    };
 
     const getInteractiveText = (el) => {
       if (!el) return "";
@@ -1271,102 +1276,56 @@ async function extractCapabilitiesFromPage(page) {
         el.getAttribute?.("placeholder") || "",
         el.getAttribute?.("value") || "",
         el.getAttribute?.("title") || "",
-      ].filter(Boolean).join(" "), 140);
+      ].filter(Boolean).join(" "), 160);
+    };
+
+    const getElementIdentity = (el) => {
+      if (!el) return "";
+      const id = el.id ? `#${el.id}` : "";
+      const cls = (el.className && typeof el.className === "string")
+        ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join(".")
+        : "";
+      return `${(el.tagName || "").toLowerCase()} ${id} ${cls}`.trim();
     };
 
     const bookingRe = {
       checkIn: /(пристигане|настаняване|check\s*-?in|arrival|checkin)/i,
       checkOut: /(напускане|заминаване|check\s*-?out|departure|checkout)/i,
-      guests: /(възрастни|adults?|guests?|гости|деца|children|promo\s*code|промо\s*код|rooms?\b|стаи?\b|persons?|pax)/i,
-      action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|check\s*availability)/i,
-      noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|wp-content\/|data:image\/|base64,|<img|<svg|<path|function\(|return\s*\(|var\s+[a-z0-9_]+)/i,
-      menuNoise: /(начало|home|за нас|about|контакти|contact|галерия|gallery|оферти|offers|цени|pricing|blog|новини|faq|ресторант|restaurant|конферентна зала|conference|wellness|spa)/i,
-      roomNoise: /(делукс|double|studio|апартамент|suite|standard room|family room|superior|junior suite|икономична стая|единичн(?:о|а)|двойн(?:а|о)|тройн(?:а|о)|четворн(?:а|о)|king bed|twin bed|тип легло|max(?:imal|imum)?ална заетост|научете повече|learn more|room details|amenities)/i,
-      genericActionNoise: /(виж повече|learn more|details|прочети повече|направи запитване|изпрати запитване|повече информация)/i,
-      navClass: /(menu|nav|navbar|header|top-bar|topbar|main-menu|desktop-menu|mobile-menu|offcanvas|burger|language|lang-switch|breadcrumbs?)/i,
-      listingClass: /(jet-listing|listing|room-card|room-item|accommodation-card|product-card|archive|grid|carousel|slider|swiper|gallery|post-list|card-grid)/i,
-      bookingClass: /(booking|reservation|reserv|checkin|checkout|availability|search-form|searchbar|hero-book|hotel-book|book-now|book-form|booking-bar|book-bar|engine)/i,
-      promo: /(promo\s*code|промо\s*код)/i,
+      guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?\b|стаи?\b|promo\s*code|промо\s*код)/i,
+      action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)/i,
+      noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|owl-carousel|slick-track)/i,
+      menuNoise: /(начало|home|за нас|about|контакти|contact|галерия|gallery|оферти|offers|цени|pricing|blog|новини|faq|конферентна зала|ресторант|restaurant|всички стаи|стаи и апартаменти|rooms? & suites|accommodation|en\b|bg\b)/i,
+      roomNoise: /(делукс|double|studio|апартамент|suite|standard room|family room|superior|junior suite|икономична стая|тип легло|max(?:имална)? заетост|максимална заетост|детайли|details|научете повече|learn more)/i,
+      genericActionNoise: /(виж повече|learn more|details|прочети повече|направи запитване|изпрати запитване|skip to content|skip-link)/i,
+      socialNoise: /(facebook|instagram|viber|whatsapp|telegram|linkedin|youtube|tiktok)/i,
     };
 
     const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], [aria-label], [placeholder]';
     const signalSelectors = 'button, a, input, select, textarea, label, span, div, [role="button"], [role="combobox"], [aria-haspopup], [aria-label], [placeholder]';
     const concreteInteractiveSelectors = 'input, select, textarea, button, a, [role="button"], [role="combobox"], [aria-label], [placeholder]';
 
-    const getElementIdentity = (el) => {
-      const parts = [];
-      try {
-        if (el?.tagName) parts.push(el.tagName.toLowerCase());
-        if (el?.id) parts.push(`#${el.id}`);
-        const cls = typeof el?.className === "string" ? el.className : "";
-        if (cls) parts.push(cls.split(/\s+/).slice(0, 5).join("."));
-        const role = el?.getAttribute?.("role");
-        if (role) parts.push(`role=${role}`);
-      } catch {}
-      return parts.join(" ").toLowerCase();
-    };
-
-    const isHeaderLike = (el) => {
-      if (!el) return false;
-      try {
-        if (el.closest('header, nav, [role="navigation"]')) return true;
-      } catch {}
-      let node = el;
-      for (let i = 0; i < 5 && node; i++) {
-        const idt = getElementIdentity(node);
-        if (bookingRe.navClass.test(idt)) return true;
-        node = node.parentElement;
-      }
-      return false;
-    };
-
-    const isListingLike = (el) => {
-      if (!el) return false;
-      let node = el;
-      for (let i = 0; i < 5 && node; i++) {
-        const idt = getElementIdentity(node);
-        if (bookingRe.listingClass.test(idt)) return true;
-        node = node.parentElement;
-      }
-      const txt = safeText(el.textContent || "", 220);
-      if (bookingRe.roomNoise.test(txt) && !bookingRe.checkIn.test(txt) && !bookingRe.checkOut.test(txt)) return true;
-      return false;
-    };
-
-    const isBookingClassLike = (el) => {
-      if (!el) return false;
-      let node = el;
-      for (let i = 0; i < 4 && node; i++) {
-        const idt = getElementIdentity(node);
-        if (bookingRe.bookingClass.test(idt)) return true;
-        node = node.parentElement;
-      }
-      return false;
-    };
-
     const getNearbyLabel = (el) => {
       if (!el) return "";
       const base = [
         getLabel(el),
-        el.getAttribute?.("aria-label") || "",
-        el.getAttribute?.("placeholder") || "",
-        el.getAttribute?.("title") || "",
-        el.getAttribute?.("data-title") || "",
+        el.getAttribute?.('aria-label') || '',
+        el.getAttribute?.('placeholder') || '',
+        el.getAttribute?.('title') || '',
       ].find(Boolean);
-      if (base) return safeText(base, 100);
+      if (base) return safeText(base, 120);
 
       const prev = el.previousElementSibling;
       if (prev) {
-        const t = safeText(prev.textContent || "", 80);
-        if (t && t.length <= 80) return t;
+        const t = safeText(prev.textContent || '', 120);
+        if (t && t.length <= 120) return t;
       }
 
       const parent = el.parentElement;
       if (parent) {
-        const siblings = Array.from(parent.children).filter(ch => ch !== el).slice(0, 6);
-        for (const sib of siblings) {
-          const t = safeText(sib.textContent || "", 80);
-          if (t && t.length >= 2 && t.length <= 60) return t;
+        const labelish = parent.querySelector('label, .label, [class*="label"], [class*="title"], [class*="caption"], span');
+        if (labelish && labelish !== el) {
+          const t = safeText(labelish.textContent || '', 120);
+          if (t && t.length <= 120) return t;
         }
       }
 
@@ -1374,97 +1333,122 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const getSignalText = (el) => {
-      if (!el) return "";
-      const tag = (el.tagName || "").toLowerCase();
-      const raw = [
+      if (!el) return '';
+      const tag = (el.tagName || '').toLowerCase();
+      const own = safeText([
         getNearbyLabel(el),
-        tag === "input" ? getLabel(el) : "",
-        el.getAttribute?.("aria-label") || "",
-        el.getAttribute?.("placeholder") || "",
-        el.getAttribute?.("value") || "",
-        el.getAttribute?.("title") || "",
-        tag === "select" ? safeText(el.selectedOptions?.[0]?.textContent || "", 40) : "",
-        safeText(el.textContent || "", 80),
-      ].filter(Boolean).join(" ");
-      return safeText(raw, 140);
+        el.textContent || '',
+        el.getAttribute?.('aria-label') || '',
+        el.getAttribute?.('placeholder') || '',
+        el.getAttribute?.('value') || '',
+        el.getAttribute?.('title') || '',
+        tag === 'input' ? getLabel(el) : '',
+      ].filter(Boolean).join(' '), 160);
+      return own;
     };
 
     const isConcreteSelectorSet = (selectors = []) => {
       return (selectors || []).some(sel => {
-        if (!sel || /^div\b|^section\b|^main\b|^header\b|^aside\b/i.test(sel)) return false;
+        if (!sel || /^div\b/i.test(sel) || /^section\b/i.test(sel) || /^main\b/i.test(sel) || /^header\b/i.test(sel) || /^aside\b/i.test(sel)) return false;
         if (/elementor-element|e-con-inner|desktop-menu-area|widget-container|widget-wrap|site\b|page\b/i.test(sel)) return false;
         return /#|\[name=|\[type=|\[placeholder\*=|\[autocomplete=|^(input|select|textarea|button|a)\b|\[role=|\[aria-label\]/i.test(sel);
       });
     };
 
-    const elementIsConcrete = (el, selectors = []) => {
+    const isHeaderLike = (el) => {
       if (!el) return false;
-      const tag = (el.tagName || "").toLowerCase();
-      const role = (el.getAttribute?.("role") || "").toLowerCase();
-      const type = (el.getAttribute?.("type") || "").toLowerCase();
-      if (["input", "select", "textarea", "button"].includes(tag)) return true;
-      if (tag === "a" && (role === "button" || selectors.some(sel => /button|btn|reserv|book/i.test(sel)))) return true;
-      if (role === "button" || role === "combobox") return true;
-      if (type === "date") return true;
-      if (el.hasAttribute?.("aria-label") || el.hasAttribute?.("placeholder")) return true;
-      return false;
+      if (el.closest('header, nav, [role="navigation"]')) return true;
+      const iden = getElementIdentity(el).toLowerCase();
+      return /(header|nav|menu|navbar|offcanvas|off-canvas|topbar|top-bar|main-menu|mobile-menu|language|lang-switch|social-icons|social)/i.test(iden);
     };
 
-    const classifyControl = (el, mode = "strict", textOverride = "") => {
-      if (!el) return null;
-      const t = safeText(textOverride || getSignalText(el), 120);
+    const isFooterLike = (el) => {
+      if (!el) return false;
+      if (el.closest('footer')) return true;
+      const iden = getElementIdentity(el).toLowerCase();
+      return /(footer|copyright|social|contact-info|address)/i.test(iden);
+    };
+
+    const isListingLike = (el) => {
+      if (!el) return false;
+      const iden = getElementIdentity(el).toLowerCase();
+      const txt = safeText(el.textContent || "", 260).toLowerCase();
+      return /(listing|jet-listing|room-card|rooms|accommodation|apartment|suite|swiper|slide|carousel|offer-card|product)/i.test(iden) ||
+        (/тип легло|максимална заетост|детайли|details|научете повече|learn more/.test(txt));
+    };
+
+    const isPageWrapperLike = (el) => {
+      if (!el) return false;
+      const iden = getElementIdentity(el).toLowerCase();
+      if (/^body\b|^html\b/.test(iden)) return true;
+      if (/\#page\b|^div #page\b|\bsite\b|\bsite-wrapper\b|\bpage-wrapper\b|\bcontent-wrapper\b|\bmain-wrapper\b|\bapp\b|\broot\b/.test(iden)) return true;
+      const rect = el.getBoundingClientRect();
+      return rect.width >= window.innerWidth * 0.9 && rect.height >= window.innerHeight * 1.2;
+    };
+
+    const hasCompactBookingShape = (container) => {
+      try {
+        const controls = Array.from(container.querySelectorAll(interactiveSelectors))
+          .filter(isVisible)
+          .filter(el => {
+            const r = el.getBoundingClientRect();
+            return r.width >= 24 && r.height >= 20 && r.width <= 420 && r.height <= 90;
+          })
+          .slice(0, 20);
+
+        if (controls.length < 2) return false;
+
+        const rows = new Map();
+        controls.forEach(el => {
+          const r = el.getBoundingClientRect();
+          const key = Math.round(r.top / 18) * 18;
+          rows.set(key, (rows.get(key) || 0) + 1);
+        });
+
+        const maxInRow = Math.max(...Array.from(rows.values()));
+        const totalWidth = controls.reduce((sum, el) => sum + el.getBoundingClientRect().width, 0);
+        return maxInRow >= 2 && totalWidth >= 250;
+      } catch {
+        return false;
+      }
+    };
+
+    const elementIsConcrete = (el) => {
+      if (!el) return false;
+      const tag = (el.tagName || "").toLowerCase();
+      const selectors = selectorCandidates(el);
+      const txt = getSignalText(el);
+      if (bookingRe.genericActionNoise.test(txt)) return false;
+      if (bookingRe.menuNoise.test(txt) && isHeaderLike(el)) return false;
+      if (bookingRe.socialNoise.test(txt)) return false;
+      if (tag === "a" && isHeaderLike(el)) return false;
+      return isConcreteSelectorSet(selectors);
+    };
+
+    const classifyControl = (el, text) => {
+      const t = safeText(text || getSignalText(el), 140);
       if (!t) return null;
       if (bookingRe.noise.test(t)) return null;
+      if (bookingRe.genericActionNoise.test(t)) return null;
+      if (bookingRe.socialNoise.test(t)) return null;
+      if (bookingRe.menuNoise.test(t) && isHeaderLike(el)) return null;
+      if (bookingRe.roomNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t)) return null;
 
       const selectors = selectorCandidates(el);
-      const concrete = elementIsConcrete(el, selectors) || isConcreteSelectorSet(selectors);
-      const tag = (el.tagName || "").toLowerCase();
-      const role = (el.getAttribute?.("role") || "").toLowerCase();
-      const inputType = (el.getAttribute?.("type") || "").toLowerCase();
-      const isActionEl = tag === "button" || role === "button" || (tag === "a" && !!el.getAttribute?.("href"));
-      const isInputEl = ["input", "select", "textarea"].includes(tag) || role === "combobox";
-
-      if (mode === "strict") {
-        if (isHeaderLike(el) && !isBookingClassLike(el) && !isInputEl) return null;
-        if (isListingLike(el) && !isInputEl && !bookingRe.action.test(t)) return null;
-        if (bookingRe.menuNoise.test(t) && !isInputEl && !isBookingClassLike(el)) return null;
-        if (bookingRe.roomNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t)) return null;
-        if (bookingRe.genericActionNoise.test(t) && !bookingRe.action.test(t)) return null;
-      }
-
+      const concrete = elementIsConcrete(el);
       const base = {
-        text: t,
-        label: t,
+        text: t.slice(0, 120),
+        label: t.slice(0, 120),
         selector_candidates: selectors,
         concrete,
       };
 
-      if (bookingRe.checkIn.test(t) || inputType === "date") return { bucket: "check_in", item: base };
-      if (bookingRe.checkOut.test(t)) return { bucket: "check_out", item: base };
-
-      if (bookingRe.guests.test(t)) {
-        const tooRoomy =
-          bookingRe.roomNoise.test(t) &&
-          !bookingRe.promo.test(t) &&
-          !/(възрастни|гости|деца|adults?|guests?|children|rooms?\b|стаи?\b)/i.test(t);
-        if (mode === "strict" && tooRoomy) return null;
-        if (mode === "strict" && !concrete && t.length > 55 && !bookingRe.promo.test(t)) return null;
-        return { bucket: "guests", item: base };
-      }
-
+      if (bookingRe.checkIn.test(t)) return { bucket: 'check_in', item: base };
+      if (bookingRe.checkOut.test(t)) return { bucket: 'check_out', item: base };
+      if (bookingRe.guests.test(t)) return { bucket: 'guests', item: base };
       if (bookingRe.action.test(t) && !bookingRe.genericActionNoise.test(t)) {
-        if (mode === "strict" && isHeaderLike(el) && !isBookingClassLike(el)) return null;
-        if (mode === "strict" && !isActionEl && !concrete) return null;
-        return {
-          bucket: "action",
-          item: {
-            text: t.slice(0, 80),
-            selector_candidates: selectors,
-            concrete,
-          },
-        };
+        return { bucket: 'action', item: { text: t.slice(0, 80), selector_candidates: selectors, concrete } };
       }
-
       return null;
     };
 
@@ -1472,7 +1456,7 @@ async function extractCapabilitiesFromPage(page) {
       const seenItems = new Set();
       const out = [];
       for (const item of items) {
-        const key = `${item.text || ""}|${(item.selector_candidates || []).join("|")}`;
+        const key = `${item.text || ''}|${(item.selector_candidates || []).join('|')}`;
         if (!item.text || seenItems.has(key)) continue;
         seenItems.add(key);
         out.push(item);
@@ -1481,126 +1465,114 @@ async function extractCapabilitiesFromPage(page) {
       return out;
     };
 
-    const getSignalNodes = (container, mode = "strict") => {
+    const getSignalNodes = (container) => {
       return Array.from(container.querySelectorAll(signalSelectors))
         .filter(isVisible)
         .filter(el => {
           const rect = el.getBoundingClientRect();
-          if (rect.width < 8 || rect.height < 8) return false;
-          if (rect.width > window.innerWidth * 0.96 || rect.height > 160) return false;
-          if (mode === "strict" && isHeaderLike(el) && !isBookingClassLike(el) && !["input", "select", "textarea"].includes((el.tagName || "").toLowerCase())) return false;
+          if (rect.width < 10 || rect.height < 10) return false;
+          if (rect.width > window.innerWidth * 0.98 || rect.height > 140) return false;
           const txt = getSignalText(el);
-          if (!txt || txt.length > 140) return false;
+          if (!txt) return false;
+          if (txt.length > 140) return false;
           if (bookingRe.noise.test(txt)) return false;
+          if (bookingRe.socialNoise.test(txt)) return false;
           return bookingRe.checkIn.test(txt) || bookingRe.checkOut.test(txt) || bookingRe.guests.test(txt) || bookingRe.action.test(txt);
-        })
-        .slice(0, 120);
-    };
-
-    const gatherInteractiveControls = (container, mode = "strict") => {
-      return Array.from(container.querySelectorAll(concreteInteractiveSelectors))
-        .filter(isVisible)
-        .filter(el => {
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 8 || rect.height < 8) return false;
-          if (rect.width > window.innerWidth * 0.96 || rect.height > 120) return false;
-          if (mode === "strict" && isHeaderLike(el) && !isBookingClassLike(el) && !["input", "select", "textarea"].includes((el.tagName || "").toLowerCase())) return false;
-          return true;
         })
         .slice(0, 80);
     };
 
-    const countHorizontalRows = (els = []) => {
-      const tops = [];
-      els.forEach(el => {
-        try {
-          const top = Math.round(el.getBoundingClientRect().top / 12) * 12;
-          if (!tops.some(t => Math.abs(t - top) <= 14)) tops.push(top);
-        } catch {}
-      });
-      return tops.length;
+    const gatherInteractiveControls = (container) => {
+      return Array.from(container.querySelectorAll(concreteInteractiveSelectors))
+        .filter(isVisible)
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          return rect.width >= 8 && rect.height >= 8 && rect.width <= window.innerWidth * 0.98 && rect.height <= 110;
+        })
+        .slice(0, 40);
     };
 
-    const hasCompactBookingShape = (controls = []) => {
-      const visible = controls.filter(Boolean);
-      if (visible.length < 2) return false;
-      const rows = countHorizontalRows(visible);
-      return rows <= 3;
-    };
-
-    const ctaCandidates = Array.from(document.querySelectorAll(interactiveSelectors))
-      .filter(isVisible)
-      .filter(el => {
-        const txt = getSignalText(el);
-        if (!txt || !bookingRe.action.test(txt)) return false;
-        if (bookingRe.genericActionNoise.test(txt)) return false;
-        return true;
-      });
-
-    const scoreContainer = (container, ctaEl, mode = "strict") => {
+    const scoreContainer = (container, ctaEl) => {
       if (!container || !isVisible(container)) return null;
-
       const rect = container.getBoundingClientRect();
       if (rect.width < 220 || rect.height < 35) return null;
-      if (rect.top > Math.max(window.innerHeight + 260, 1300)) return null;
+      if (rect.top > Math.max(window.innerHeight + 220, 1200)) return null;
 
-      const raw = safeText(container.innerText || container.textContent || "", 1600);
-      if (!raw || raw.length > 1600) return null;
+      const raw = safeText(container.innerText || container.textContent || '', 1800);
+      if (!raw || raw.length < 16) return null;
       if (bookingRe.noise.test(raw)) return null;
 
-      const nodes = getSignalNodes(container, mode);
-      const interactiveControls = gatherInteractiveControls(container, mode);
+      const headerLike = isHeaderLike(container);
+      const footerLike = isFooterLike(container);
+      const listingLike = isListingLike(container);
+      const pageWrapperLike = isPageWrapperLike(container);
+      const compactShape = hasCompactBookingShape(container);
 
+      const nodes = getSignalNodes(container);
       if (ctaEl && !nodes.includes(ctaEl)) nodes.unshift(ctaEl);
+
+      const interactiveControls = gatherInteractiveControls(container);
       if (ctaEl && !interactiveControls.includes(ctaEl)) interactiveControls.unshift(ctaEl);
 
-      const signalTexts = [...nodes, ...interactiveControls].map(getSignalText).filter(Boolean);
-      const joined = signalTexts.join(" | ");
+      const texts = nodes.map(getSignalText).filter(Boolean);
+      const interactiveTexts = interactiveControls.map(getSignalText).filter(Boolean);
+      if (ctaEl) texts.unshift(getInteractiveText(ctaEl));
+      texts.push(raw.slice(0, 300));
+      const joined = [...texts, ...interactiveTexts].join(' | ');
 
       const hasCheckIn = bookingRe.checkIn.test(joined);
       const hasCheckOut = bookingRe.checkOut.test(joined);
       const hasGuests = bookingRe.guests.test(joined);
       const hasAction = bookingRe.action.test(joined);
 
-      if (!hasCheckIn || !hasAction || !(hasCheckOut || hasGuests)) return null;
-
       let score = 0;
       if (hasCheckIn) score += 2;
       if (hasCheckOut) score += 2;
       if (hasGuests) score += 1;
       if (hasAction) score += 2;
-      if (rect.top < Math.max(window.innerHeight + 140, 950)) score += 1;
+      if (rect.top < Math.max(window.innerHeight + 120, 900)) score += 1;
       if (nodes.length >= 3) score += 1;
       if (interactiveControls.length >= 2) score += 1;
-      if (hasCompactBookingShape(interactiveControls)) score += 2;
-      if (isBookingClassLike(container)) score += 2;
+      if (compactShape) score += 3;
+      if (rect.width <= window.innerWidth * 0.85) score += 1;
+      if (rect.height <= 180) score += 1;
 
-      const identity = getElementIdentity(container);
-      if (/^main\b|^body\b|#page\b|\.?site\b/.test(identity) || /elementor-widget-wrap|elementor-column|elementor-element/.test(identity)) score -= 2;
-      if (mode === "strict" && isHeaderLike(container) && !isBookingClassLike(container)) score -= 5;
-      if (mode === "strict" && isListingLike(container) && !isBookingClassLike(container)) score -= 4;
-      if (mode === "strict" && bookingRe.menuNoise.test(raw) && !isBookingClassLike(container)) score -= 2;
-      if (raw.length > 650) score -= 1;
-      if (raw.length > 900) score -= 2;
-      if (interactiveControls.length === 0) score -= 3;
+      if (headerLike) score -= 6;
+      if (footerLike) score -= 6;
+      if (listingLike) score -= 5;
+      if (pageWrapperLike) score -= 7;
+      if (raw.length > 700) score -= 3;
+      if (bookingRe.menuNoise.test(raw) && headerLike) score -= 4;
+      if (bookingRe.socialNoise.test(raw)) score -= 4;
+
+      if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 2) return null;
 
       const checkIn = [];
       const checkOut = [];
       const guestFields = [];
       const actionButtons = [];
 
-      [...nodes, ...interactiveControls].forEach((el) => {
-        const hit = classifyControl(el, mode);
+      nodes.forEach((el) => {
+        const hit = classifyControl(el);
         if (!hit) return;
-        if (hit.bucket === "check_in") checkIn.push(hit.item);
-        if (hit.bucket === "check_out") checkOut.push(hit.item);
-        if (hit.bucket === "guests") guestFields.push(hit.item);
-        if (hit.bucket === "action") actionButtons.push(hit.item);
+        if (hit.bucket === 'check_in') checkIn.push(hit.item);
+        if (hit.bucket === 'check_out') checkOut.push(hit.item);
+        if (hit.bucket === 'guests') guestFields.push(hit.item);
+        if (hit.bucket === 'action') actionButtons.push(hit.item);
+      });
+
+      interactiveControls.forEach((el) => {
+        const hit = classifyControl(el);
+        if (!hit) return;
+        if (hit.bucket === 'check_in') checkIn.push(hit.item);
+        if (hit.bucket === 'check_out') checkOut.push(hit.item);
+        if (hit.bucket === 'guests') guestFields.push(hit.item);
+        if (hit.bucket === 'action') actionButtons.push(hit.item);
       });
 
       if (ctaEl) {
-        const hit = classifyControl(ctaEl, mode, getSignalText(ctaEl));
-        if (hit?.bucket === "action") actionButtons.unshift(hit.item);
+        const hit = classifyControl(ctaEl, getInteractiveText(ctaEl));
+        if (hit?.bucket === 'action') actionButtons.unshift(hit.item);
       }
 
       const dedupedCheckIn = dedupeSignals(checkIn, 4);
@@ -1613,22 +1585,26 @@ async function extractCapabilitiesFromPage(page) {
       const concreteActionCount = dedupedActions.filter(x => x.concrete).length;
       const concreteControlCount = concreteFieldCount + concreteActionCount;
 
+      const navContaminated =
+        headerLike ||
+        footerLike ||
+        dedupedCheckIn.some(x => bookingRe.menuNoise.test(x.text)) ||
+        dedupedActions.some(x => bookingRe.socialNoise.test(x.text) || bookingRe.menuNoise.test(x.text));
+
       const detectionGrade =
-        score >= (mode === "strict" ? 3 : 2) &&
         (dedupedCheckIn.length > 0 || dedupedCheckOut.length > 0) &&
         dedupedActions.length > 0 &&
         (dedupedCheckIn.length + dedupedCheckOut.length + dedupedGuests.length) >= 2;
 
       const executionGrade =
-        score >= 7 &&
-        !isHeaderLike(container) &&
-        !isListingLike(container) &&
+        !navContaminated &&
+        !listingLike &&
+        !pageWrapperLike &&
+        concreteFieldCount >= 1 &&
         concreteActionCount >= 1 &&
-        concreteControlCount >= 3 &&
-        (
-          (dedupedCheckIn.some(c => c.concrete) && dedupedCheckOut.some(c => c.concrete)) ||
-          (dedupedCheckIn.some(c => c.concrete) && dedupedGuests.some(c => c.concrete))
-        );
+        concreteControlCount >= 2 &&
+        (dedupedCheckIn.some(c => c.concrete) || dedupedCheckOut.some(c => c.concrete)) &&
+        (dedupedCheckOut.length > 0 || dedupedGuests.length > 0);
 
       if (!detectionGrade) return null;
 
@@ -1636,74 +1612,77 @@ async function extractCapabilitiesFromPage(page) {
         ...dateInputs.map(x => x.text),
         ...dedupedGuests.map(x => x.text),
         ...dedupedActions.map(x => x.text),
-      ])).join(" | ").slice(0, 260);
+      ])).join(' | ').slice(0, 260);
 
       return {
         score: score + (executionGrade ? 2 : 0),
         schema: {
           ui_type: "interactive_booking_bar",
-          extraction_mode: mode === "strict" ? "hybrid_universal_v2_safe" : "hybrid_universal_v2_fallback",
+          extraction_mode: executionGrade ? "hybrid_universal_v4" : "hybrid_universal_v4_detection",
           detection_grade: true,
           execution_grade: executionGrade,
           text_hint: compact || raw.slice(0, 260),
           date_inputs: dateInputs.slice(0, 6),
           guest_fields: dedupedGuests.slice(0, 6),
           action_buttons: dedupedActions.slice(0, 4),
-          detected_fields: {
-            check_in: dedupedCheckIn.length > 0,
-            check_out: dedupedCheckOut.length > 0,
-            guests: dedupedGuests.length > 0,
-          },
+          detected_fields: { check_in: hasCheckIn, check_out: hasCheckOut, guests: hasGuests },
           selector_candidates: selectorCandidates(container),
         },
       };
     };
 
-    const runScoringPass = (mode = "strict") => {
-      const seenContainers = new Set();
-      const scored = [];
-      const containerSelectors = 'form, section, div, aside, main, header';
-
-      ctaCandidates.forEach((cta) => {
-        let node = cta;
-        for (let i = 0; i < 8 && node; i++) {
-          const candidate = node.closest?.(containerSelectors) || node.parentElement;
-          if (!candidate) break;
-          if (!seenContainers.has(candidate)) {
-            seenContainers.add(candidate);
-            const result = scoreContainer(candidate, cta, mode);
-            if (result) scored.push(result);
-          }
-          node = candidate.parentElement;
-        }
+    const ctaCandidates = Array.from(document.querySelectorAll(interactiveSelectors))
+      .filter(isVisible)
+      .filter(el => {
+        const t = getInteractiveText(el);
+        if (!t) return false;
+        if (!bookingRe.action.test(t)) return false;
+        if (bookingRe.genericActionNoise.test(t)) return false;
+        if (bookingRe.socialNoise.test(t)) return false;
+        return true;
       });
 
+    const seenContainers = new Set();
+    const scored = [];
+    const containerSelectors = 'section, form, div, aside, header, main';
+
+    ctaCandidates.forEach((cta) => {
+      let node = cta;
+      for (let i = 0; i < 8 && node; i++) {
+        const candidate = node.closest?.(containerSelectors) || node.parentElement;
+        if (!candidate) break;
+        if (!seenContainers.has(candidate)) {
+          seenContainers.add(candidate);
+          const result = scoreContainer(candidate, cta);
+          if (result) scored.push(result);
+        }
+        node = candidate.parentElement;
+      }
+    });
+
+    if (scored.length === 0) {
       const topCandidates = Array.from(document.querySelectorAll(containerSelectors))
         .filter(isVisible)
         .filter(el => {
           const rect = el.getBoundingClientRect();
-          return rect.top < Math.max(window.innerHeight + 220, 1200) && rect.width > 220 && rect.height > 35;
+          if (rect.top >= Math.max(window.innerHeight + 200, 1100)) return false;
+          if (rect.width <= 220 || rect.height <= 35) return false;
+          const raw = safeText(el.textContent || "", 500);
+          if (!raw) return false;
+          return bookingRe.checkIn.test(raw) || bookingRe.checkOut.test(raw) || bookingRe.guests.test(raw) || bookingRe.action.test(raw);
         })
-        .slice(0, mode === "strict" ? 120 : 160);
+        .slice(0, 80);
 
       topCandidates.forEach((candidate) => {
         if (seenContainers.has(candidate)) return;
-        const result = scoreContainer(candidate, null, mode);
+        const result = scoreContainer(candidate, null);
         if (result) scored.push(result);
       });
-
-      scored.sort((a, b) => b.score - a.score);
-      return scored;
-    };
-
-    let scored = runScoringPass("strict");
-    if (scored.length === 0) {
-      scored = runScoringPass("relaxed");
     }
 
+    scored.sort((a, b) => b.score - a.score);
     scored.slice(0, 6).forEach(item => pushAvailability(item.schema));
-
-// ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     // WIZARD / MULTI-STEP DETECTION (enriched with choices)
     // Catches div-based wizards not inside <form>
     // ═══════════════════════════════════════════════════════════
