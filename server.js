@@ -1267,30 +1267,63 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const bookingRe = {
-      checkIn: /\b(пристигане|настаняване|check\s*-?in|arrival)\b/i,
-      checkOut: /\b(напускане|заминаване|check\s*-?out|departure)\b/i,
-      guests: /\b(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)\b/i,
-      action: /\b(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)\b/i,
+      checkIn: /(пристигане|настаняване|check\s*-?in|arrival|checkin)/i,
+      checkOut: /(напускане|заминаване|check\s*-?out|departure|checkout)/i,
+      guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?|promo\s*code|промо\s*код)/i,
+      action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)/i,
       noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|виж повече|направи запитване)/i,
     };
 
     const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup]';
+    const signalSelectors = 'button, a, input, select, textarea, label, span, div, [role="button"], [role="combobox"], [aria-haspopup]';
     const ctaCandidates = Array.from(document.querySelectorAll(interactiveSelectors))
       .filter(isVisible)
       .filter(el => bookingRe.action.test(getInteractiveText(el)) && !/виж повече/i.test(getInteractiveText(el)));
+
+    const getSignalText = (el) => {
+      if (!el) return '';
+      const tag = (el.tagName || '').toLowerCase();
+      const own = normText([
+        el.textContent || '',
+        el.getAttribute?.('aria-label') || '',
+        el.getAttribute?.('placeholder') || '',
+        el.getAttribute?.('value') || '',
+        el.getAttribute?.('title') || '',
+        tag === 'input' ? getLabel(el) : '',
+      ].filter(Boolean).join(' '));
+      return own.slice(0, 140);
+    };
+
+    const getSignalNodes = (container) => {
+      return Array.from(container.querySelectorAll(signalSelectors))
+        .filter(isVisible)
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 10 || rect.height < 10) return false;
+          if (rect.width > window.innerWidth * 0.95 || rect.height > 180) return false;
+          const txt = getSignalText(el);
+          if (!txt) return false;
+          if (txt.length > 140) return false;
+          if (bookingRe.noise.test(txt)) return false;
+          return bookingRe.checkIn.test(txt) || bookingRe.checkOut.test(txt) || bookingRe.guests.test(txt) || bookingRe.action.test(txt);
+        })
+        .slice(0, 80);
+    };
 
     const scoreContainer = (container, ctaEl) => {
       if (!container || !isVisible(container)) return null;
       const rect = container.getBoundingClientRect();
       if (rect.width < 220 || rect.height < 35) return null;
-      const raw = normText(container.innerText || container.textContent || "");
-      if (!raw || raw.length > 450) return null;
+      if (rect.top > Math.max(window.innerHeight + 220, 1200)) return null;
+      const raw = normText(container.innerText || container.textContent || '');
+      if (!raw || raw.length > 1200) return null;
       if (bookingRe.noise.test(raw)) return null;
 
-      const nodes = Array.from(container.querySelectorAll(interactiveSelectors)).filter(isVisible).slice(0, 20);
-      const texts = nodes.map(getInteractiveText).filter(Boolean);
+      const nodes = getSignalNodes(container);
+      if (ctaEl && !nodes.includes(ctaEl)) nodes.unshift(ctaEl);
+      const texts = nodes.map(getSignalText).filter(Boolean);
       if (ctaEl) texts.unshift(getInteractiveText(ctaEl));
-      texts.push(raw);
+      texts.push(raw.slice(0, 300));
       const joined = texts.join(' | ');
 
       const hasCheckIn = bookingRe.checkIn.test(joined);
@@ -1302,19 +1335,20 @@ async function extractCapabilitiesFromPage(page) {
       if (hasCheckOut) score += 2;
       if (hasGuests) score += 1;
       if (hasAction) score += 2;
-      if (rect.top < Math.max(window.innerHeight + 150, 950)) score += 1;
+      if (rect.top < Math.max(window.innerHeight + 120, 900)) score += 1;
+      if (nodes.length >= 3) score += 1;
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
 
       const dateInputs = [];
       const guestFields = [];
       const actionButtons = [];
       nodes.forEach((el) => {
-        const t = getInteractiveText(el);
-        if (!t || t.length > 120) return;
+        const t = getSignalText(el);
+        if (!t) return;
         const item = { text: t.slice(0, 120), label: t.slice(0, 120), selector_candidates: selectorCandidates(el) };
-        if ((bookingRe.checkIn.test(t) || bookingRe.checkOut.test(t)) && dateInputs.length < 4) dateInputs.push(item);
-        if (bookingRe.guests.test(t) && guestFields.length < 4) guestFields.push(item);
-        if (bookingRe.action.test(t) && actionButtons.length < 3 && !/виж повече/i.test(t)) {
+        if ((bookingRe.checkIn.test(t) || bookingRe.checkOut.test(t)) && dateInputs.length < 6) dateInputs.push(item);
+        if (bookingRe.guests.test(t) && guestFields.length < 6) guestFields.push(item);
+        if (bookingRe.action.test(t) && actionButtons.length < 4 && !/виж повече/i.test(t)) {
           actionButtons.push({ text: t.slice(0, 80), selector_candidates: selectorCandidates(el) });
         }
       });
@@ -1324,15 +1358,15 @@ async function extractCapabilitiesFromPage(page) {
           actionButtons.unshift({ text: t, selector_candidates: selectorCandidates(ctaEl) });
         }
       }
-      const compact = Array.from(new Set([...dateInputs.map(x => x.text), ...guestFields.map(x => x.text), ...actionButtons.map(x => x.text)])).join(' | ').slice(0, 220);
+      const compact = Array.from(new Set([...dateInputs.map(x => x.text), ...guestFields.map(x => x.text), ...actionButtons.map(x => x.text)])).join(' | ').slice(0, 260);
       return {
         score,
         schema: {
           ui_type: "interactive_booking_bar",
-          text_hint: compact || raw.slice(0, 220),
-          date_inputs: dateInputs.slice(0, 4),
-          guest_fields: guestFields.slice(0, 4),
-          action_buttons: actionButtons.slice(0, 3),
+          text_hint: compact || raw.slice(0, 260),
+          date_inputs: dateInputs.slice(0, 6),
+          guest_fields: guestFields.slice(0, 6),
+          action_buttons: actionButtons.slice(0, 4),
           detected_fields: { check_in: hasCheckIn, check_out: hasCheckOut, guests: hasGuests },
           selector_candidates: selectorCandidates(container),
         },
@@ -1341,10 +1375,11 @@ async function extractCapabilitiesFromPage(page) {
 
     const seenContainers = new Set();
     const scored = [];
+    const containerSelectors = 'section, form, div, aside, header, main';
     ctaCandidates.forEach((cta) => {
       let node = cta;
-      for (let i = 0; i < 6 && node; i++) {
-        const candidate = node.closest?.('section, form, div, aside, header, main') || node.parentElement;
+      for (let i = 0; i < 8 && node; i++) {
+        const candidate = node.closest?.(containerSelectors) || node.parentElement;
         if (!candidate) break;
         if (!seenContainers.has(candidate)) {
           seenContainers.add(candidate);
@@ -1354,6 +1389,22 @@ async function extractCapabilitiesFromPage(page) {
         node = candidate.parentElement;
       }
     });
+
+    if (scored.length === 0) {
+      const topCandidates = Array.from(document.querySelectorAll(containerSelectors))
+        .filter(isVisible)
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          return rect.top < Math.max(window.innerHeight + 200, 1100) && rect.width > 220 && rect.height > 35;
+        })
+        .slice(0, 80);
+      topCandidates.forEach((candidate) => {
+        if (seenContainers.has(candidate)) return;
+        const result = scoreContainer(candidate, null);
+        if (result) scored.push(result);
+      });
+    }
+
     scored.sort((a, b) => b.score - a.score);
     scored.slice(0, 3).forEach(item => pushAvailability(item.schema));
 
@@ -1757,112 +1808,6 @@ async function extractStructured(page) {
   }
 }
 
-function synthesizeAvailabilityFromRawContent(rawContent = "", pageTitle = "", pageUrl = "") {
-  const text = String(rawContent || "").replace(/\r/g, "");
-  if (!text.trim()) return [];
-
-  const lower = text.toLowerCase();
-  const titleLower = String(pageTitle || "").toLowerCase();
-
-  const hasTopControls = /(^|\n)TOP_CONTROLS\b/.test(text);
-  const topControlsBlock = (() => {
-    const m = text.match(/TOP_CONTROLS\n([\s\S]{0,1200})/);
-    return m ? m[1] : "";
-  })();
-
-  const topControls = topControlsBlock
-    .split(/\n+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 20);
-
-  const checkInRe = /\b(пристигане|настаняване|check\s*-?in|arrival)\b/i;
-  const checkOutRe = /\b(напускане|заминаване|check\s*-?out|departure)\b/i;
-  const guestsRe = /\b(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)\b/i;
-  const actionRe = /\b(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|online booking|онлайн резервац)\b/i;
-  const paymentRe = /\b(payment|pay|плащан|карта|bank transfer|банков превод|card)\b/i;
-  const bookingBrandRe = /\b(hotel|хотел|resort|park hotel|guest house|villa|апартамент|апартаменти|къща за гости)\b/i;
-  const bookingText = [text, pageTitle].join(" \n ");
-
-  const hasCheckIn = checkInRe.test(bookingText);
-  const hasCheckOut = checkOutRe.test(bookingText);
-  const hasGuests = guestsRe.test(bookingText);
-  const hasAction = actionRe.test(bookingText);
-  const hasPaymentHint = paymentRe.test(bookingText);
-  const hasBrandHint = bookingBrandRe.test(`${titleLower} ${lower}`);
-
-  let score = 0;
-  if (hasTopControls) score += 2;
-  if (hasCheckIn) score += 2;
-  if (hasCheckOut) score += 2;
-  if (hasGuests) score += 1;
-  if (hasAction) score += 2;
-  if (hasPaymentHint) score += 1;
-  if (hasBrandHint) score += 1;
-
-  if (!hasAction) return [];
-  if (!hasCheckIn && !hasCheckOut) return [];
-  if (!(hasGuests || hasCheckOut)) return [];
-  if (score < 5) return [];
-
-  const compact = topControls.length
-    ? topControls.join(' | ').slice(0, 220)
-    : bookingText.replace(/\s+/g, ' ').trim().slice(0, 220);
-
-  const date_inputs = [];
-  if (hasCheckIn) {
-    date_inputs.push({
-      name: 'check_in',
-      label: topControls.find((t) => checkInRe.test(t)) || 'Check-in',
-      selector_candidates: [],
-    });
-  }
-  if (hasCheckOut) {
-    date_inputs.push({
-      name: 'check_out',
-      label: topControls.find((t) => checkOutRe.test(t)) || 'Check-out',
-      selector_candidates: [],
-    });
-  }
-
-  const guest_fields = [];
-  if (hasGuests) {
-    guest_fields.push({
-      text: topControls.find((t) => guestsRe.test(t)) || 'Guests',
-      label: topControls.find((t) => guestsRe.test(t)) || 'Guests',
-      selector_candidates: [],
-    });
-  }
-
-  const action_buttons = [];
-  const topAction = topControls.find((t) => actionRe.test(t));
-  action_buttons.push({
-    text: (topAction || 'Reserve').slice(0, 80),
-    selector_candidates: [],
-  });
-
-  return [{
-    kind: 'availability',
-    schema: {
-      ui_type: hasTopControls ? 'custom_booking_bar' : 'semantic_booking_fallback',
-      source: hasTopControls ? 'top_controls' : 'semantic',
-      page_url: pageUrl || '',
-      text_hint: compact,
-      date_inputs,
-      guest_fields,
-      action_buttons,
-      detected_fields: {
-        check_in: hasCheckIn,
-        check_out: hasCheckOut,
-        guests: hasGuests,
-        payment_hint: hasPaymentHint,
-      },
-      payment_required_hint: hasPaymentHint,
-      selector_candidates: [],
-    },
-  }];
-}
-
 // ================= GLOBAL OCR CACHE =================
 const globalOcrCache = new Map();
 const API_KEY = process.env.GOOGLE_VISION_API_KEY || "AIzaSyBngqUxV-Rc8kLhfMp651fqHTEQ9eVLDgg";
@@ -2104,10 +2049,6 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
     try {
       const caps = await extractCapabilitiesFromPage(page);
-      const inferredAvailability = synthesizeAvailabilityFromRawContent(data.rawContent || "", title, url);
-      if ((inferredAvailability?.length || 0) > 0) {
-        caps.availability = [...(caps.availability || []), ...inferredAvailability];
-      }
       if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
         capabilitiesMaps.push(caps);
         console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
