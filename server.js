@@ -872,6 +872,78 @@ function guessVendorFromText(s = "") {
   return "unknown";
 }
 
+function buildCombinedCapabilities(capabilitiesMaps = [], base = "") {
+  const combined = [];
+  const seen = new Set();
+
+  const normalizeItem = (kind, item) => {
+    if (!item || typeof item !== "object") return null;
+
+    const schema = item.schema && typeof item.schema === "object" ? item.schema : {};
+    const dom_snapshot =
+      typeof item.dom_snapshot === "string" && item.dom_snapshot.trim()
+        ? item.dom_snapshot.slice(0, 4000)
+        : "";
+
+    const vendorSource = [
+      schema.src || "",
+      schema.action || "",
+      schema.title || "",
+      schema.name || "",
+      schema.text_hint || "",
+      dom_snapshot.slice(0, 500),
+      base || "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const fingerprint = sha256Hex(
+      stableStringify({
+        kind,
+        schema,
+        dom_snapshot: dom_snapshot ? dom_snapshot.slice(0, 1000) : "",
+        base,
+      })
+    );
+
+    return {
+      kind,
+      vendor: guessVendorFromText(String(vendorSource || "")),
+      fingerprint,
+      schema,
+      dom_snapshot: dom_snapshot || null,
+    };
+  };
+
+  const pushUnique = (kind, item) => {
+    const normalized = normalizeItem(kind, item);
+    if (!normalized) return;
+    if (seen.has(normalized.fingerprint)) return;
+    seen.add(normalized.fingerprint);
+    combined.push(normalized);
+  };
+
+  for (const caps of capabilitiesMaps || []) {
+    for (const form of caps?.forms || []) {
+      pushUnique("form", form);
+    }
+
+    for (const wizard of caps?.wizards || []) {
+      pushUnique("wizard", wizard);
+    }
+
+    for (const iframe of caps?.iframes || []) {
+      pushUnique("booking_widget", iframe);
+    }
+
+    for (const availability of caps?.availability || []) {
+      pushUnique("availability", availability);
+    }
+  }
+
+  return combined.slice(0, 200);
+}
+
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
