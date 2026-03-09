@@ -1295,6 +1295,57 @@ async function extractCapabilitiesFromPage(page) {
       roomNoise: /(делукс|double|studio|апартамент|suite|standard room|family room|superior|junior suite|икономична стая|тип легло|максимална заетост|детайли|details|научете повече|learn more)/i,
       genericActionNoise: /(виж повече|learn more|details|прочети повече|направи запитване|изпрати запитване|skip to content|skip-link)/i,
       socialNoise: /(facebook|instagram|viber|whatsapp|telegram|linkedin|youtube|tiktok)/i,
+      embedNoise: /(function\s*\(|let\s+key\s*=|currency\s*=|<script|shortcode|google\s*translate|gtag\(|fbq\()/i,
+      marketingNoise: /(удобен паркинг|какво казват нашите гости|мнение\.?\s*опит\.?\s*доверие|виж повече|прочети повече|научете повече|специални условия|зарядна станция|видеонаблюдение|детайли|details|testimonial|review|feature)/i,
+      headingNoise: /^(настаняване|нашите стаи|ресторант|контакти|оферти|начало)$/i,
+    };
+
+
+
+    const isBadSignalText = (txt) => {
+      const t = safeText(txt || '', 220);
+      if (!t) return true;
+      if (bookingRe.noise.test(t)) return true;
+      if (bookingRe.embedNoise.test(t)) return true;
+      if (bookingRe.socialNoise.test(t)) return true;
+      if (t.length > 130 && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t) && !bookingRe.action.test(t)) return true;
+      if (/https?:\/\//i.test(t) || /src=|width=|height=|\.js/i.test(t)) return true;
+      return false;
+    };
+
+    const isWeakGenericSelector = (selectors = []) => {
+      if (!selectors || !selectors.length) return true;
+      return selectors.every(sel =>
+        /^div/i.test(sel) ||
+        /elementor-element|elementor-widget-container|elementor-widget-wrap|e-con-inner|site|page|shortcode|icon-box/i.test(sel)
+      );
+    };
+
+    const filterUsableSignals = (items = [], bucket = 'field') => {
+      return (items || []).filter((item) => {
+        const text = safeText(item?.text || item?.label || '', 140);
+        if (!text) return false;
+        if (isBadSignalText(text)) return false;
+        if (bookingRe.marketingNoise.test(text)) return false;
+        if (bookingRe.menuNoise.test(text) && !item?.concrete) return false;
+        if (bucket === 'action') {
+          if (!bookingRe.action.test(text)) return false;
+          if (bookingRe.genericActionNoise.test(text)) return false;
+          if (isWeakGenericSelector(item?.selector_candidates || []) && !item?.concrete) return false;
+          return true;
+        }
+        if (bucket === 'guests') {
+          if (!bookingRe.guests.test(text)) return false;
+          if (bookingRe.roomNoise.test(text) && !/възрастни|гости|деца|adults?|guests?|children/i.test(text)) return false;
+        }
+        if (bucket === 'date') {
+          if (!(bookingRe.checkIn.test(text) || bookingRe.checkOut.test(text))) return false;
+          if (bookingRe.headingNoise.test(text) && !item?.concrete) return false;
+          if (text.split(/\s+/).length > 6 && !item?.concrete) return false;
+        }
+        if (isWeakGenericSelector(item?.selector_candidates || []) && !item?.concrete && text.split(/\s+/).length > 5) return false;
+        return true;
+      });
     };
 
     const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], [aria-label], [placeholder]';
@@ -1395,8 +1446,10 @@ async function extractCapabilitiesFromPage(page) {
       const t = safeText(text || getSignalText(el), 140);
       if (!t) return null;
       if (bookingRe.noise.test(t)) return null;
+      if (bookingRe.embedNoise.test(t)) return null;
       if (bookingRe.genericActionNoise.test(t)) return null;
       if (bookingRe.socialNoise.test(t)) return null;
+      if (bookingRe.marketingNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t) && !bookingRe.action.test(t)) return null;
       if (bookingRe.menuNoise.test(t) && isHeaderLike(el)) return null;
       if (bookingRe.roomNoise.test(t) && !bookingRe.checkIn.test(t) && !bookingRe.checkOut.test(t) && !bookingRe.guests.test(t)) return null;
 
@@ -1443,6 +1496,8 @@ async function extractCapabilitiesFromPage(page) {
           if (txt.length > 140) return false;
           if (bookingRe.noise.test(txt)) return false;
           if (bookingRe.socialNoise.test(txt)) return false;
+          if (bookingRe.embedNoise.test(txt)) return false;
+          if (bookingRe.marketingNoise.test(txt) && !bookingRe.checkIn.test(txt) && !bookingRe.checkOut.test(txt) && !bookingRe.guests.test(txt) && !bookingRe.action.test(txt)) return false;
           return bookingRe.checkIn.test(txt) || bookingRe.checkOut.test(txt) || bookingRe.guests.test(txt) || bookingRe.action.test(txt);
         })
         .slice(0, 100);
@@ -1579,11 +1634,11 @@ async function extractCapabilitiesFromPage(page) {
         if (hit?.bucket === 'action') actionButtons.unshift(hit.item);
       }
 
-      const dedupedCheckIn = dedupeSignals(checkIn, 4);
-      const dedupedCheckOut = dedupeSignals(checkOut, 4);
-      const dedupedGuests = dedupeSignals(guestFields, 6);
-      const dedupedActions = dedupeSignals(actionButtons, 4);
-      const dateInputs = dedupeSignals([...dedupedCheckIn, ...dedupedCheckOut], 6);
+      const dedupedCheckIn = filterUsableSignals(dedupeSignals(checkIn, 6), 'date').slice(0, 4);
+      const dedupedCheckOut = filterUsableSignals(dedupeSignals(checkOut, 6), 'date').slice(0, 4);
+      const dedupedGuests = filterUsableSignals(dedupeSignals(guestFields, 8), 'guests').slice(0, 6);
+      const dedupedActions = filterUsableSignals(dedupeSignals(actionButtons, 6), 'action').slice(0, 4);
+      const dateInputs = filterUsableSignals(dedupeSignals([...dedupedCheckIn, ...dedupedCheckOut], 8), 'date').slice(0, 6);
 
       const concreteFieldCount = [...dedupedCheckIn, ...dedupedCheckOut, ...dedupedGuests].filter(x => x.concrete).length;
       const concreteActionCount = dedupedActions.filter(x => x.concrete).length;
@@ -1598,7 +1653,8 @@ async function extractCapabilitiesFromPage(page) {
       const detectionGrade =
         (dedupedCheckIn.length > 0 || dedupedCheckOut.length > 0) &&
         dedupedActions.length > 0 &&
-        (dedupedCheckIn.length + dedupedCheckOut.length + dedupedGuests.length) >= 2;
+        (dedupedCheckIn.length + dedupedCheckOut.length + dedupedGuests.length) >= 2 &&
+        !dedupedActions.some(x => isBadSignalText(x.text));
 
       const executionGrade =
         !navContaminated &&
@@ -1621,7 +1677,7 @@ async function extractCapabilitiesFromPage(page) {
         score: score + (executionGrade ? 2 : 0),
         schema: {
           ui_type: "interactive_booking_bar",
-          extraction_mode: executionGrade ? "hybrid_universal_stable" : "hybrid_universal_stable_detection",
+          extraction_mode: executionGrade ? "hybrid_universal_cleanup_v2" : "hybrid_universal_cleanup_v2_detection",
           detection_grade: true,
           execution_grade: executionGrade,
           text_hint: compact || raw.slice(0, 260),
