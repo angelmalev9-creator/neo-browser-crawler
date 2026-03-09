@@ -1567,6 +1567,98 @@ async function extractCapabilitiesFromPage(page) {
   });
 }
 
+
+function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUrl = "") {
+  const empty = { forms: [], wizards: [], iframes: [], availability: [] };
+  const text = String(rawContent || "").replace(/
+/g, "");
+  if (!text.trim()) return empty;
+
+  const topMatch = text.match(/(?:^|
+
+)TOP_CONTROLS
+([\s\S]*?)(?=
+
+|$)/i);
+  const topLines = topMatch
+    ? topMatch[1].split(/
++/).map(s => s.trim()).filter(Boolean).slice(0, 20)
+    : [];
+
+  const scopeText = [pageTitle, pageUrl, ...topLines, text.slice(0, 5000)].join(" 
+ ").replace(/\s+/g, " ").trim();
+  const hasTopControls = topLines.length > 0;
+
+  const re = {
+    checkIn: /(пристигане|настаняване|check\s*-?in|arrival)/i,
+    checkOut: /(напускане|заминаване|check\s*-?out|departure)/i,
+    guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i,
+    action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|book\s+online|онлайн резервац)/i,
+    accommodation: /(hotel|хотел|accommodation|настаняване|апартамент|apartments?|вила|villa|guest\s*house|къща\s*за\s*гости|room|rooms|стая|стаи|нощувк)/i,
+    payment: /(плащане|payment|credit\s*card|банкова\s*карта|pay\s*now|депозит)/i,
+  };
+
+  const hasCheckIn = re.checkIn.test(scopeText);
+  const hasCheckOut = re.checkOut.test(scopeText);
+  const hasGuests = re.guests.test(scopeText);
+  const hasAction = re.action.test(scopeText);
+  const hasAccommodation = re.accommodation.test(scopeText);
+  const hasPayment = re.payment.test(scopeText);
+
+  let score = 0;
+  if (hasCheckIn) score += 2;
+  if (hasCheckOut) score += 2;
+  if (hasGuests) score += 1;
+  if (hasAction) score += 2;
+  if (hasAccommodation) score += 1;
+  if (hasTopControls) score += 1;
+  if (hasPayment) score += 1;
+
+  const strongBooking = (hasCheckIn && hasCheckOut && (hasGuests || hasAccommodation) && (hasAction || hasPayment)) || score >= 6;
+  if (!strongBooking) return empty;
+
+  const matchedCheckIn = topLines.find(x => re.checkIn.test(x)) || (hasCheckIn ? "check-in" : "");
+  const matchedCheckOut = topLines.find(x => re.checkOut.test(x)) || (hasCheckOut ? "check-out" : "");
+  const matchedGuests = topLines.find(x => re.guests.test(x)) || (hasGuests ? "guests" : "");
+  const matchedAction = topLines.find(x => re.action.test(x)) || (hasAction ? "reserve" : (hasPayment ? "booking" : ""));
+
+  const textHint = [matchedCheckIn, matchedCheckOut, matchedGuests, matchedAction]
+    .filter(Boolean)
+    .join(" | ") || scopeText.slice(0, 180);
+
+  return {
+    forms: [],
+    wizards: [],
+    iframes: [],
+    availability: [{
+      kind: "availability",
+      schema: {
+        ui_type: hasTopControls ? "semantic_top_controls_booking" : "semantic_booking_fallback",
+        source: hasTopControls ? "TOP_CONTROLS" : "raw_content_semantics",
+        text_hint: textHint.slice(0, 220),
+        date_inputs: [
+          hasCheckIn ? { text: matchedCheckIn || "check-in", label: matchedCheckIn || "check-in", selector_candidates: [] } : null,
+          hasCheckOut ? { text: matchedCheckOut || "check-out", label: matchedCheckOut || "check-out", selector_candidates: [] } : null,
+        ].filter(Boolean),
+        guest_fields: [
+          hasGuests ? { text: matchedGuests || "guests", label: matchedGuests || "guests", selector_candidates: [] } : null,
+        ].filter(Boolean),
+        action_buttons: [
+          (hasAction || hasPayment) ? { text: matchedAction || "reserve", selector_candidates: [] } : null,
+        ].filter(Boolean),
+        detected_fields: {
+          check_in: hasCheckIn,
+          check_out: hasCheckOut,
+          guests: hasGuests,
+          accommodation: hasAccommodation,
+          payment_hint: hasPayment,
+        },
+        selector_candidates: [],
+      },
+    }],
+  };
+}
+
 function buildCombinedCapabilities(perPageCaps, baseOrigin) {
   const combined = [];
   const seen = new Set();
@@ -1997,7 +2089,14 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
     try {
-      const caps = await extractCapabilitiesFromPage(page);
+      const domCaps = await extractCapabilitiesFromPage(page);
+      const inferredCaps = synthesizeCapabilitiesFromRawContent(data.rawContent || "", title, url);
+      const caps = {
+        forms: [...(domCaps.forms || []), ...(inferredCaps.forms || [])],
+        wizards: [...(domCaps.wizards || []), ...(inferredCaps.wizards || [])],
+        iframes: [...(domCaps.iframes || []), ...(inferredCaps.iframes || [])],
+        availability: [...(domCaps.availability || []), ...(inferredCaps.availability || [])],
+      };
       if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
         capabilitiesMaps.push(caps);
         console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
