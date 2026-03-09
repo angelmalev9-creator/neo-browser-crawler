@@ -1758,42 +1758,38 @@ async function extractStructured(page) {
 }
 
 function synthesizeAvailabilityFromRawContent(rawContent = "", pageTitle = "", pageUrl = "") {
-  const text = String(rawContent || "").replace(/
-/g, "");
+  const text = String(rawContent || "").replace(/\r/g, "");
   if (!text.trim()) return [];
 
   const lower = text.toLowerCase();
   const titleLower = String(pageTitle || "").toLowerCase();
 
-  const hasTopControls = /(^|
-)TOP_CONTROLS/.test(text);
+  const hasTopControls = /(^|\n)TOP_CONTROLS\b/.test(text);
   const topControlsBlock = (() => {
-    const m = text.match(/TOP_CONTROLS
-([\s\S]{0,1200})/);
+    const m = text.match(/TOP_CONTROLS\n([\s\S]{0,1200})/);
     return m ? m[1] : "";
   })();
+
   const topControls = topControlsBlock
-    .split(/
-+/)
+    .split(/\n+/)
     .map((s) => s.trim())
     .filter(Boolean)
     .slice(0, 20);
 
-  const checkInRe = /(пристигане|настаняване|check\s*-?in|arrival)/i;
-  const checkOutRe = /(напускане|заминаване|check\s*-?out|departure)/i;
-  const guestsRe = /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i;
-  const actionRe = /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|online booking|онлайн резервац)/i;
-  const paymentRe = /(payment|pay|плащан|карта|bank transfer|банков превод|card)/i;
-  const bookingBrandRe = /(hotel|хотел|resort|park hotel|guest house|villa|апартамент|апартаменти|къща за гости)/i;
-  const bookingText = [text, pageTitle].join(" 
- ");
+  const checkInRe = /\b(пристигане|настаняване|check\s*-?in|arrival)\b/i;
+  const checkOutRe = /\b(напускане|заминаване|check\s*-?out|departure)\b/i;
+  const guestsRe = /\b(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)\b/i;
+  const actionRe = /\b(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|online booking|онлайн резервац)\b/i;
+  const paymentRe = /\b(payment|pay|плащан|карта|bank transfer|банков превод|card)\b/i;
+  const bookingBrandRe = /\b(hotel|хотел|resort|park hotel|guest house|villa|апартамент|апартаменти|къща за гости)\b/i;
+  const bookingText = [text, pageTitle].join(" \n ");
 
   const hasCheckIn = checkInRe.test(bookingText);
   const hasCheckOut = checkOutRe.test(bookingText);
   const hasGuests = guestsRe.test(bookingText);
   const hasAction = actionRe.test(bookingText);
   const hasPaymentHint = paymentRe.test(bookingText);
-  const hasBrandHint = bookingBrandRe.test(titleLower + " " + lower);
+  const hasBrandHint = bookingBrandRe.test(`${titleLower} ${lower}`);
 
   let score = 0;
   if (hasTopControls) score += 2;
