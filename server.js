@@ -1582,18 +1582,21 @@ function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUr
 |$)/i);
   const topLines = topMatch
     ? topMatch[1].split(/
-+/).map(s => s.trim()).filter(Boolean).slice(0, 20)
++/).map((s) => s.trim()).filter(Boolean).slice(0, 20)
     : [];
 
-  const scopeText = [pageTitle, pageUrl, ...topLines, text.slice(0, 5000)].join(" 
- ").replace(/\s+/g, " ").trim();
+  const scopeText = [pageTitle, pageUrl, ...topLines, text.slice(0, 5000)]
+    .join(" 
+ ")
+    .replace(/\s+/g, " ")
+    .trim();
   const hasTopControls = topLines.length > 0;
 
   const re = {
     checkIn: /(пристигане|настаняване|check\s*-?in|arrival)/i,
     checkOut: /(напускане|заминаване|check\s*-?out|departure)/i,
     guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i,
-    action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|book\s+online|онлайн резервац)/i,
+    action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|book\s+online|онлайн\s+резервац)/i,
     accommodation: /(hotel|хотел|accommodation|настаняване|апартамент|apartments?|вила|villa|guest\s*house|къща\s*за\s*гости|room|rooms|стая|стаи|нощувк)/i,
     payment: /(плащане|payment|credit\s*card|банкова\s*карта|pay\s*now|депозит)/i,
   };
@@ -1614,13 +1617,16 @@ function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUr
   if (hasTopControls) score += 1;
   if (hasPayment) score += 1;
 
-  const strongBooking = (hasCheckIn && hasCheckOut && (hasGuests || hasAccommodation) && (hasAction || hasPayment)) || score >= 6;
+  const strongBooking =
+    (hasCheckIn && hasCheckOut && (hasGuests || hasAccommodation) && (hasAction || hasPayment)) ||
+    score >= 6;
   if (!strongBooking) return empty;
 
-  const matchedCheckIn = topLines.find(x => re.checkIn.test(x)) || (hasCheckIn ? "check-in" : "");
-  const matchedCheckOut = topLines.find(x => re.checkOut.test(x)) || (hasCheckOut ? "check-out" : "");
-  const matchedGuests = topLines.find(x => re.guests.test(x)) || (hasGuests ? "guests" : "");
-  const matchedAction = topLines.find(x => re.action.test(x)) || (hasAction ? "reserve" : (hasPayment ? "booking" : ""));
+  const matchedCheckIn = topLines.find((x) => re.checkIn.test(x)) || (hasCheckIn ? "check-in" : "");
+  const matchedCheckOut = topLines.find((x) => re.checkOut.test(x)) || (hasCheckOut ? "check-out" : "");
+  const matchedGuests = topLines.find((x) => re.guests.test(x)) || (hasGuests ? "guests" : "");
+  const matchedAction =
+    topLines.find((x) => re.action.test(x)) || (hasAction ? "reserve" : hasPayment ? "booking" : "");
 
   const textHint = [matchedCheckIn, matchedCheckOut, matchedGuests, matchedAction]
     .filter(Boolean)
@@ -1630,32 +1636,57 @@ function synthesizeCapabilitiesFromRawContent(rawContent, pageTitle = "", pageUr
     forms: [],
     wizards: [],
     iframes: [],
-    availability: [{
-      kind: "availability",
-      schema: {
-        ui_type: hasTopControls ? "semantic_top_controls_booking" : "semantic_booking_fallback",
-        source: hasTopControls ? "TOP_CONTROLS" : "raw_content_semantics",
-        text_hint: textHint.slice(0, 220),
-        date_inputs: [
-          hasCheckIn ? { text: matchedCheckIn || "check-in", label: matchedCheckIn || "check-in", selector_candidates: [] } : null,
-          hasCheckOut ? { text: matchedCheckOut || "check-out", label: matchedCheckOut || "check-out", selector_candidates: [] } : null,
-        ].filter(Boolean),
-        guest_fields: [
-          hasGuests ? { text: matchedGuests || "guests", label: matchedGuests || "guests", selector_candidates: [] } : null,
-        ].filter(Boolean),
-        action_buttons: [
-          (hasAction || hasPayment) ? { text: matchedAction || "reserve", selector_candidates: [] } : null,
-        ].filter(Boolean),
-        detected_fields: {
-          check_in: hasCheckIn,
-          check_out: hasCheckOut,
-          guests: hasGuests,
-          accommodation: hasAccommodation,
-          payment_hint: hasPayment,
+    availability: [
+      {
+        kind: "availability",
+        schema: {
+          ui_type: hasTopControls ? "semantic_top_controls_booking" : "semantic_booking_fallback",
+          source: hasTopControls ? "TOP_CONTROLS" : "raw_content_semantics",
+          text_hint: textHint.slice(0, 220),
+          date_inputs: [
+            hasCheckIn
+              ? {
+                  text: matchedCheckIn || "check-in",
+                  label: matchedCheckIn || "check-in",
+                  selector_candidates: [],
+                }
+              : null,
+            hasCheckOut
+              ? {
+                  text: matchedCheckOut || "check-out",
+                  label: matchedCheckOut || "check-out",
+                  selector_candidates: [],
+                }
+              : null,
+          ].filter(Boolean),
+          guest_fields: [
+            hasGuests
+              ? {
+                  text: matchedGuests || "guests",
+                  label: matchedGuests || "guests",
+                  selector_candidates: [],
+                }
+              : null,
+          ].filter(Boolean),
+          action_buttons: [
+            matchedAction
+              ? {
+                  text: matchedAction,
+                  selector_candidates: [],
+                }
+              : null,
+          ].filter(Boolean),
+          detected_fields: {
+            check_in: hasCheckIn,
+            check_out: hasCheckOut,
+            guests: hasGuests,
+            payment_hint: hasPayment,
+          },
+          selector_candidates: [],
         },
-        selector_candidates: [],
+        dom_snapshot: null,
       },
-    }],
+    ],
   };
 }
 
