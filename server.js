@@ -1244,177 +1244,118 @@ async function extractCapabilitiesFromPage(page) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // INTERACTIVE CLUSTER DETECTION (generic action bars / custom widgets)
-    // Additive: catches compact custom UIs that are not real <form>s
+    // INTERACTIVE BOOKING BAR DETECTION (additive, non-destructive)
     // ═══════════════════════════════════════════════════════════
-    const interactive_clusters = [];
-    try {
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-      const lower = (s) => norm(s).toLowerCase();
-      const noiseRe = /jquery|document\.ready|swiper|slidesperview|pagination|autoplay|loop\s*:|navigation|cookie|consent|newsletter/i;
-      const bookingActionRe = /(резервирай|резервация|book(?: now)?|reserve|search|check(?: availability)?|провери|търси|запази)/i;
-      const checkInRe = /(пристигане|настаняване|check\s*-?\s*in|arrival|checkin)/i;
-      const checkOutRe = /(напускане|заминаване|check\s*-?\s*out|departure|checkout)/i;
-      const guestsRe = /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i;
-      const appointmentRe = /(час|hour|time|дата|date|appointment|booking|резервация|запази час)/i;
-      const formishFieldRe = /(име|name|имейл|email|телефон|phone|message|съобщение|коментар)/i;
+    const pushAvailability = (schema) => {
+      const key = JSON.stringify(schema || {});
+      if (!pushAvailability._seen) pushAvailability._seen = new Set();
+      if (pushAvailability._seen.has(key)) return;
+      pushAvailability._seen.add(key);
+      availability.push({ kind: "availability", schema });
+    };
 
-      const textFromEl = (el) => norm([
+    const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
+    const getInteractiveText = (el) => {
+      if (!el) return "";
+      return normText([
+        el.textContent || "",
         el.getAttribute?.("aria-label") || "",
         el.getAttribute?.("placeholder") || "",
-        el.getAttribute?.("title") || "",
         el.getAttribute?.("value") || "",
-        el.innerText || el.textContent || ""
-      ].join(" "));
+        el.getAttribute?.("title") || "",
+      ].filter(Boolean).join(" "));
+    };
 
-      const compactLabel = (el) => {
-        const direct = textFromEl(el);
-        if (direct && direct.length <= 80) return direct;
-        try {
-          const labelled = el.id ? document.querySelector(`label[for="${el.id}"]`) : null;
-          const lt = norm(labelled?.innerText || labelled?.textContent || "");
-          if (lt && lt.length <= 80) return lt;
-        } catch {}
-        return "";
-      };
+    const bookingRe = {
+      checkIn: /\b(пристигане|настаняване|check\s*-?in|arrival)\b/i,
+      checkOut: /\b(напускане|заминаване|check\s*-?out|departure)\b/i,
+      guests: /\b(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)\b/i,
+      action: /\b(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)\b/i,
+      noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|виж повече|направи запитване)/i,
+    };
 
-      const candidateRoots = new Set();
-      document.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],input[type="search"]').forEach(seed => {
-        if (!isVisible(seed)) return;
-        const t = textFromEl(seed);
-        if (!bookingActionRe.test(t)) return;
-        let el = seed;
-        for (let depth = 0; depth < 5 && el && el !== document.body; depth++) {
-          el = el.parentElement;
-          if (!el) break;
-          if (!isVisible(el)) continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 220 || rect.height < 40 || rect.height > 380) continue;
-          candidateRoots.add(el);
+    const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup]';
+    const ctaCandidates = Array.from(document.querySelectorAll(interactiveSelectors))
+      .filter(isVisible)
+      .filter(el => bookingRe.action.test(getInteractiveText(el)) && !/виж повече/i.test(getInteractiveText(el)));
+
+    const scoreContainer = (container, ctaEl) => {
+      if (!container || !isVisible(container)) return null;
+      const rect = container.getBoundingClientRect();
+      if (rect.width < 220 || rect.height < 35) return null;
+      const raw = normText(container.innerText || container.textContent || "");
+      if (!raw || raw.length > 450) return null;
+      if (bookingRe.noise.test(raw)) return null;
+
+      const nodes = Array.from(container.querySelectorAll(interactiveSelectors)).filter(isVisible).slice(0, 20);
+      const texts = nodes.map(getInteractiveText).filter(Boolean);
+      if (ctaEl) texts.unshift(getInteractiveText(ctaEl));
+      texts.push(raw);
+      const joined = texts.join(' | ');
+
+      const hasCheckIn = bookingRe.checkIn.test(joined);
+      const hasCheckOut = bookingRe.checkOut.test(joined);
+      const hasGuests = bookingRe.guests.test(joined);
+      const hasAction = bookingRe.action.test(joined);
+      let score = 0;
+      if (hasCheckIn) score += 2;
+      if (hasCheckOut) score += 2;
+      if (hasGuests) score += 1;
+      if (hasAction) score += 2;
+      if (rect.top < Math.max(window.innerHeight + 150, 950)) score += 1;
+      if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
+
+      const dateInputs = [];
+      const guestFields = [];
+      const actionButtons = [];
+      nodes.forEach((el) => {
+        const t = getInteractiveText(el);
+        if (!t || t.length > 120) return;
+        const item = { text: t.slice(0, 120), label: t.slice(0, 120), selector_candidates: selectorCandidates(el) };
+        if ((bookingRe.checkIn.test(t) || bookingRe.checkOut.test(t)) && dateInputs.length < 4) dateInputs.push(item);
+        if (bookingRe.guests.test(t) && guestFields.length < 4) guestFields.push(item);
+        if (bookingRe.action.test(t) && actionButtons.length < 3 && !/виж повече/i.test(t)) {
+          actionButtons.push({ text: t.slice(0, 80), selector_candidates: selectorCandidates(el) });
         }
       });
-
-      const broadCandidates = Array.from(document.querySelectorAll('section,header,main,div,[class*="book"],[class*="reserv"],[class*="search"],[class*="hero"],[class*="widget"]')).slice(0, 250);
-      broadCandidates.forEach(el => {
-        try {
-          if (!isVisible(el)) return;
-          const rect = el.getBoundingClientRect();
-          if (rect.top > window.innerHeight * 1.5) return;
-          if (rect.width < 260 || rect.height < 40 || rect.height > 260) return;
-          const txt = textFromEl(el);
-          if (!txt || txt.length < 20 || txt.length > 260) return;
-          if (noiseRe.test(txt)) return;
-          if ((checkInRe.test(txt) || checkOutRe.test(txt) || guestsRe.test(txt)) && bookingActionRe.test(txt)) {
-            candidateRoots.add(el);
-          }
-        } catch {}
-      });
-
-      const seenClusterKeys = new Set();
-      const pushInteractiveCluster = (cluster) => {
-        const key = JSON.stringify({
-          labels: cluster.labels,
-          cta: cluster.cta?.text || "",
-          type: cluster.cluster_type_hint || "unknown"
-        });
-        if (seenClusterKeys.has(key)) return;
-        seenClusterKeys.add(key);
-        interactive_clusters.push(cluster);
+      if (ctaEl) {
+        const t = getInteractiveText(ctaEl).slice(0, 80);
+        if (t && !actionButtons.find(x => x.text === t)) {
+          actionButtons.unshift({ text: t, selector_candidates: selectorCandidates(ctaEl) });
+        }
+      }
+      const compact = Array.from(new Set([...dateInputs.map(x => x.text), ...guestFields.map(x => x.text), ...actionButtons.map(x => x.text)])).join(' | ').slice(0, 220);
+      return {
+        score,
+        schema: {
+          ui_type: "interactive_booking_bar",
+          text_hint: compact || raw.slice(0, 220),
+          date_inputs: dateInputs.slice(0, 4),
+          guest_fields: guestFields.slice(0, 4),
+          action_buttons: actionButtons.slice(0, 3),
+          detected_fields: { check_in: hasCheckIn, check_out: hasCheckOut, guests: hasGuests },
+          selector_candidates: selectorCandidates(container),
+        },
       };
+    };
 
-      const pushAvailability = (schema) => {
-        const key = JSON.stringify(schema);
-        const exists = availability.some(a => JSON.stringify(a.schema) === key);
-        if (!exists) availability.push({ kind: "availability", schema });
-      };
-
-      Array.from(candidateRoots).slice(0, 30).forEach(root => {
-        try {
-          const rootText = textFromEl(root);
-          if (!rootText || rootText.length > 320 || noiseRe.test(rootText)) return;
-
-          const controls = Array.from(root.querySelectorAll('button,a,input,select,textarea,[role="button"],[role="combobox"],[aria-haspopup]'))
-            .filter(isVisible)
-            .slice(0, 20);
-          if (controls.length < 2 || controls.length > 12) return;
-
-          const labels = [];
-          const controlSchemas = [];
-          let cta = null;
-          let score = 0;
-          let hasCheckIn = false;
-          let hasCheckOut = false;
-          let hasGuests = false;
-          let hasAppointmentSignals = false;
-          let formishSignals = 0;
-
-          controls.forEach(ctrl => {
-            const txt = compactLabel(ctrl);
-            if (!txt) return;
-            const t = lower(txt);
-            labels.push(txt);
-            controlSchemas.push({
-              text: txt,
-              tag: (ctrl.tagName || "").toLowerCase(),
-              role: ctrl.getAttribute?.("role") || "",
-              selector_candidates: selectorCandidates(ctrl)
-            });
-
-            if (bookingActionRe.test(t) && !/виж повече|learn more|read more|научи повече/i.test(t)) {
-              cta = cta || { text: txt, selector_candidates: selectorCandidates(ctrl) };
-              score += 2;
-            }
-            if (checkInRe.test(t)) { hasCheckIn = true; score += 2; }
-            if (checkOutRe.test(t)) { hasCheckOut = true; score += 2; }
-            if (guestsRe.test(t)) { hasGuests = true; score += 1; }
-            if (appointmentRe.test(t)) hasAppointmentSignals = true;
-            if (formishFieldRe.test(t)) formishSignals += 1;
-          });
-
-          const uniqueLabels = Array.from(new Set(labels)).slice(0, 12);
-          if (!cta || uniqueLabels.length < 2) return;
-          if (/виж повече|learn more|read more|научи повече/i.test(cta.text || "")) return;
-          if (formishSignals >= 2 && !hasCheckIn && !hasCheckOut && !hasGuests) return;
-          if (score < 4) return;
-
-          const dom_snapshot = (root.outerHTML || "").slice(0, 3000);
-          const schemaBase = {
-            ui_type: "interactive_cluster",
-            cluster_type_hint: hasCheckIn || hasCheckOut || hasGuests ? "booking" : (hasAppointmentSignals ? "appointment" : "unknown"),
-            labels: uniqueLabels,
-            controls: controlSchemas,
-            action_buttons: [cta],
-            selector_candidates: selectorCandidates(root),
-            text_hint: rootText.slice(0, 180)
-          };
-
-          pushInteractiveCluster({ kind: "interactive_cluster", schema: schemaBase, dom_snapshot });
-
-          if ((hasCheckIn && (hasCheckOut || hasGuests)) || ((hasCheckIn || hasCheckOut) && hasGuests)) {
-            pushAvailability({
-              ui_type: "interactive_booking_bar",
-              source: "interactive_cluster",
-              date_inputs: uniqueLabels.filter(l => checkInRe.test(l) || checkOutRe.test(l)).map(label => ({
-                label,
-                selector_candidates: controlSchemas.find(c => c.text === label)?.selector_candidates || []
-              })),
-              guest_fields: uniqueLabels.filter(l => guestsRe.test(l)).map(label => ({
-                label,
-                selector_candidates: controlSchemas.find(c => c.text === label)?.selector_candidates || []
-              })),
-              action_buttons: [cta],
-              detected_fields: {
-                check_in: hasCheckIn,
-                check_out: hasCheckOut,
-                guests: hasGuests,
-              },
-              selector_candidates: selectorCandidates(root),
-              text_hint: uniqueLabels.join(" | ").slice(0, 180)
-            });
-          }
-        } catch {}
-      });
-    } catch {}
+    const seenContainers = new Set();
+    const scored = [];
+    ctaCandidates.forEach((cta) => {
+      let node = cta;
+      for (let i = 0; i < 6 && node; i++) {
+        const candidate = node.closest?.('section, form, div, aside, header, main') || node.parentElement;
+        if (!candidate) break;
+        if (!seenContainers.has(candidate)) {
+          seenContainers.add(candidate);
+          const result = scoreContainer(candidate, cta);
+          if (result) scored.push(result);
+        }
+        node = candidate.parentElement;
+      }
+    });
+    scored.sort((a, b) => b.score - a.score);
+    scored.slice(0, 3).forEach(item => pushAvailability(item.schema));
 
     // ═══════════════════════════════════════════════════════════
     // WIZARD / MULTI-STEP DETECTION (enriched with choices)
@@ -1622,7 +1563,6 @@ async function extractCapabilitiesFromPage(page) {
       wizards,
       iframes,
       availability,
-      interactive_clusters,
     };
   });
 }
@@ -1665,7 +1605,6 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     }
 
     for (const a of p.availability || []) pushCap("availability", a.schema);
-    for (const ic of p.interactive_clusters || []) pushCap("interactive_cluster", ic.schema, ic.dom_snapshot);
   }
 
   // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
@@ -1673,10 +1612,9 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
   const wizards = combined.filter(c => c.kind === "wizard").slice(0, 5);
   const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 5);
   const avail = combined.filter(c => c.kind === "availability").slice(0, 5);
-  const clusters = combined.filter(c => c.kind === "interactive_cluster").slice(0, 8);
-  const other = combined.filter(c => !["form","wizard","booking_widget","availability","interactive_cluster"].includes(c.kind)).slice(0, 10);
+  const other = combined.filter(c => !["form","wizard","booking_widget","availability"].includes(c.kind)).slice(0, 10);
 
-  return [...forms, ...wizards, ...widgets, ...avail, ...clusters, ...other];
+  return [...forms, ...wizards, ...widgets, ...avail, ...other];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1771,18 +1709,162 @@ async function extractStructured(page) {
         if (text) mainContent = addUniqueText(text) || "";
       }
 
+      const isVisible = (el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+        } catch {
+          return false;
+        }
+      };
+
+      const topControlTexts = [];
+      const seenControls = new Set();
+      try {
+        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup]');
+        controls.forEach((el) => {
+          if (!isVisible(el)) return;
+          const rect = el.getBoundingClientRect();
+          if (rect.top > Math.max(window.innerHeight + 250, 1100)) return;
+          const parts = [
+            el.textContent || "",
+            el.getAttribute?.("aria-label") || "",
+            el.getAttribute?.("placeholder") || "",
+            el.getAttribute?.("value") || "",
+            el.getAttribute?.("title") || "",
+          ].join(" ").replace(/\s+/g, " ").trim();
+          if (!parts || parts.length < 2 || parts.length > 80) return;
+          const key = parts.toLowerCase();
+          if (seenControls.has(key)) return;
+          seenControls.add(key);
+          topControlTexts.push(parts);
+        });
+      } catch {}
+
       return {
         rawContent: [
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
+          topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
         ].filter(Boolean).join("\n\n"),
       };
     });
   } catch (e) {
     return { rawContent: "" };
   }
+}
+
+function synthesizeAvailabilityFromRawContent(rawContent = "", pageTitle = "", pageUrl = "") {
+  const text = String(rawContent || "").replace(/
+/g, "");
+  if (!text.trim()) return [];
+
+  const lower = text.toLowerCase();
+  const titleLower = String(pageTitle || "").toLowerCase();
+
+  const hasTopControls = /(^|
+)TOP_CONTROLS/.test(text);
+  const topControlsBlock = (() => {
+    const m = text.match(/TOP_CONTROLS
+([\s\S]{0,1200})/);
+    return m ? m[1] : "";
+  })();
+  const topControls = topControlsBlock
+    .split(/
++/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+
+  const checkInRe = /(пристигане|настаняване|check\s*-?in|arrival)/i;
+  const checkOutRe = /(напускане|заминаване|check\s*-?out|departure)/i;
+  const guestsRe = /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i;
+  const actionRe = /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси|online booking|онлайн резервац)/i;
+  const paymentRe = /(payment|pay|плащан|карта|bank transfer|банков превод|card)/i;
+  const bookingBrandRe = /(hotel|хотел|resort|park hotel|guest house|villa|апартамент|апартаменти|къща за гости)/i;
+  const bookingText = [text, pageTitle].join(" 
+ ");
+
+  const hasCheckIn = checkInRe.test(bookingText);
+  const hasCheckOut = checkOutRe.test(bookingText);
+  const hasGuests = guestsRe.test(bookingText);
+  const hasAction = actionRe.test(bookingText);
+  const hasPaymentHint = paymentRe.test(bookingText);
+  const hasBrandHint = bookingBrandRe.test(titleLower + " " + lower);
+
+  let score = 0;
+  if (hasTopControls) score += 2;
+  if (hasCheckIn) score += 2;
+  if (hasCheckOut) score += 2;
+  if (hasGuests) score += 1;
+  if (hasAction) score += 2;
+  if (hasPaymentHint) score += 1;
+  if (hasBrandHint) score += 1;
+
+  if (!hasAction) return [];
+  if (!hasCheckIn && !hasCheckOut) return [];
+  if (!(hasGuests || hasCheckOut)) return [];
+  if (score < 5) return [];
+
+  const compact = topControls.length
+    ? topControls.join(' | ').slice(0, 220)
+    : bookingText.replace(/\s+/g, ' ').trim().slice(0, 220);
+
+  const date_inputs = [];
+  if (hasCheckIn) {
+    date_inputs.push({
+      name: 'check_in',
+      label: topControls.find((t) => checkInRe.test(t)) || 'Check-in',
+      selector_candidates: [],
+    });
+  }
+  if (hasCheckOut) {
+    date_inputs.push({
+      name: 'check_out',
+      label: topControls.find((t) => checkOutRe.test(t)) || 'Check-out',
+      selector_candidates: [],
+    });
+  }
+
+  const guest_fields = [];
+  if (hasGuests) {
+    guest_fields.push({
+      text: topControls.find((t) => guestsRe.test(t)) || 'Guests',
+      label: topControls.find((t) => guestsRe.test(t)) || 'Guests',
+      selector_candidates: [],
+    });
+  }
+
+  const action_buttons = [];
+  const topAction = topControls.find((t) => actionRe.test(t));
+  action_buttons.push({
+    text: (topAction || 'Reserve').slice(0, 80),
+    selector_candidates: [],
+  });
+
+  return [{
+    kind: 'availability',
+    schema: {
+      ui_type: hasTopControls ? 'custom_booking_bar' : 'semantic_booking_fallback',
+      source: hasTopControls ? 'top_controls' : 'semantic',
+      page_url: pageUrl || '',
+      text_hint: compact,
+      date_inputs,
+      guest_fields,
+      action_buttons,
+      detected_fields: {
+        check_in: hasCheckIn,
+        check_out: hasCheckOut,
+        guests: hasGuests,
+        payment_hint: hasPaymentHint,
+      },
+      payment_required_hint: hasPaymentHint,
+      selector_candidates: [],
+    },
+  }];
 }
 
 // ================= GLOBAL OCR CACHE =================
@@ -2026,9 +2108,13 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
     try {
       const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0 || (caps.interactive_clusters?.length || 0) > 0) {
+      const inferredAvailability = synthesizeAvailabilityFromRawContent(data.rawContent || "", title, url);
+      if ((inferredAvailability?.length || 0) > 0) {
+        caps.availability = [...(caps.availability || []), ...inferredAvailability];
+      }
+      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
         capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability, ${caps.interactive_clusters?.length || 0} clusters`);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
       }
     } catch (e) {
       console.error("[CAPS] Extract error:", e.message);
