@@ -1267,10 +1267,10 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const bookingRe = {
-      checkIn: /(пристигане|настаняване|check\s*-?in|arrival)/i,
-      checkOut: /(напускане|заминаване|check\s*-?out|departure)/i,
-      guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)/i,
-      action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)/i,
+      checkIn: /\b(пристигане|настаняване|check\s*-?in|arrival)\b/i,
+      checkOut: /\b(напускане|заминаване|check\s*-?out|departure)\b/i,
+      guests: /\b(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?)\b/i,
+      action: /\b(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)\b/i,
       noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|виж повече|направи запитване)/i,
     };
 
