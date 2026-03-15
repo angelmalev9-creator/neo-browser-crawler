@@ -2224,6 +2224,126 @@ async function collectAllLinks(page, base) {
 }
 
 // ================= PROCESS SINGLE PAGE =================
+
+// ================= DROPDOWN / ACCORDION EXTRACTOR =================
+// Finds and clicks all collapsed dropdowns, accordions, details/summary,
+// and any clickable expand-triggers, then collects the revealed text.
+async function extractDropdownContent(page) {
+  const results = [];
+
+  try {
+    // ── 1. Native <details> / <summary> ────────────────────────────
+    const detailsTexts = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll("details").forEach(el => {
+        const summary = el.querySelector("summary");
+        const label = (summary?.innerText || "").trim().slice(0, 120);
+        el.open = true;
+        const full = (el.innerText || "").trim();
+        const body = full.replace(label, "").trim();
+        if (body.length > 5) out.push({ label, body });
+      });
+      return out;
+    });
+    results.push(...detailsTexts);
+
+    // ── 2. Accordion / collapse triggers (class-based heuristic) ───
+    const triggerSelectors = [
+      "[class*=\'accordion\'] [class*=\'header\']",
+      "[class*=\'accordion\'] [class*=\'title\']",
+      "[class*=\'accordion\'] [class*=\'trigger\']",
+      "[class*=\'accordion\'] [class*=\'toggle\']",
+      "[class*=\'collapse\'] [class*=\'header\']",
+      "[class*=\'collapse\'] [class*=\'title\']",
+      "[class*=\'collapse\'] button",
+      "[class*=\'faq\'] [class*=\'question\']",
+      "[class*=\'faq\'] dt",
+      "[class*=\'faq\'] [class*=\'title\']",
+      "[class*=\'expandable\']",
+      "[data-toggle=\'collapse\']",
+      "[data-bs-toggle=\'collapse\']",
+      "[aria-expanded=\'false\']",
+      ".collapsible",
+      ".accordion-button",
+      ".accordion-header button",
+    ];
+
+    const seen = new Set();
+
+    for (const sel of triggerSelectors) {
+      let handles;
+      try { handles = await page.$$(sel); } catch { continue; }
+
+      for (const handle of handles) {
+        try {
+          const label = await handle.evaluate(el =>
+            (el.innerText || el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 120)
+          );
+          if (!label || seen.has(label)) continue;
+          seen.add(label);
+
+          const isExpanded = await handle.evaluate(el =>
+            el.getAttribute("aria-expanded") === "true" ||
+            el.classList.contains("active") ||
+            el.classList.contains("open") ||
+            el.classList.contains("show")
+          );
+
+          if (!isExpanded) {
+            await handle.click({ force: true }).catch(() => {});
+            await page.waitForTimeout(300);
+          }
+
+          const body = await handle.evaluate(el => {
+            const candidates = [];
+            const parent = el.closest("[class*=\'accordion-item\'],[class*=\'collapse-item\'],[class*=\'faq-item\'],details,li,div");
+            if (parent) {
+              const content = parent.querySelector(
+                "[class*=\'body\'],[class*=\'content\'],[class*=\'panel\'],[class*=\'answer\'],[class*=\'text\'],[class*=\'collapse\']"
+              );
+              if (content) candidates.push((content.innerText || "").trim());
+            }
+            let next = el.nextElementSibling;
+            for (let i = 0; i < 3 && next; i++, next = next.nextElementSibling) {
+              const t = (next.innerText || "").trim();
+              if (t.length > 5) { candidates.push(t); break; }
+            }
+            return candidates.join("\n").slice(0, 1500);
+          });
+
+          if (body && body.length > 5) {
+            results.push({ label, body });
+          }
+        } catch {}
+      }
+    }
+
+    // ── 3. Visible list items acting as toggles ─────────────────────
+    const listTriggers = await page.$$("li > span[class*=\'toggle\'], li > div[class*=\'title\'], li > button, li > a[class*=\'expand\']");
+    for (const handle of listTriggers) {
+      try {
+        const label = await handle.evaluate(el => (el.innerText || "").trim().slice(0, 120));
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+        await handle.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(250);
+        const body = await handle.evaluate(el => {
+          const li = el.closest("li");
+          if (!li) return "";
+          return (li.innerText || "").replace(el.innerText || "", "").trim().slice(0, 1500);
+        });
+        if (body && body.length > 5) results.push({ label, body });
+      } catch {}
+    }
+
+  } catch (e) {
+    console.error("[DROPDOWNS] Error:", e.message);
+  }
+
+  console.log(`[DROPDOWNS] Extracted ${results.length} expanded sections`);
+  return results;
+}
+
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
@@ -2316,6 +2436,20 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[CAPS] Extract error:", e.message);
     }
 
+    // *** DROPDOWN EXTRACTION: click accordions/details and capture hidden text ***
+    let dropdownContent = "";
+    try {
+      const dropdownSections = await extractDropdownContent(page);
+      if (dropdownSections.length > 0) {
+        dropdownContent = dropdownSections
+          .map(s => `${s.label ? s.label + "\n" : ""}${s.body}`)
+          .join("\n\n");
+        dropdownContent = normalizeNumbers(clean(dropdownContent));
+      }
+    } catch (e) {
+      console.error("[DROPDOWNS] Extract error:", e.message);
+    }
+
     // Format content
     const htmlContent = normalizeNumbers(clean(data.rawContent));
     const ocrTexts = ocrResults.map(r => r.text);
@@ -2329,11 +2463,15 @@ ${htmlContent}
 === OCR_CONTENT_START ===
 ${ocrContent}
 === OCR_CONTENT_END ===
+
+=== DROPDOWN_CONTENT_START ===
+${dropdownContent}
+=== DROPDOWN_CONTENT_END ===
 `.trim();
 
     // ✅ NEW: contacts extraction (DOM + combined text)
     const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${dropdownContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
     const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
