@@ -2225,53 +2225,79 @@ async function collectAllLinks(page, base) {
 
 
 // ================= DROPDOWN / ACCORDION EXTRACTOR =================
-// Upgraded: covers details/summary, aria-expanded, data-toggle,
-// Elementor accordion, WP blocks, ▶ list-item toggles,
-// and any element whose click reveals hidden sibling/child content.
+// Handles: WP <details> blocks, aria-expanded, data-toggle, Elementor,
+// list-item ▶ toggles, and any element that reveals hidden content on click.
 async function extractDropdownContent(page) {
   const results = [];
 
   try {
-    // ── 1. Native <details> / <summary> ────────────────────────────
+    // ── 1. Native <details>/<summary> — WP block details, FAQ plugins, etc. ──
+    // Directly open all details elements and capture their table/text content.
     const detailsTexts = await page.evaluate(() => {
       const out = [];
       document.querySelectorAll("details").forEach(el => {
         const summary = el.querySelector("summary");
-        const label = (summary?.innerText || "").trim().slice(0, 120);
+        const label = (summary?.innerText || summary?.textContent || "").trim().slice(0, 120);
+        if (!label) return;
+
+        // Force open
         el.open = true;
-        const full = (el.innerText || "").trim();
-        const body = full.replace(label, "").trim();
-        if (body.length > 5) out.push({ label, body });
+        el.setAttribute("open", "");
+        // Also trigger any JS open handlers
+        try { summary?.click(); } catch {}
+
+        // Collect content: everything except the summary itself
+        let body = "";
+        const contentEls = Array.from(el.children).filter(c => c !== summary && c.tagName !== "SUMMARY");
+        if (contentEls.length > 0) {
+          body = contentEls.map(c => (c.innerText || c.textContent || "").trim()).filter(Boolean).join("\n");
+        }
+        // Fallback: full innerText minus label
+        if (!body || body.length < 5) {
+          const full = (el.innerText || el.textContent || "").trim();
+          body = full.startsWith(label) ? full.slice(label.length).trim() : full;
+        }
+
+        // For tables: extract rows as text
+        el.querySelectorAll("tr").forEach(row => {
+          const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText || "").trim());
+          if (cells.length > 0) {
+            const rowText = cells.join(" | ");
+            if (!body.includes(rowText)) body += "\n" + rowText;
+          }
+        });
+
+        body = body.trim();
+        if (body.length > 5) out.push({ label, body: body.slice(0, 3000) });
       });
       return out;
     });
     results.push(...detailsTexts);
+    if (detailsTexts.length > 0) {
+      console.log(`[DROPDOWNS] details/summary: ${detailsTexts.length} sections`);
+    }
 
-    // ── 2. Broad trigger selector list ─────────────────────────────
+    // ── 2. aria-expanded + data-toggle triggers ────────────────────
     const triggerSelectors = [
-      // Standard aria
       "[aria-expanded='false']",
-      "[aria-expanded=\"false\"]",
-      // Bootstrap / generic data attrs
+      '[aria-expanded="false"]',
       "[data-toggle='collapse']",
       "[data-bs-toggle='collapse']",
       "[data-toggle='tab']",
       "[data-bs-toggle='tab']",
-      // Class-based accordion/FAQ patterns
       "[class*='accordion'] [class*='header']",
       "[class*='accordion'] [class*='title']",
       "[class*='accordion'] [class*='trigger']",
       "[class*='accordion'] [class*='toggle']",
-      "[class*='accordion-button']",
       ".accordion-button",
-      ".accordion-header button",
       ".accordion-header",
+      ".accordion-header button",
+      "[class*='accordion-button']",
       "[class*='collapse'] [class*='header']",
       "[class*='collapse'] [class*='title']",
       "[class*='collapse'] button",
-      "[class*='collapsible']",
       ".collapsible",
-      // FAQ patterns
+      "[class*='collapsible']",
       "[class*='faq'] [class*='question']",
       "[class*='faq'] dt",
       "[class*='faq'] [class*='title']",
@@ -2279,46 +2305,28 @@ async function extractDropdownContent(page) {
       "[class*='faq'] [class*='toggle']",
       ".faq-question",
       ".faq-title",
-      // Toggle / expandable
       "[class*='toggle-title']",
       "[class*='toggle-heading']",
       "[class*='toggle-btn']",
       "[class*='expandable']",
       "[class*='expand-btn']",
       "[class*='expand-title']",
-      // Tab patterns
       "[class*='tab-title']",
       "[class*='tab-label']",
       "[role='tab']",
-      // Elementor (WordPress page builder)
       ".elementor-toggle-item .elementor-tab-title",
       ".elementor-accordion-item .elementor-tab-title",
       ".elementor-tab-title",
-      // WordPress blocks
       ".wp-block-details summary",
-      ".wp-block-faq .wp-block-faq-item",
-      // Divi, Avada, WPBakery, etc.
       "[class*='et_pb_toggle'] [class*='et_pb_toggle_title']",
       "[class*='fusion-accordion'] [class*='fusion-panel-heading']",
       "[class*='vc_tta'] [class*='vc_tta-title']",
-      // Generic heading-near-hidden-content
-      "h2[class*='toggle']",
-      "h3[class*='toggle']",
-      "h4[class*='toggle']",
-      // dt in definition lists (often used for FAQ)
       "dt",
-      // Span/div with arrow icons (▶ ▼ + −) used as toggles
-      "span[class*='arrow']",
-      "span[class*='icon-toggle']",
-      "div[class*='arrow']",
-      // li-based toggles (boutiquehome style: ▶ Външна стена)
       "li[class*='toggle']",
       "li[class*='collapsible']",
-      "li > span:first-child",
-      "li > div:first-child",
     ];
 
-    const seen = new Set();
+    const seen = new Set(results.map(r => r.label));
 
     for (const sel of triggerSelectors) {
       let handles;
@@ -2326,12 +2334,12 @@ async function extractDropdownContent(page) {
 
       for (const handle of handles) {
         try {
-          const isVisible = await handle.evaluate(el => {
+          const isVis = await handle.evaluate(el => {
             const r = el.getBoundingClientRect();
             const s = window.getComputedStyle(el);
             return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
           });
-          if (!isVisible) continue;
+          if (!isVis) continue;
 
           const label = await handle.evaluate(el =>
             (el.innerText || el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 120)
@@ -2340,7 +2348,6 @@ async function extractDropdownContent(page) {
           if (seen.has(label)) continue;
           seen.add(label);
 
-          // Check if already expanded
           const isExpanded = await handle.evaluate(el => {
             const aria = el.getAttribute("aria-expanded");
             if (aria === "true") return true;
@@ -2349,56 +2356,46 @@ async function extractDropdownContent(page) {
             return cls.includes("active") || cls.includes(" open") || cls.includes("expanded") || cls.includes("show");
           });
 
-          // Click to expand if not already open
           if (!isExpanded) {
             await handle.click({ force: true }).catch(() => {});
             await page.waitForTimeout(400);
           }
 
-          // Collect revealed body text
           const body = await handle.evaluate(el => {
             const candidates = [];
 
-            // Method A: look for content in common sibling/child patterns
             const contentSelectors = [
-              "[class*='body']",
-              "[class*='content']",
-              "[class*='panel']",
-              "[class*='answer']",
-              "[class*='text']",
-              "[class*='collapse']",
-              "[class*='description']",
-              "[class*='detail']",
-              "[class*='inner']",
-              "[class*='accordion-collapse']",
-              ".collapse",
-              ".panel-body",
+              "[class*='body']","[class*='content']","[class*='panel']",
+              "[class*='answer']","[class*='text']","[class*='collapse']",
+              "[class*='description']","[class*='detail']","[class*='inner']",
+              ".collapse",".panel-body",
             ];
 
-            // Try closest card/item container first
             const container = el.closest(
               "[class*='accordion-item'],[class*='collapse-item'],[class*='faq-item']," +
-              "[class*='toggle-item'],[class*='et_pb_toggle'],[class*='elementor-accordion-item']," +
-              "details,li"
+              "[class*='toggle-item'],[class*='et_pb_toggle'],[class*='elementor-accordion-item'],details,li"
             );
             if (container) {
               for (const csel of contentSelectors) {
-                const content = container.querySelector(csel);
-                if (content && content !== el) {
-                  const t = (content.innerText || "").trim();
+                const c = container.querySelector(csel);
+                if (c && c !== el) {
+                  const t = (c.innerText || "").trim();
                   if (t.length > 5) { candidates.push(t); break; }
                 }
               }
-              // Also grab all text from container excluding the trigger itself
+              // Extract table rows if present
+              container.querySelectorAll("tr").forEach(row => {
+                const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText || "").trim());
+                if (cells.length > 0) candidates.push(cells.join(" | "));
+              });
+
               if (candidates.length === 0) {
-                const fullText = (container.innerText || "").trim();
-                const labelText = (el.innerText || "").trim();
-                const stripped = fullText.replace(labelText, "").trim();
+                const full = (container.innerText || "").trim();
+                const stripped = full.replace((el.innerText || "").trim(), "").trim();
                 if (stripped.length > 5) candidates.push(stripped);
               }
             }
 
-            // Method B: scan next siblings for revealed content
             if (candidates.length === 0) {
               let next = el.nextElementSibling;
               for (let i = 0; i < 5 && next; i++, next = next.nextElementSibling) {
@@ -2407,83 +2404,67 @@ async function extractDropdownContent(page) {
               }
             }
 
-            // Method C: parent's next sibling
             if (candidates.length === 0) {
-              const parentNext = el.parentElement?.nextElementSibling;
-              if (parentNext) {
-                const t = (parentNext.innerText || "").trim();
-                if (t.length > 5) candidates.push(t);
-              }
+              const pn = el.parentElement?.nextElementSibling;
+              if (pn) { const t = (pn.innerText || "").trim(); if (t.length > 5) candidates.push(t); }
             }
 
             return candidates.join("\n").slice(0, 2000);
           });
 
-          if (body && body.length > 5) {
-            results.push({ label, body });
-          }
+          if (body && body.length > 5) results.push({ label, body });
         } catch {}
       }
     }
 
-    // ── 3. Aggressive fallback: find ANY element whose click reveals hidden content ─
-    // Looks for elements with pseudo-content ▶ ▼ + that are likely toggles
-    try {
-      const pseudoToggles = await page.evaluate(() => {
-        const candidates = [];
-        document.querySelectorAll("li, dt, [class*='item'], [class*='row']").forEach(el => {
-          const style = window.getComputedStyle(el, "::before");
-          const content = style.content || "";
-          // Check for arrow-like pseudo-content
-          if (/▶|▼|►|›|»|\+|\-|chevron/i.test(content) || /▶|▼|►|›|»/.test(el.textContent || "")) {
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) {
-              candidates.push({
-                text: (el.innerText || "").trim().slice(0, 120),
-                selector: el.id ? `#${el.id}` : null,
-              });
-            }
-          }
-        });
-        return candidates.slice(0, 30);
+    // ── 3. li-based ▶ toggles (boutiquehome style) ─────────────────
+    // Find li elements that have ▶ arrow pseudo-content and click them
+    const liToggles = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll("li").forEach(el => {
+        const text = (el.innerText || el.textContent || "").trim();
+        if (!text || text.length < 2 || text.length > 120) return;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        // Check for ▶ arrow in before pseudo-element or text
+        const before = window.getComputedStyle(el, "::before").content || "";
+        const hasArrow = /▶|▼|►|›|»|\u25B6|\u25BC|\u25BA|\u203A|\u00BB/.test(before + text);
+        if (hasArrow) out.push({ text: text.slice(0, 80) });
       });
+      return out.slice(0, 30);
+    });
 
-      for (const candidate of pseudoToggles) {
-        if (!candidate.text || seen.has(candidate.text)) continue;
-        seen.add(candidate.text);
-
-        // Find and click by text content
-        try {
-          const el = await page.locator(`text="${candidate.text.slice(0, 40)}"`).first();
-          const beforeText = await page.evaluate(() => document.body.innerText.length);
-          await el.click({ force: true }).catch(() => {});
-          await page.waitForTimeout(400);
-          const afterText = await page.evaluate(() => document.body.innerText.length);
-
-          // If clicking revealed new content (body text grew)
-          if (afterText > beforeText + 20) {
-            const newContent = await el.evaluate(el => {
-              const container = el.closest("li, dt, [class*='item']");
-              return container ? (container.innerText || "").trim().slice(0, 2000) : "";
-            });
-            if (newContent && newContent.length > candidate.text.length + 10) {
-              const body = newContent.replace(candidate.text, "").trim();
-              if (body.length > 5) results.push({ label: candidate.text, body });
-            }
-          }
-        } catch {}
-      }
-    } catch {}
+    for (const item of liToggles) {
+      if (seen.has(item.text)) continue;
+      seen.add(item.text);
+      try {
+        const liEl = await page.locator(`li`).filter({ hasText: item.text }).first();
+        await liEl.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(450);
+        const body = await liEl.evaluate(el => {
+          // Get the revealed content: tables or text after the label
+          const rows = [];
+          el.querySelectorAll("tr").forEach(row => {
+            const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText||"").trim());
+            if (cells.length > 0) rows.push(cells.join(" | "));
+          });
+          if (rows.length > 0) return rows.join("\n").slice(0, 2000);
+          const full = (el.innerText || "").trim();
+          return full.replace(item.text, "").trim().slice(0, 2000);
+        }).catch(() => "");
+        if (body && body.length > 5) results.push({ label: item.text, body });
+      } catch {}
+    }
 
   } catch (e) {
     console.error("[DROPDOWNS] Error:", e.message);
   }
 
-  // Deduplicate results
+  // Deduplicate by body prefix
   const deduped = [];
   const seenBodies = new Set();
   for (const r of results) {
-    const key = r.body.slice(0, 60);
+    const key = r.body.slice(0, 80);
     if (!seenBodies.has(key)) {
       seenBodies.add(key);
       deduped.push(r);
