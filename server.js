@@ -2239,7 +2239,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
-    await page.evaluate(async ({ stepMs, maxSteps }) => {
+    await page.evaluate(async (stepMs, maxSteps) => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
       const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
@@ -2256,7 +2256,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
         if (img.dataset.src) img.src = img.dataset.src;
         if (img.dataset.lazy) img.src = img.dataset.lazy;
       });
-    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
+    }, SCROLL_STEP_MS, MAX_SCROLL_STEPS);
 
     await page.waitForTimeout(150); // ↓ was 500ms
 
