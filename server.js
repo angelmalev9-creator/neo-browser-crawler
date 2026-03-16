@@ -23,9 +23,15 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 5;
-const PARALLEL_OCR = 10;
-const OCR_TIMEOUT_MS = 6000;
+const PARALLEL_TABS = 8;          // ↑ was 5
+const PARALLEL_OCR = 20;          // ↑ was 10
+const OCR_TIMEOUT_MS = 4000;      // ↓ was 6000
+const MAX_OCR_IMAGES_PER_PAGE = 6;  // NEW: cap images per page
+const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
+const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
+
+// Pages where OCR is WORTH doing (likely to have image-based text)
+const OCR_WORTHY_URL_RE = /(tseni|ceni|price|pricing|uslugi|services|package|paket|tarif)/i;
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -2150,11 +2156,12 @@ async function ocrAllImages(page, stats) {
       return true;
     });
 
-    console.log(`[OCR] ${validImages.length}/${imgElements.length} images to process`);
-    if (validImages.length === 0) return results;
+    const cappedImages = validImages.slice(0, MAX_OCR_IMAGES_PER_PAGE);
+    console.log(`[OCR] ${cappedImages.length}/${imgElements.length} images to process (capped at ${MAX_OCR_IMAGES_PER_PAGE})`);
+    if (cappedImages.length === 0) return results;
 
     const screenshots = await Promise.all(
-      validImages.map(async (img) => {
+      cappedImages.map(async (img) => {
         try {
           if (globalOcrCache.has(img.src)) {
             const cachedText = globalOcrCache.get(img.src);
@@ -2162,7 +2169,7 @@ async function ocrAllImages(page, stats) {
           }
 
           if (page.isClosed()) return null;
-          const buffer = await img.element.screenshot({ type: 'png', timeout: 2500 });
+          const buffer = await img.element.screenshot({ type: 'png', timeout: 1500 }); // ↓ was 2500ms
           return { ...img, buffer, cached: false };
         } catch { return null; }
       })
@@ -2223,258 +2230,6 @@ async function collectAllLinks(page, base) {
   } catch { return []; }
 }
 
-
-// ================= DROPDOWN / ACCORDION EXTRACTOR =================
-// Handles: WP <details> blocks, aria-expanded, data-toggle, Elementor,
-// list-item ▶ toggles, and any element that reveals hidden content on click.
-async function extractDropdownContent(page) {
-  const results = [];
-
-  try {
-    // ── 1. Native <details>/<summary> — WP block details, FAQ plugins, etc. ──
-    // Directly open all details elements and capture their table/text content.
-    const detailsTexts = await page.evaluate(() => {
-      const out = [];
-      document.querySelectorAll("details").forEach(el => {
-        const summary = el.querySelector("summary");
-        const label = (summary?.innerText || summary?.textContent || "").trim().slice(0, 120);
-        if (!label) return;
-
-        // Force open
-        el.open = true;
-        el.setAttribute("open", "");
-        // Also trigger any JS open handlers
-        try { summary?.click(); } catch {}
-
-        // Collect content: everything except the summary itself
-        let body = "";
-        const contentEls = Array.from(el.children).filter(c => c !== summary && c.tagName !== "SUMMARY");
-        if (contentEls.length > 0) {
-          body = contentEls.map(c => (c.innerText || c.textContent || "").trim()).filter(Boolean).join("\n");
-        }
-        // Fallback: full innerText minus label
-        if (!body || body.length < 5) {
-          const full = (el.innerText || el.textContent || "").trim();
-          body = full.startsWith(label) ? full.slice(label.length).trim() : full;
-        }
-
-        // For tables: extract rows as text
-        el.querySelectorAll("tr").forEach(row => {
-          const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText || "").trim());
-          if (cells.length > 0) {
-            const rowText = cells.join(" | ");
-            if (!body.includes(rowText)) body += "\n" + rowText;
-          }
-        });
-
-        body = body.trim();
-        if (body.length > 5) out.push({ label, body: body.slice(0, 3000) });
-      });
-      return out;
-    });
-    results.push(...detailsTexts);
-    if (detailsTexts.length > 0) {
-      console.log(`[DROPDOWNS] details/summary: ${detailsTexts.length} sections`);
-    }
-
-    // ── 2. aria-expanded + data-toggle triggers ────────────────────
-    const triggerSelectors = [
-      "[aria-expanded='false']",
-      '[aria-expanded="false"]',
-      "[data-toggle='collapse']",
-      "[data-bs-toggle='collapse']",
-      "[data-toggle='tab']",
-      "[data-bs-toggle='tab']",
-      "[class*='accordion'] [class*='header']",
-      "[class*='accordion'] [class*='title']",
-      "[class*='accordion'] [class*='trigger']",
-      "[class*='accordion'] [class*='toggle']",
-      ".accordion-button",
-      ".accordion-header",
-      ".accordion-header button",
-      "[class*='accordion-button']",
-      "[class*='collapse'] [class*='header']",
-      "[class*='collapse'] [class*='title']",
-      "[class*='collapse'] button",
-      ".collapsible",
-      "[class*='collapsible']",
-      "[class*='faq'] [class*='question']",
-      "[class*='faq'] dt",
-      "[class*='faq'] [class*='title']",
-      "[class*='faq'] [class*='header']",
-      "[class*='faq'] [class*='toggle']",
-      ".faq-question",
-      ".faq-title",
-      "[class*='toggle-title']",
-      "[class*='toggle-heading']",
-      "[class*='toggle-btn']",
-      "[class*='expandable']",
-      "[class*='expand-btn']",
-      "[class*='expand-title']",
-      "[class*='tab-title']",
-      "[class*='tab-label']",
-      "[role='tab']",
-      ".elementor-toggle-item .elementor-tab-title",
-      ".elementor-accordion-item .elementor-tab-title",
-      ".elementor-tab-title",
-      ".wp-block-details summary",
-      "[class*='et_pb_toggle'] [class*='et_pb_toggle_title']",
-      "[class*='fusion-accordion'] [class*='fusion-panel-heading']",
-      "[class*='vc_tta'] [class*='vc_tta-title']",
-      "dt",
-      "li[class*='toggle']",
-      "li[class*='collapsible']",
-    ];
-
-    const seen = new Set(results.map(r => r.label));
-
-    for (const sel of triggerSelectors) {
-      let handles;
-      try { handles = await page.$$(sel); } catch { continue; }
-
-      for (const handle of handles) {
-        try {
-          const isVis = await handle.evaluate(el => {
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
-          });
-          if (!isVis) continue;
-
-          const label = await handle.evaluate(el =>
-            (el.innerText || el.textContent || el.getAttribute("aria-label") || "").trim().slice(0, 120)
-          );
-          if (!label || label.length < 2) continue;
-          if (seen.has(label)) continue;
-          seen.add(label);
-
-          const isExpanded = await handle.evaluate(el => {
-            const aria = el.getAttribute("aria-expanded");
-            if (aria === "true") return true;
-            if (aria === "false") return false;
-            const cls = (el.className || "").toLowerCase();
-            return cls.includes("active") || cls.includes(" open") || cls.includes("expanded") || cls.includes("show");
-          });
-
-          if (!isExpanded) {
-            await handle.click({ force: true }).catch(() => {});
-            await page.waitForTimeout(400);
-          }
-
-          const body = await handle.evaluate(el => {
-            const candidates = [];
-
-            const contentSelectors = [
-              "[class*='body']","[class*='content']","[class*='panel']",
-              "[class*='answer']","[class*='text']","[class*='collapse']",
-              "[class*='description']","[class*='detail']","[class*='inner']",
-              ".collapse",".panel-body",
-            ];
-
-            const container = el.closest(
-              "[class*='accordion-item'],[class*='collapse-item'],[class*='faq-item']," +
-              "[class*='toggle-item'],[class*='et_pb_toggle'],[class*='elementor-accordion-item'],details,li"
-            );
-            if (container) {
-              for (const csel of contentSelectors) {
-                const c = container.querySelector(csel);
-                if (c && c !== el) {
-                  const t = (c.innerText || "").trim();
-                  if (t.length > 5) { candidates.push(t); break; }
-                }
-              }
-              // Extract table rows if present
-              container.querySelectorAll("tr").forEach(row => {
-                const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText || "").trim());
-                if (cells.length > 0) candidates.push(cells.join(" | "));
-              });
-
-              if (candidates.length === 0) {
-                const full = (container.innerText || "").trim();
-                const stripped = full.replace((el.innerText || "").trim(), "").trim();
-                if (stripped.length > 5) candidates.push(stripped);
-              }
-            }
-
-            if (candidates.length === 0) {
-              let next = el.nextElementSibling;
-              for (let i = 0; i < 5 && next; i++, next = next.nextElementSibling) {
-                const t = (next.innerText || "").trim();
-                if (t.length > 5) { candidates.push(t); break; }
-              }
-            }
-
-            if (candidates.length === 0) {
-              const pn = el.parentElement?.nextElementSibling;
-              if (pn) { const t = (pn.innerText || "").trim(); if (t.length > 5) candidates.push(t); }
-            }
-
-            return candidates.join("\n").slice(0, 2000);
-          });
-
-          if (body && body.length > 5) results.push({ label, body });
-        } catch {}
-      }
-    }
-
-    // ── 3. li-based ▶ toggles (boutiquehome style) ─────────────────
-    // Find li elements that have ▶ arrow pseudo-content and click them
-    const liToggles = await page.evaluate(() => {
-      const out = [];
-      document.querySelectorAll("li").forEach(el => {
-        const text = (el.innerText || el.textContent || "").trim();
-        if (!text || text.length < 2 || text.length > 120) return;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return;
-        // Check for ▶ arrow in before pseudo-element or text
-        const before = window.getComputedStyle(el, "::before").content || "";
-        const hasArrow = /▶|▼|►|›|»|\u25B6|\u25BC|\u25BA|\u203A|\u00BB/.test(before + text);
-        if (hasArrow) out.push({ text: text.slice(0, 80) });
-      });
-      return out.slice(0, 30);
-    });
-
-    for (const item of liToggles) {
-      if (seen.has(item.text)) continue;
-      seen.add(item.text);
-      try {
-        const liEl = await page.locator(`li`).filter({ hasText: item.text }).first();
-        await liEl.click({ force: true }).catch(() => {});
-        await page.waitForTimeout(450);
-        const body = await liEl.evaluate(el => {
-          // Get the revealed content: tables or text after the label
-          const rows = [];
-          el.querySelectorAll("tr").forEach(row => {
-            const cells = Array.from(row.querySelectorAll("td,th")).map(c => (c.innerText||"").trim());
-            if (cells.length > 0) rows.push(cells.join(" | "));
-          });
-          if (rows.length > 0) return rows.join("\n").slice(0, 2000);
-          const full = (el.innerText || "").trim();
-          return full.replace(item.text, "").trim().slice(0, 2000);
-        }).catch(() => "");
-        if (body && body.length > 5) results.push({ label: item.text, body });
-      } catch {}
-    }
-
-  } catch (e) {
-    console.error("[DROPDOWNS] Error:", e.message);
-  }
-
-  // Deduplicate by body prefix
-  const deduped = [];
-  const seenBodies = new Set();
-  for (const r of results) {
-    const key = r.body.slice(0, 80);
-    if (!seenBodies.has(key)) {
-      seenBodies.add(key);
-      deduped.push(r);
-    }
-  }
-
-  console.log(`[DROPDOWNS] Extracted ${deduped.length} expanded sections`);
-  return deduped;
-}
-
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
@@ -2483,29 +2238,30 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
-    // Scroll for lazy load
-    await page.evaluate(async () => {
+    // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
+    await page.evaluate(async (stepMs, maxSteps) => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
+      const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
 
-      for (let pos = 0; pos < maxScroll; pos += scrollStep) {
-        window.scrollTo(0, pos);
-        await new Promise(r => setTimeout(r, 100));
+      for (let i = 0; i <= steps; i++) {
+        window.scrollTo(0, i * scrollStep);
+        await new Promise(r => setTimeout(r, stepMs));
       }
-
       window.scrollTo(0, maxScroll);
 
+      // Force-load lazy images without waiting for scroll events
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
         if (img.dataset.lazy) img.src = img.dataset.lazy;
       });
-    });
+    }, SCROLL_STEP_MS, MAX_SCROLL_STEPS);
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(150); // ↓ was 500ms
 
     try {
-      await page.waitForLoadState('networkidle', { timeout: 3000 });
+      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
     } catch {}
 
     const title = clean(await page.title());
@@ -2515,8 +2271,11 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // Extract structured content
     const data = await extractStructured(page);
 
-    // OCR images
-    const ocrResults = await ocrAllImages(page, stats);
+    // OCR images — only run on pages likely to contain image-based text
+    // (pricing/services pages). Skip for generic content pages to save time.
+    const isOcrWorthy = OCR_WORTHY_URL_RE.test(url) || pageType === "services";
+    const ocrResults = isOcrWorthy ? await ocrAllImages(page, stats) : [];
+    if (!isOcrWorthy) console.log(`[OCR] Skipped (not OCR-worthy page)`);
 
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
@@ -2568,20 +2327,6 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[CAPS] Extract error:", e.message);
     }
 
-    // *** DROPDOWN EXTRACTION: click accordions/details and capture hidden text ***
-    let dropdownContent = "";
-    try {
-      const dropdownSections = await extractDropdownContent(page);
-      if (dropdownSections.length > 0) {
-        dropdownContent = dropdownSections
-          .map(s => `${s.label ? s.label + "\n" : ""}${s.body}`)
-          .join("\n\n");
-        dropdownContent = normalizeNumbers(clean(dropdownContent));
-      }
-    } catch (e) {
-      console.error("[DROPDOWNS] Extract error:", e.message);
-    }
-
     // Format content
     const htmlContent = normalizeNumbers(clean(data.rawContent));
     const ocrTexts = ocrResults.map(r => r.text);
@@ -2595,15 +2340,11 @@ ${htmlContent}
 === OCR_CONTENT_START ===
 ${ocrContent}
 === OCR_CONTENT_END ===
-
-=== DROPDOWN_CONTENT_START ===
-${dropdownContent}
-=== DROPDOWN_CONTENT_END ===
 `.trim();
 
     // ✅ NEW: contacts extraction (DOM + combined text)
     const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${dropdownContent}\n\n${domContacts.textHints || ""}`);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
     const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
