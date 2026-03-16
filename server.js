@@ -30,8 +30,8 @@ const MAX_OCR_IMAGES_PER_PAGE = 6;  // NEW: cap images per page
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
 
-// Pages where OCR is WORTH doing (likely to have image-based text)
-const OCR_WORTHY_URL_RE = /(tseni|ceni|price|pricing|uslugi|services|package|paket|tarif)/i;
+// OCR only on /tseni/ pages
+const OCR_WORTHY_URL_RE = /\/tseni(?:\/|$)/i;
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -1953,12 +1953,72 @@ async function extractStructured(page) {
         return normalized;
       }
 
+      const norm = (s = "") => s.replace(/\s+/g, " ").trim();
+
+      const extractTableText = (table) => {
+        const rows = [];
+        table.querySelectorAll("tr").forEach((tr) => {
+          const cells = Array.from(tr.querySelectorAll("th, td"))
+            .map((cell) => norm(cell.innerText || cell.textContent || ""))
+            .filter(Boolean);
+          if (cells.length > 0) rows.push(cells.join(" | "));
+        });
+        return rows.join("\n");
+      };
+
+      const extractDetailsContent = (detailsEl) => {
+        const parts = [];
+        const summaryEl = detailsEl.querySelector(":scope > summary");
+        const summaryText = norm(summaryEl?.innerText || summaryEl?.textContent || "");
+        if (summaryText) parts.push(summaryText);
+
+        Array.from(detailsEl.children).forEach((child) => {
+          if (child.tagName?.toLowerCase() === "summary") return;
+
+          child.querySelectorAll?.("table").forEach((table) => {
+            const tableText = extractTableText(table);
+            if (tableText) parts.push(tableText);
+          });
+
+          const textWithoutTables = norm(
+            Array.from(child.childNodes)
+              .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.tagName?.toLowerCase() === "table"))
+              .map((node) => node.textContent || "")
+              .join(" ")
+          );
+
+          if (textWithoutTables) parts.push(textWithoutTables);
+        });
+
+        return parts.filter(Boolean).join("\n");
+      };
+
+      const detailsTexts = [];
+      try {
+        const detailsBlocks = Array.from(document.querySelectorAll("details.wp-block-details, details"));
+        detailsBlocks.forEach((el) => {
+          try {
+            const summary = el.querySelector(":scope > summary");
+            el.open = true;
+            el.setAttribute("open", "");
+            try { summary?.click(); } catch {}
+            el.open = true;
+            el.setAttribute("open", "");
+
+            const blockText = extractDetailsContent(el);
+            const uniqueText = addUniqueText(blockText, 5);
+            if (uniqueText) detailsTexts.push(uniqueText);
+          } catch {}
+        });
+      } catch {}
+
       const sections = [];
       let current = null;
       const processedElements = new Set();
 
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
+        if (el.closest("details.wp-block-details, details")) return;
         let parent = el.parentElement;
         while (parent) {
           if (processedElements.has(parent)) return;
@@ -2038,7 +2098,7 @@ async function extractStructured(page) {
       const topControlTexts = [];
       const seenControls = new Set();
       try {
-        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup]');
+        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], summary');
         controls.forEach((el) => {
           if (!isVisible(el)) return;
           const rect = el.getBoundingClientRect();
@@ -2060,6 +2120,7 @@ async function extractStructured(page) {
 
       return {
         rawContent: [
+          detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
           overlayTexts.join("\n"),
@@ -2273,7 +2334,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
     // OCR images — only run on pages likely to contain image-based text
     // (pricing/services pages). Skip for generic content pages to save time.
-    const isOcrWorthy = OCR_WORTHY_URL_RE.test(url) || pageType === "services";
+    const isOcrWorthy = OCR_WORTHY_URL_RE.test(new URL(url).pathname);
     const ocrResults = isOcrWorthy ? await ocrAllImages(page, stats) : [];
     if (!isOcrWorthy) console.log(`[OCR] Skipped (not OCR-worthy page)`);
 
