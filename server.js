@@ -23,8 +23,8 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 8;          // ↑ was 5
-const PARALLEL_OCR = 20;          // ↑ was 10
+const PARALLEL_TABS = 16;          // ↑ was 5
+const PARALLEL_OCR = 25;          // ↑ was 10
 const OCR_TIMEOUT_MS = 4000;      // ↓ was 6000
 const MAX_OCR_IMAGES_PER_PAGE = 6;  // NEW: cap images per page
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
