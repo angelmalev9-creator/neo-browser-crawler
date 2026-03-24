@@ -2060,7 +2060,16 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
+    try {
+      await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
+    } catch (e) {
+      // JS/meta redirects interrupt navigation — not a real error, page loaded fine
+      if (e.message?.includes("interrupted by another navigation")) {
+        // page is at the redirect destination, proceed normally
+      } else {
+        throw e;
+      }
+    }
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
