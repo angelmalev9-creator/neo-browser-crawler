@@ -24,19 +24,12 @@ const visited = new Set();
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 16;          // ↑ was 5
-const PARALLEL_OCR = 25;          // ↑ was 10
-const OCR_TIMEOUT_MS = 4000;      // ↓ was 6000
-const MAX_OCR_IMAGES_PER_PAGE = 6;  // NEW: cap images per page
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
-
-// OCR only on /tseni/ pages
-const OCR_WORTHY_URL_RE = /\/tseni(?:\/|$)/i;
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
 
-const SKIP_OCR_RE = /\/(logo|favicon|spinner|avatar|pixel|spacer|blank|transparent)\.|\/icons?\//i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
@@ -753,90 +746,6 @@ async function extractPricingFromPage(page) {
       installment_plans: installment_plans.slice(0, 12),
     };
   });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// OCR-BASED PRICING EXTRACTION
-// Parses pricing cards from raw OCR text when prices are rendered as images
-// ═══════════════════════════════════════════════════════════════════════════
-
-function extractPricingFromOcr(ocrResults) {
-  const pricing_cards = [];
-  const seen = new Set();
-
-  // Money regex: €350, 350 лв, 650 EUR, etc.
-  const moneyRe = /([€$])\s*(\d[\d\s.,]*)|\b(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/gi;
-
-  for (const { text, alt } of ocrResults) {
-    if (!text || text.length < 3) continue;
-
-    // Split OCR text into lines for context
-    const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-
-    // Find all money matches
-    let m;
-    const localRe = /([€$])\s*(\d[\d\s.,]*)|\b(\d[\d\s.,]*)\s*(лв\.?|лева|BGN|EUR|€|\$)/gi;
-    while ((m = localRe.exec(text)) !== null) {
-      const price_text = m[0].replace(/\s+/g, "").trim();
-
-      // Look for a title near the price in the OCR text
-      // Find line index of the match
-      let charPos = 0;
-      let titleLine = "";
-      for (const line of lines) {
-        if (charPos + line.length >= m.index) {
-          // Use nearby lines as title candidates
-          const lineIdx = lines.indexOf(line);
-          // Look at lines before/after the price line for a title
-          for (let delta = -3; delta <= 3; delta++) {
-            const candidate = lines[lineIdx + delta];
-            if (!candidate) continue;
-            // Title: short, no digits or currency symbols, not the price itself
-            if (candidate.length >= 3 && candidate.length <= 60 && !/\d/.test(candidate) && candidate !== price_text) {
-              titleLine = candidate;
-              break;
-            }
-          }
-          break;
-        }
-        charPos += line.length + 1;
-      }
-
-      // Fallback to alt text as title
-      if (!titleLine && alt && alt.length <= 60) titleLine = alt;
-      if (!titleLine) titleLine = price_text; // last resort
-
-      const key = `${titleLine}|${price_text}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      // Extract features from remaining lines (non-price, non-title lines)
-      const features = lines.filter(l => {
-        if (l === titleLine) return false;
-        if (l === price_text) return false;
-        if (/([€$])\s*\d|\d\s*(лв\.?|лева|BGN|EUR)/i.test(l)) return false;
-        return l.length >= 3 && l.length <= 140;
-      }).slice(0, 20);
-
-      const period = /\/\s*месец|на месец|месец/i.test(text) ? "monthly"
-                   : /еднократно|one[-\s]?time/i.test(text) ? "one_time"
-                   : null;
-
-      pricing_cards.push({
-        title: titleLine,
-        price_text,
-        period,
-        badge: "",
-        features,
-        source: "ocr",
-      });
-    }
-  }
-
-  return {
-    pricing_cards: pricing_cards.slice(0, 12),
-    installment_plans: pricing_cards.filter(c => c.period === "monthly").slice(0, 12),
-  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2134,147 +2043,6 @@ async function extractStructured(page) {
   }
 }
 
-// ================= GLOBAL OCR CACHE =================
-const globalOcrCache = new Map();
-const API_KEY = process.env.GOOGLE_VISION_API_KEY || "";
-
-async function fastOCR(buffer) {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), OCR_TIMEOUT_MS);
-
-    const res = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          requests: [{
-            image: { content: buffer.toString("base64") },
-            features: [{ type: "TEXT_DETECTION" }],
-            imageContext: { languageHints: ["bg", "en", "tr", "ru"] }
-          }]
-        }),
-        signal: controller.signal
-      }
-    );
-
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      let errBody = "";
-      try { errBody = await res.text(); } catch {}
-      console.error(`[OCR ERROR] HTTP ${res.status}: ${errBody.slice(0, 200)}`);
-      return "";
-    }
-
-    const json = await res.json();
-
-    // Log Vision API errors (e.g. quota exceeded, invalid key)
-    const apiError = json.responses?.[0]?.error;
-    if (apiError) {
-      console.error(`[OCR API ERROR] code=${apiError.code} msg=${apiError.message}`);
-      return "";
-    }
-
-    const text = json.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
-    return text;
-  } catch (e) {
-    console.error(`[OCR EXCEPTION] ${e.message}`);
-    return "";
-  }
-}
-
-async function ocrAllImages(page, stats) {
-  const results = [];
-
-  try {
-    const imgElements = await page.$$("img");
-    if (imgElements.length === 0) return results;
-
-    const imgInfos = await Promise.all(
-      imgElements.map(async (img, i) => {
-        try {
-          const info = await img.evaluate(el => ({
-            src: el.src || "",
-            alt: el.alt || "",
-            w: Math.round(el.getBoundingClientRect().width),
-            h: Math.round(el.getBoundingClientRect().height),
-            visible: el.getBoundingClientRect().width > 0
-          }));
-          return { ...info, element: img, index: i };
-        } catch { return null; }
-      })
-    );
-
-    const validImages = imgInfos.filter(info => {
-      if (!info || !info.visible) return false;
-      if (info.w < 50 || info.h < 25) return false;
-      if (info.w > 1800 && info.h > 700) return false;
-      if (SKIP_OCR_RE.test(info.src)) {
-        return false;
-      }
-      return true;
-    });
-
-    const cappedImages = validImages.slice(0, MAX_OCR_IMAGES_PER_PAGE);
-    console.log(`[OCR] ${cappedImages.length}/${imgElements.length} images to process (capped at ${MAX_OCR_IMAGES_PER_PAGE})`);
-    if (cappedImages.length === 0) return results;
-
-    const screenshots = await Promise.all(
-      cappedImages.map(async (img) => {
-        try {
-          if (globalOcrCache.has(img.src)) {
-            const cachedText = globalOcrCache.get(img.src);
-            return { ...img, buffer: null, cached: true, text: cachedText };
-          }
-
-          if (page.isClosed()) return null;
-          const buffer = await img.element.screenshot({ type: 'png', timeout: 1500 }); // ↓ was 2500ms
-          return { ...img, buffer, cached: false };
-        } catch { return null; }
-      })
-    );
-
-    const validScreenshots = screenshots.filter(s => s !== null);
-
-    for (let i = 0; i < validScreenshots.length; i += PARALLEL_OCR) {
-      const batch = validScreenshots.slice(i, i + PARALLEL_OCR);
-
-      const batchResults = await Promise.all(
-        batch.map(async (img) => {
-          if (img.cached) {
-            if (img.text && img.text.length > 2) {
-              return { text: img.text, src: img.src, alt: img.alt };
-            }
-            return null;
-          }
-
-          if (!img.buffer) return null;
-
-          const text = await fastOCR(img.buffer);
-
-          globalOcrCache.set(img.src, text);
-
-          if (text && text.length > 2) {
-            stats.ocrElementsProcessed++;
-            stats.ocrCharsExtracted += text.length;
-            return { text, src: img.src, alt: img.alt };
-          }
-          return null;
-        })
-      );
-
-      results.push(...batchResults.filter(r => r !== null));
-    }
-
-  } catch (e) {
-    console.error("[OCR ERROR]", e.message);
-  }
-
-  return results;
-}
-
 // ================= LINK DISCOVERY =================
 async function collectAllLinks(page, base) {
   try {
@@ -2332,32 +2100,10 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // Extract structured content
     const data = await extractStructured(page);
 
-    // OCR images — only run on pages likely to contain image-based text
-    // (pricing/services pages). Skip for generic content pages to save time.
-    const isOcrWorthy = OCR_WORTHY_URL_RE.test(new URL(url).pathname);
-    const ocrResults = isOcrWorthy ? await ocrAllImages(page, stats) : [];
-    if (!isOcrWorthy) console.log(`[OCR] Skipped (not OCR-worthy page)`);
-
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
     try {
       pricing = await extractPricingFromPage(page);
-
-      // ✅ FIX: Also extract pricing from OCR results (for sites where prices are rendered as images, not DOM text)
-      if (ocrResults.length > 0) {
-        const ocrPricing = extractPricingFromOcr(ocrResults);
-        if (ocrPricing.pricing_cards.length > 0) {
-          console.log(`[PRICING OCR] ${ocrPricing.pricing_cards.length} cards from OCR`);
-          const domPriceTexts = new Set((pricing?.pricing_cards || []).map(c => c.price_text));
-          const newOcrCards = ocrPricing.pricing_cards.filter(c => !domPriceTexts.has(c.price_text));
-          pricing = pricing || { pricing_cards: [], installment_plans: [] };
-          pricing.pricing_cards = [...(pricing.pricing_cards || []), ...newOcrCards].slice(0, 12);
-          pricing.installment_plans = [
-            ...(pricing.installment_plans || []),
-            ...ocrPricing.installment_plans.filter(c => !domPriceTexts.has(c.price_text))
-          ].slice(0, 12);
-        }
-      }
 
       if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
         console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
@@ -2390,22 +2136,16 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
     // Format content
     const htmlContent = normalizeNumbers(clean(data.rawContent));
-    const ocrTexts = ocrResults.map(r => r.text);
-    const ocrContent = normalizeNumbers(clean(ocrTexts.join("\n\n")));
 
     const content = `
 === HTML_CONTENT_START ===
 ${htmlContent}
 === HTML_CONTENT_END ===
-
-=== OCR_CONTENT_START ===
-${ocrContent}
-=== OCR_CONTENT_END ===
 `.trim();
 
-    // ✅ NEW: contacts extraction (DOM + combined text)
+    // contacts extraction (DOM + HTML text)
     const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${ocrContent}\n\n${domContacts.textHints || ""}`);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
     const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
@@ -2419,12 +2159,10 @@ ${ocrContent}
       console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
     }
 
-    const htmlWords = countWordsExact(htmlContent);
-    const ocrWords = countWordsExact(ocrContent);
-    const totalWords = htmlWords + ocrWords;
+    const totalWords = countWordsExact(htmlContent);
 
     const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${totalWords}w (${htmlWords}+${ocrWords}ocr, ${ocrResults.length} imgs) ${elapsed}ms`);
+    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
     if (pageType !== "services" && totalWords < MIN_WORDS) {
       return { links: await collectAllLinks(page, base), page: null };
@@ -2437,10 +2175,8 @@ ${ocrContent}
         title,
         pageType,
         content,
-        // ✅ structured output: pricing + contacts
         structured: { pricing, contacts },
         wordCount: totalWords,
-        breakdown: { htmlWords, ocrWords, images: ocrResults.length },
         status: "ok",
       }
     };
@@ -2455,7 +2191,7 @@ ${ocrContent}
 async function crawlSmart(startUrl, siteId = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
@@ -2467,8 +2203,6 @@ async function crawlSmart(startUrl, siteId = null) {
     visited: 0,
     saved: 0,
     byType: {},
-    ocrElementsProcessed: 0,
-    ocrCharsExtracted: 0,
     errors: 0,
   };
 
@@ -2561,7 +2295,6 @@ async function crawlSmart(startUrl, siteId = null) {
   } finally {
     await browser.close();
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
-    console.log(`[OCR STATS] ${stats.ocrElementsProcessed} images → ${stats.ocrCharsExtracted} chars`);
   }
 
   let combinedSiteMap = null;
@@ -2608,7 +2341,7 @@ http
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
         contacts: lastResult?.contacts || null,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PARALLEL_OCR }
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
       }));
     }
 
@@ -2669,7 +2402,6 @@ http
         crawlFinished = false;
         lastCrawlUrl = requestedUrl;
         visited.clear();
-        globalOcrCache.clear();
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
         if (siteId) console.log("[SITE ID]", siteId);
@@ -2698,6 +2430,6 @@ http
   })
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
-    console.log(`Config: ${PARALLEL_TABS} tabs, ${PARALLEL_OCR} parallel OCR`);
+    console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
