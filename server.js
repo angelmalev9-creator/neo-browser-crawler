@@ -822,9 +822,13 @@ async function crawlSmart(startUrl, siteId = null) {
     );
     base = new URL(initPage.url()).origin;
 
-    const initialLinks = await collectAllLinks(initPage, base);
+    const initData = await withDeadline(
+      extractEverything(initPage, base, initPage.url()),
+      8000,
+      { links: [] }
+    );
     enqueue(initPage.url());
-    initialLinks.forEach(enqueue);
+    (initData?.links || []).forEach(enqueue);
 
     await initPage.close();
     await initCtx.close();
