@@ -23,9 +23,8 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 16;          // ↑ was 5
-const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
+const PARALLEL_TABS = 32;          // 6-core VPS: ~5 tabs per core
+const BROWSERS = 2;                // split tabs across 2 browser instances
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -1848,10 +1847,6 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
 
 async function extractStructured(page) {
   try {
-    await page.waitForSelector("body", { timeout: 1500 });
-  } catch {}
-
-  try {
     return await page.evaluate(() => {
       const seenTexts = new Set();
 
@@ -2065,73 +2060,30 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
-
-    // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
-    await page.evaluate(async ({ stepMs, maxSteps }) => {
-      const scrollStep = window.innerHeight;
-      const maxScroll = document.body.scrollHeight;
-      const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
-
-      for (let i = 0; i <= steps; i++) {
-        window.scrollTo(0, i * scrollStep);
-        await new Promise(r => setTimeout(r, stepMs));
-      }
-      window.scrollTo(0, maxScroll);
-
-      // Force-load lazy images without waiting for scroll events
-      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
-        img.loading = 'eager';
-        if (img.dataset.src) img.src = img.dataset.src;
-        if (img.dataset.lazy) img.src = img.dataset.lazy;
-      });
-    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
-
-    await page.waitForTimeout(150); // ↓ was 500ms
-
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
-    } catch {}
+    await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    // Extract structured content
-    const data = await extractStructured(page);
+    // Run all extractions in parallel
+    const [data, pricing, rawSiteMap, caps] = await Promise.all([
+      extractStructured(page),
+      extractPricingFromPage(page).catch(() => null),
+      extractSiteMapFromPage(page).catch(() => null),
+      extractCapabilitiesFromPage(page).catch(() => null),
+    ]);
 
-    // NEW: Pricing/package structured extraction (cards + installment)
-    let pricing = null;
-    try {
-      pricing = await extractPricingFromPage(page);
-
-      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
-      }
-    } catch (e) {
-      console.error("[PRICING] Extract error:", e.message);
+    if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+      console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
     }
 
-    // *** EXISTING: Extract SiteMap from this page ***
-    try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
-      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
-        siteMaps.push(rawSiteMap);
-        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
-      }
-    } catch (e) {
-      console.error("[SITEMAP] Extract error:", e.message);
+    if (rawSiteMap && (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0)) {
+      siteMaps.push(rawSiteMap);
     }
 
-    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
-    try {
-      const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
-        capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
-      }
-    } catch (e) {
-      console.error("[CAPS] Extract error:", e.message);
+    if (caps && ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0)) {
+      capabilitiesMaps.push(caps);
     }
 
     // Format content
@@ -2188,16 +2140,55 @@ ${htmlContent}
 }
 
 // ================= PARALLEL CRAWLER =================
+
+// Shared Chromium args for max performance
+const CHROMIUM_ARGS = [
+  "--no-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-software-rasterizer",
+  "--disable-extensions",
+  "--disable-default-apps",
+  "--disable-sync",
+  "--no-first-run",
+  "--disable-background-networking",
+  "--disable-translate",
+  "--disable-hang-monitor",
+  "--disable-prompt-on-repost",
+  "--disable-client-side-phishing-detection",
+  "--disable-component-update",
+  "--disable-domain-reliability",
+  "--disable-features=TranslateUI",
+  "--mute-audio",
+  "--no-zygote",
+  "--single-process",
+];
+
+// Block resources we don't need (no OCR = no images needed)
+const BLOCKED_TYPES = new Set(["image", "media", "font", "stylesheet"]);
+
+async function setupPage(ctx) {
+  const pg = await ctx.newPage();
+  await pg.route("**/*", (route) => {
+    if (BLOCKED_TYPES.has(route.request().resourceType())) {
+      route.abort();
+    } else {
+      route.continue();
+    }
+  });
+  return pg;
+}
+
 async function crawlSmart(startUrl, siteId = null) {
   const deadline = Date.now() + MAX_SECONDS * 1000;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs`);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs across ${BROWSERS} browsers`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
-  });
+  // Launch multiple browser instances for better CPU distribution
+  const browsers = await Promise.all(
+    Array(BROWSERS).fill(0).map(() => chromium.launch({ headless: true, args: CHROMIUM_ARGS }))
+  );
 
   const stats = {
     visited: 0,
@@ -2207,59 +2198,62 @@ async function crawlSmart(startUrl, siteId = null) {
   };
 
   const pages = [];
+  // Use Set for O(1) queue dedup instead of array.includes()
   const queue = [];
-  const siteMaps = []; // collect sitemaps from all pages
-  const capabilitiesMaps = []; // collect capabilities from all pages
+  const queued = new Set();
+  const siteMaps = [];
+  const capabilitiesMaps = [];
   let base = "";
 
-  // ✅ NEW: aggregate contacts across pages
   const contactAgg = { emails: new Set(), phones: new Set() };
 
+  const enqueue = (url) => {
+    const nl = normalizeUrl(url);
+    if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queued.has(nl)) {
+      queued.add(nl);
+      queue.push(nl);
+    }
+  };
+
   try {
-    const initContext = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
+    const initCtx = await browsers[0].newContext({
+      viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     });
-    const initPage = await initContext.newPage();
+    const initPage = await setupPage(initCtx);
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
-    queue.push(normalizeUrl(initPage.url()));
-    initialLinks.forEach(l => {
-      const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
-        queue.push(nl);
-      }
-    });
+    enqueue(initPage.url());
+    initialLinks.forEach(enqueue);
 
     await initPage.close();
-    await initContext.close();
+    await initCtx.close();
 
     console.log(`[CRAWL] Found ${queue.length} URLs`);
 
-    const createWorker = async () => {
+    const createWorker = async (browser) => {
       const ctx = await browser.newContext({
-        viewport: { width: 1920, height: 1080 },
+        viewport: { width: 1280, height: 800 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       });
-      const pg = await ctx.newPage();
+      const pg = await setupPage(ctx);
 
       while (Date.now() < deadline) {
         let url = null;
         while (queue.length > 0) {
           const candidate = queue.shift();
-          const normalized = normalizeUrl(candidate);
-          if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
-            visited.add(normalized);
-            url = normalized;
+          if (!visited.has(candidate) && !SKIP_URL_RE.test(candidate)) {
+            visited.add(candidate);
+            url = candidate;
             break;
           }
         }
 
         if (!url) {
-          await new Promise(r => setTimeout(r, 30));
+          await new Promise(r => setTimeout(r, 20));
           if (queue.length === 0) break;
           continue;
         }
@@ -2269,31 +2263,29 @@ async function crawlSmart(startUrl, siteId = null) {
         const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
-          // ✅ collect contacts
           const c = result.page?.structured?.contacts;
           if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
           if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
-
           pages.push(result.page);
           stats.saved++;
         }
 
-        result.links.forEach(l => {
-          const nl = normalizeUrl(l);
-          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
-            queue.push(nl);
-          }
-        });
+        result.links.forEach(enqueue);
       }
 
       await pg.close();
       await ctx.close();
     };
 
-    await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
+    // Distribute tabs evenly across browser instances
+    const tabsPerBrowser = Math.ceil(PARALLEL_TABS / BROWSERS);
+    const workerPromises = browsers.flatMap((browser, i) =>
+      Array(tabsPerBrowser).fill(0).map(() => createWorker(browser))
+    );
+    await Promise.all(workerPromises);
 
   } finally {
-    await browser.close();
+    await Promise.all(browsers.map(b => b.close()));
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
   }
 
@@ -2341,7 +2333,7 @@ http
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
         contacts: lastResult?.contacts || null,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
+        config: { PARALLEL_TABS, BROWSERS, MAX_SECONDS, MIN_WORDS }
       }));
     }
 
@@ -2430,6 +2422,6 @@ http
   })
   .listen(PORT, () => {
     console.log("Crawler running on", PORT);
-    console.log(`Config: ${PARALLEL_TABS} tabs`);
+    console.log(`Config: ${PARALLEL_TABS} tabs across ${BROWSERS} browsers`);
     console.log(`Worker: ${WORKER_URL}`);
   });
