@@ -1854,203 +1854,99 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// EXISTING EXTRACTION FUNCTIONS (unchanged)
+// SINGLE-EVALUATE EXTRACTOR — 1 CDP round-trip does everything
+// Replaces: extractStructured + collectAllLinks + extractContactsFromPage
+// Heavy functions (extractPricingFromPage, extractSiteMapFromPage,
+// extractCapabilitiesFromPage) are still called separately but in parallel.
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function extractStructured(page) {
+async function extractAll(page, base) {
   try {
-    return await page.evaluate(() => {
-      const seenTexts = new Set();
+    return await page.evaluate((base) => {
+      const norm = (s = "") => String(s).replace(/\s+/g, " ").trim();
+      const seen = new Set();
+      const addUniq = (t, min = 8) => {
+        const n = norm(t);
+        if (!n || n.length < min || seen.has(n)) return "";
+        seen.add(n);
+        return n;
+      };
 
-      function addUniqueText(text, minLength = 10) {
-        const normalized = text.trim().replace(/\s+/g, ' ');
-        if (normalized.length < minLength || seenTexts.has(normalized)) return "";
-        seenTexts.add(normalized);
-        return normalized;
+      // ── TEXT ─────────────────────────────────────────────
+      const parts = [];
+
+      // Main content area first (fastest path)
+      const main = document.querySelector("main, article, [role='main'], #content, .content, #main");
+      if (main) {
+        const t = addUniq(main.innerText || "", 20);
+        if (t) parts.push(t);
       }
 
-      const norm = (s = "") => s.replace(/\s+/g, " ").trim();
+      // Headings + paragraphs + lists (deduplicated)
+      document.querySelectorAll("h1,h2,h3,h4,p,li,td,th,label,span.price,span.amount,[class*='price'],[class*='amount']").forEach(el => {
+        try {
+          const t = addUniq(el.innerText || el.textContent || "");
+          if (t) parts.push(t);
+        } catch {}
+      });
 
-      const extractTableText = (table) => {
-        const rows = [];
-        table.querySelectorAll("tr").forEach((tr) => {
-          const cells = Array.from(tr.querySelectorAll("th, td"))
-            .map((cell) => norm(cell.innerText || cell.textContent || ""))
-            .filter(Boolean);
-          if (cells.length > 0) rows.push(cells.join(" | "));
-        });
-        return rows.join("\n");
-      };
+      // Details/accordion blocks
+      document.querySelectorAll("details").forEach(el => {
+        try {
+          el.open = true;
+          const t = addUniq(el.innerText || "", 5);
+          if (t) parts.push(t);
+        } catch {}
+      });
 
-      const extractDetailsContent = (detailsEl) => {
-        const parts = [];
-        const summaryEl = detailsEl.querySelector(":scope > summary");
-        const summaryText = norm(summaryEl?.innerText || summaryEl?.textContent || "");
-        if (summaryText) parts.push(summaryText);
+      const rawContent = parts.join("\n");
 
-        Array.from(detailsEl.children).forEach((child) => {
-          if (child.tagName?.toLowerCase() === "summary") return;
-
-          child.querySelectorAll?.("table").forEach((table) => {
-            const tableText = extractTableText(table);
-            if (tableText) parts.push(tableText);
-          });
-
-          const textWithoutTables = norm(
-            Array.from(child.childNodes)
-              .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.tagName?.toLowerCase() === "table"))
-              .map((node) => node.textContent || "")
-              .join(" ")
-          );
-
-          if (textWithoutTables) parts.push(textWithoutTables);
-        });
-
-        return parts.filter(Boolean).join("\n");
-      };
-
-      const detailsTexts = [];
+      // ── LINKS ─────────────────────────────────────────────
+      const links = [];
       try {
-        const detailsBlocks = Array.from(document.querySelectorAll("details.wp-block-details, details"));
-        detailsBlocks.forEach((el) => {
+        const base_origin = new URL(base).origin;
+        document.querySelectorAll("a[href]").forEach(a => {
           try {
-            const summary = el.querySelector(":scope > summary");
-            el.open = true;
-            el.setAttribute("open", "");
-            try { summary?.click(); } catch {}
-            el.open = true;
-            el.setAttribute("open", "");
-
-            const blockText = extractDetailsContent(el);
-            const uniqueText = addUniqueText(blockText, 5);
-            if (uniqueText) detailsTexts.push(uniqueText);
+            const u = new URL(a.href, base);
+            if (u.origin === base_origin) links.push(u.href.split("#")[0]);
           } catch {}
         });
       } catch {}
 
-      const sections = [];
-      let current = null;
-      const processedElements = new Set();
+      // ── CONTACTS ──────────────────────────────────────────
+      const emails = new Set();
+      const phones = new Set();
 
-      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
-        if (processedElements.has(el)) return;
-        if (el.closest("details.wp-block-details, details")) return;
-        let parent = el.parentElement;
-        while (parent) {
-          if (processedElements.has(parent)) return;
-          parent = parent.parentElement;
-        }
-        const text = el.innerText?.trim();
-        if (!text) return;
-        const uniqueText = addUniqueText(text, 5);
-        if (!uniqueText) return;
-        if (el.tagName.startsWith("H")) {
-          current = { heading: uniqueText, text: "" };
-          sections.push(current);
-        } else if (current) {
-          current.text += " " + uniqueText;
-        }
-        processedElements.add(el);
+      document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
+        const v = (a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0].trim();
+        if (v) emails.add(v);
+      });
+      document.querySelectorAll('a[href^="tel:"]').forEach(a => {
+        const v = (a.getAttribute("href") || "").replace(/^tel:/i, "").trim();
+        if (v) phones.add(v);
       });
 
-      const overlaySelectors = [
-        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
-        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
-        '[class*="alert"]', '[style*="position: fixed"]',
-        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
-      ];
-
-      const overlayTexts = [];
-      overlaySelectors.forEach(selector => {
-        try {
-          document.querySelectorAll(selector).forEach(el => {
-            if (processedElements.has(el)) return;
-            const text = el.innerText?.trim();
-            if (!text) return;
-            const uniqueText = addUniqueText(text);
-            if (uniqueText) {
-              overlayTexts.push(uniqueText);
-              processedElements.add(el);
-            }
-          });
-        } catch {}
-      });
-
-      const pseudoTexts = [];
-      try {
-        document.querySelectorAll("*").forEach(el => {
-          const before = window.getComputedStyle(el, "::before").content;
-          const after = window.getComputedStyle(el, "::after").content;
-          if (before && before !== "none" && before !== '""') {
-            const cleaned = before.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-          if (after && after !== "none" && after !== '""') {
-            const cleaned = after.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-        });
-      } catch {}
-
-      let mainContent = "";
-      const mainEl = document.querySelector("main") || document.querySelector("article");
-      if (mainEl && !processedElements.has(mainEl)) {
-        const text = mainEl.innerText?.trim();
-        if (text) mainContent = addUniqueText(text) || "";
-      }
-
-      const isVisible = (el) => {
-        try {
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-        } catch {
-          return false;
-        }
-      };
-
-      const topControlTexts = [];
-      const seenControls = new Set();
-      try {
-        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], summary');
-        controls.forEach((el) => {
-          if (!isVisible(el)) return;
-          const rect = el.getBoundingClientRect();
-          if (rect.top > Math.max(window.innerHeight + 250, 1100)) return;
-          const parts = [
-            el.textContent || "",
-            el.getAttribute?.("aria-label") || "",
-            el.getAttribute?.("placeholder") || "",
-            el.getAttribute?.("value") || "",
-            el.getAttribute?.("title") || "",
-          ].join(" ").replace(/\s+/g, " ").trim();
-          if (!parts || parts.length < 2 || parts.length > 80) return;
-          const key = parts.toLowerCase();
-          if (seenControls.has(key)) return;
-          seenControls.add(key);
-          topControlTexts.push(parts);
-        });
-      } catch {}
+      // Footer/contact text hints
+      const contactHints = [];
+      const footer = document.querySelector("footer");
+      if (footer) contactHints.push(norm(footer.innerText || ""));
+      const contactEl = document.querySelector("[id*='contact'],[class*='contact'],[id*='kontakti'],[class*='kontakti']");
+      if (contactEl) contactHints.push(norm(contactEl.innerText || ""));
 
       return {
-        rawContent: [
-          detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
-          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
-          mainContent,
-          overlayTexts.join("\n"),
-          pseudoTexts.join(" "),
-          topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
-        ].filter(Boolean).join("\n\n"),
+        rawContent,
+        links: [...new Set(links)],
+        emails: [...emails].slice(0, 12),
+        phones: [...phones].slice(0, 12),
+        contactHints: contactHints.join("\n"),
       };
-    });
-  } catch (e) {
-    return { rawContent: "" };
+    }, base);
+  } catch {
+    return { rawContent: "", links: [], emails: [], phones: [], contactHints: "" };
   }
 }
 
-// ================= LINK DISCOVERY =================
+// ================= LINK DISCOVERY (fallback) =================
 async function collectAllLinks(page, base) {
   try {
     return await page.evaluate(base => {
@@ -2058,7 +1954,7 @@ async function collectAllLinks(page, base) {
       document.querySelectorAll("a[href]").forEach(a => {
         try {
           const u = new URL(a.href, base);
-          if (u.origin === base) urls.add(u.href.split("#")[0]);
+          if (u.origin === new URL(base).origin) urls.add(u.href.split("#")[0]);
         } catch {}
       });
       return Array.from(urls);
@@ -2071,77 +1967,74 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
   console.log("[PAGE]", url);
 
-  // Navigate — timeout:0 means Playwright never throws, we race against our budget
-  const gotoOk = await withDeadline(
+  // Navigate — timeout:0 = never throws, we control budget via withDeadline
+  await withDeadline(
     page.goto(url, { timeout: 0, waitUntil: "domcontentloaded" })
       .catch(e => {
-        if (e.message?.includes("interrupted by another navigation")) return true;
-        return null; // navigation failed — proceed with whatever is in DOM
+        if (!e.message?.includes("interrupted by another navigation")) throw e;
       }),
     PAGE_BUDGET_MS,
     null
   );
 
   const remaining = PAGE_BUDGET_MS - (Date.now() - startTime);
-  if (remaining < 500) {
-    // Page took the full budget just to load — collect links and move on
-    const links = await withDeadline(collectAllLinks(page, base), 1000, []);
+  if (remaining < 400) {
     stats.errors++;
-    return { links, page: null };
+    return { links: [], page: null };
   }
 
-  const title = clean(await withDeadline(page.title(), 1000, ""));
-  const pageType = detectPageType(url, title);
-  stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+  const evalMs = Math.max(800, remaining - 300);
 
-  // Evaluate timeout: remaining time minus 500ms buffer, min 1s
-  const evalMs = Math.max(1000, remaining - 500);
-
-  // Run all extractions in parallel with individual deadlines
-  const [data, pricing, rawSiteMap, caps, domContacts, links] = await Promise.all([
-    withDeadline(extractStructured(page), evalMs, { rawContent: "" }),
+  // ONE evaluate call for text+links+contacts  +  parallel capability extraction
+  const [all, pricing, rawSiteMap, caps] = await Promise.all([
+    withDeadline(extractAll(page, base), evalMs, { rawContent: "", links: [], emails: [], phones: [], contactHints: "" }),
     withDeadline(extractPricingFromPage(page), evalMs, null),
     withDeadline(extractSiteMapFromPage(page), evalMs, null),
     withDeadline(extractCapabilitiesFromPage(page), evalMs, null),
-    withDeadline(extractContactsFromPage(page), evalMs, { emails: [], phones: [], textHints: "" }),
-    withDeadline(collectAllLinks(page, base), evalMs, []),
   ]);
 
   if (rawSiteMap?.buttons?.length > 0 || rawSiteMap?.forms?.length > 0) {
     siteMaps.push(rawSiteMap);
   }
-  if (caps && ((caps.forms?.length || 0) + (caps.wizards?.length || 0) + (caps.iframes?.length || 0) + (caps.availability?.length || 0) > 0)) {
+  if (caps && (caps.forms?.length || caps.wizards?.length || caps.iframes?.length || caps.availability?.length)) {
     capabilitiesMaps.push(caps);
   }
 
-  const htmlContent = normalizeNumbers(clean(data?.rawContent || ""));
-  const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts?.textHints || ""}`);
+  const title = clean(await withDeadline(page.title(), 500, ""));
+  const pageType = detectPageType(url, title);
+  stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-  const mergedEmails = Array.from(new Set([...(domContacts?.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
-  const mergedPhones = Array.from(new Set([...(domContacts?.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
+  const htmlContent = normalizeNumbers(clean(all?.rawContent || ""));
+  const textContacts = extractContactsFromText(`${htmlContent}\n${all?.contactHints || ""}`);
 
-  const contacts = { emails: mergedEmails, phones: mergedPhones };
+  const mergedEmails = Array.from(new Set([...(all?.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
+  const mergedPhones = Array.from(new Set([
+    ...(all?.phones || []).map(normalizePhone).filter(Boolean),
+    ...(textContacts.phones || [])
+  ])).slice(0, 12);
+
   const totalWords = countWordsExact(htmlContent);
   const elapsed = Date.now() - startTime;
   console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
   if (pageType !== "services" && totalWords < MIN_WORDS) {
-    return { links, page: null };
+    return { links: all?.links || [], page: null };
   }
 
   return {
-    links,
+    links: all?.links || [],
     page: {
       url,
       title,
       pageType,
       content: `=== HTML_CONTENT_START ===\n${htmlContent}\n=== HTML_CONTENT_END ===`,
-      structured: { pricing, contacts },
+      structured: { pricing, contacts: { emails: mergedEmails, phones: mergedPhones } },
       wordCount: totalWords,
       status: "ok",
     }
   };
 }
+
 
 // ================= PARALLEL CRAWLER =================
 
