@@ -25,9 +25,21 @@ const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 32;          // 6-core VPS: ~5 tabs per core
 const BROWSERS = 2;                // split tabs across 2 browser instances
+const PAGE_BUDGET_MS = 7000;      // max ms per page total (soft, never throws)
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
+
+// ================= DEADLINE HELPER =================
+// Races a promise against a timeout. On timeout returns the fallback — never throws.
+function withDeadline(promise, ms, fallback = null) {
+  let t;
+  const timer = new Promise(r => { t = setTimeout(() => r(fallback), ms); });
+  return Promise.race([
+    promise.then(v => { clearTimeout(t); return v; }).catch(() => { clearTimeout(t); return fallback; }),
+    timer,
+  ]);
+}
 
 
 // ================= UTILS =================
@@ -2057,95 +2069,78 @@ async function collectAllLinks(page, base) {
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
+  console.log("[PAGE]", url);
 
-  try {
-    console.log("[PAGE]", url);
-    try {
-      await page.goto(url, { timeout: 8000, waitUntil: "domcontentloaded" });
-    } catch (e) {
-      // JS/meta redirects interrupt navigation — not a real error, page loaded fine
-      if (e.message?.includes("interrupted by another navigation")) {
-        // page is at the redirect destination, proceed normally
-      } else {
-        throw e;
-      }
-    }
+  // Navigate — timeout:0 means Playwright never throws, we race against our budget
+  const gotoOk = await withDeadline(
+    page.goto(url, { timeout: 0, waitUntil: "domcontentloaded" })
+      .catch(e => {
+        if (e.message?.includes("interrupted by another navigation")) return true;
+        return null; // navigation failed — proceed with whatever is in DOM
+      }),
+    PAGE_BUDGET_MS,
+    null
+  );
 
-    const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
-    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
-
-    // Run all extractions in parallel
-    const [data, pricing, rawSiteMap, caps] = await Promise.all([
-      extractStructured(page),
-      extractPricingFromPage(page).catch(() => null),
-      extractSiteMapFromPage(page).catch(() => null),
-      extractCapabilitiesFromPage(page).catch(() => null),
-    ]);
-
-    if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-      console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
-    }
-
-    if (rawSiteMap && (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0)) {
-      siteMaps.push(rawSiteMap);
-    }
-
-    if (caps && ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0)) {
-      capabilitiesMaps.push(caps);
-    }
-
-    // Format content
-    const htmlContent = normalizeNumbers(clean(data.rawContent));
-
-    const content = `
-=== HTML_CONTENT_START ===
-${htmlContent}
-=== HTML_CONTENT_END ===
-`.trim();
-
-    // contacts extraction (DOM + HTML text)
-    const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
-
-    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
-    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
-
-    const contacts = {
-      emails: mergedEmails,
-      phones: mergedPhones,
-    };
-
-    if (contacts.emails.length || contacts.phones.length) {
-      console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
-    }
-
-    const totalWords = countWordsExact(htmlContent);
-
-    const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
-
-    if (pageType !== "services" && totalWords < MIN_WORDS) {
-      return { links: await collectAllLinks(page, base), page: null };
-    }
-
-    return {
-      links: await collectAllLinks(page, base),
-      page: {
-        url,
-        title,
-        pageType,
-        content,
-        structured: { pricing, contacts },
-        wordCount: totalWords,
-        status: "ok",
-      }
-    };
-  } catch (e) {
-    console.error("[PAGE ERROR]", url, e.message);
+  const remaining = PAGE_BUDGET_MS - (Date.now() - startTime);
+  if (remaining < 500) {
+    // Page took the full budget just to load — collect links and move on
+    const links = await withDeadline(collectAllLinks(page, base), 1000, []);
     stats.errors++;
-    return { links: [], page: null };
+    return { links, page: null };
   }
+
+  const title = clean(await withDeadline(page.title(), 1000, ""));
+  const pageType = detectPageType(url, title);
+  stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+
+  // Evaluate timeout: remaining time minus 500ms buffer, min 1s
+  const evalMs = Math.max(1000, remaining - 500);
+
+  // Run all extractions in parallel with individual deadlines
+  const [data, pricing, rawSiteMap, caps, domContacts, links] = await Promise.all([
+    withDeadline(extractStructured(page), evalMs, { rawContent: "" }),
+    withDeadline(extractPricingFromPage(page), evalMs, null),
+    withDeadline(extractSiteMapFromPage(page), evalMs, null),
+    withDeadline(extractCapabilitiesFromPage(page), evalMs, null),
+    withDeadline(extractContactsFromPage(page), evalMs, { emails: [], phones: [], textHints: "" }),
+    withDeadline(collectAllLinks(page, base), evalMs, []),
+  ]);
+
+  if (rawSiteMap?.buttons?.length > 0 || rawSiteMap?.forms?.length > 0) {
+    siteMaps.push(rawSiteMap);
+  }
+  if (caps && ((caps.forms?.length || 0) + (caps.wizards?.length || 0) + (caps.iframes?.length || 0) + (caps.availability?.length || 0) > 0)) {
+    capabilitiesMaps.push(caps);
+  }
+
+  const htmlContent = normalizeNumbers(clean(data?.rawContent || ""));
+  const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts?.textHints || ""}`);
+
+  const mergedEmails = Array.from(new Set([...(domContacts?.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
+  const mergedPhones = Array.from(new Set([...(domContacts?.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
+
+  const contacts = { emails: mergedEmails, phones: mergedPhones };
+  const totalWords = countWordsExact(htmlContent);
+  const elapsed = Date.now() - startTime;
+  console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
+
+  if (pageType !== "services" && totalWords < MIN_WORDS) {
+    return { links, page: null };
+  }
+
+  return {
+    links,
+    page: {
+      url,
+      title,
+      pageType,
+      content: `=== HTML_CONTENT_START ===\n${htmlContent}\n=== HTML_CONTENT_END ===`,
+      structured: { pricing, contacts },
+      wordCount: totalWords,
+      status: "ok",
+    }
+  };
 }
 
 // ================= PARALLEL CRAWLER =================
@@ -2220,7 +2215,10 @@ async function crawlSmart(startUrl, siteId = null) {
     });
     const initPage = await setupPage(initCtx);
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await withDeadline(
+      initPage.goto(startUrl, { timeout: 0, waitUntil: "domcontentloaded" }).catch(() => null),
+      12000, null
+    );
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
