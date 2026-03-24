@@ -2141,27 +2141,16 @@ ${htmlContent}
 
 // ================= PARALLEL CRAWLER =================
 
-// Shared Chromium args for max performance
+// Chromium args for performance (no duplicates with Playwright defaults)
 const CHROMIUM_ARGS = [
   "--no-sandbox",
   "--disable-dev-shm-usage",
   "--disable-gpu",
   "--disable-software-rasterizer",
-  "--disable-extensions",
-  "--disable-default-apps",
-  "--disable-sync",
-  "--no-first-run",
-  "--disable-background-networking",
-  "--disable-translate",
-  "--disable-hang-monitor",
-  "--disable-prompt-on-repost",
-  "--disable-client-side-phishing-detection",
-  "--disable-component-update",
   "--disable-domain-reliability",
-  "--disable-features=TranslateUI",
   "--mute-audio",
-  "--no-zygote",
-  "--single-process",
+  // NOTE: --single-process and --no-zygote intentionally omitted
+  // — they crash Chromium when opening multiple pages/contexts
 ];
 
 // Block resources we don't need (no OCR = no images needed)
