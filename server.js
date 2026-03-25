@@ -25,7 +25,8 @@ const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 30;          // 6-core VPS: ~5 tabs per core
 const BROWSERS = 1;                // split tabs across 2 browser instances
-const PAGE_BUDGET_MS = 7000;      // max ms per page total (soft, never throws)
+const PAGE_BUDGET_MS = 7000; 
+const RETURN_BEFORE_MS = 45000; // max ms per page total (soft, never throws)
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -774,7 +775,9 @@ async function setupPage(ctx) {
 }
 
 async function crawlSmart(startUrl, siteId = null) {
-  const deadline = Date.now() + MAX_SECONDS * 1000;
+ const startTs = Date.now();
+const deadline = startTs + MAX_SECONDS * 1000;
+const returnDeadline = startTs + RETURN_BEFORE_MS;
   console.log("\n[CRAWL START]", startUrl);
   console.log(`[CONFIG] ${PARALLEL_TABS} tabs across ${BROWSERS} browsers`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
@@ -842,7 +845,7 @@ async function crawlSmart(startUrl, siteId = null) {
       });
       const pg = await setupPage(ctx);
 
-      while (Date.now() < deadline) {
+      while (Date.now() < deadline && Date.now() < returnDeadline) {
         let url = null;
         while (queue.length > 0) {
           const candidate = queue.shift();
@@ -859,7 +862,12 @@ async function crawlSmart(startUrl, siteId = null) {
           continue;
         }
 
-        stats.visited++;
+        if (Date.now() >= returnDeadline) {
+  console.log("[EARLY RETURN] Deadline reached");
+  break;
+}
+
+stats.visited++;
 
         const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
@@ -916,7 +924,26 @@ async function crawlSmart(startUrl, siteId = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
+  const elapsed = Date.now() - startTs;
+const isPartial = Date.now() >= returnDeadline;
+
+console.log(`[TIME] ${elapsed}ms`);
+
+return {
+  pages,
+  stats,
+  siteMap: combinedSiteMap,
+  capabilities: combinedCapabilities,
+  contacts,
+  meta: {
+    partial: isPartial,
+    reason: isPartial ? "deadline_reached" : "completed",
+    elapsed_ms: elapsed,
+    visited: stats.visited,
+    saved: stats.saved,
+    remaining_queue: queue.length
+  }
+};
 }
 
 // ================= HTTP SERVER =================
