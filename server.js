@@ -23,8 +23,8 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 180;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 32;          // 6-core VPS: ~5 tabs per core
-const BROWSERS = 2;                // split tabs across 2 browser instances
+const PARALLEL_TABS = 16;          // 6-core VPS: ~5 tabs per core
+const BROWSERS = 1;                // split tabs across 2 browser instances
 const PAGE_BUDGET_MS = 7000;      // max ms per page total (soft, never throws)
 
 const SKIP_URL_RE =
