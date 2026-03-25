@@ -21,7 +21,7 @@ const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
-const MAX_SECONDS = 180;
+const MAX_SECONDS = 90;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
@@ -2184,10 +2184,16 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 }
 
 // ================= PARALLEL CRAWLER =================
-async function crawlSmart(startUrl, siteId = null) {
-  const deadline = Date.now() + MAX_SECONDS * 1000;
+async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
+  // If caller passed a deadline (e.g. scrape-website knows its own timeout),
+  // use that minus a 5s buffer for JSON serialization + response.
+  // Otherwise fall back to MAX_SECONDS.
+  const effectiveMs = deadlineMs
+    ? Math.min(deadlineMs, MAX_SECONDS * 1000)
+    : MAX_SECONDS * 1000;
+  const deadline = Date.now() + effectiveMs;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs`);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, deadline in ${Math.round(effectiveMs / 1000)}s`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
@@ -2367,6 +2373,10 @@ http
 
         const requestedUrl = normalizeUrl(parsed.url);
         const siteId = parsed.site_id || null;
+        // Accept deadline from caller — scrape-website sends how many ms the crawler has
+        // before the caller's own timeout fires. We subtract 5s for safety buffer.
+        const rawDeadline = Number(parsed.deadline_ms) || 0;
+        const deadlineMs = rawDeadline > 10000 ? rawDeadline - 5000 : null;
         const now = Date.now();
 
         if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
@@ -2401,8 +2411,9 @@ http
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
         if (siteId) console.log("[SITE ID]", siteId);
+        if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
 
-        const result = await crawlSmart(parsed.url, siteId);
+        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
 
         crawlInProgress = false;
         crawlFinished = true;
