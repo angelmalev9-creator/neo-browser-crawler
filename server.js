@@ -309,26 +309,73 @@ function generateFieldKeywords(name, placeholder, label) {
 // Extract SiteMap from a page
 async function extractSiteMapFromPage(page) {
   return await page.evaluate(() => {
-    const getSelector = (el, idx) => {
-      if (el.id) return `#${el.id}`;
-      if (el.className && typeof el.className === "string") {
-        const cls = el.className.trim().split(/\s+/)[0];
-        if (cls && !cls.includes(":") && !cls.includes("[")) {
-          const matches = document.querySelectorAll(`.${cls}`);
-          if (matches.length === 1) return `.${cls}`;
+   const getSelector = (el, idx) => {
+      const tag = (el.tagName || "div").toLowerCase();
+
+      try {
+        if (el.id) return `#${CSS.escape(el.id)}`;
+      } catch {}
+
+      try {
+        const name = el.getAttribute?.("name");
+        if (name) return `${tag}[name="${CSS.escape(name)}"]`;
+      } catch {}
+
+      try {
+        const type = el.getAttribute?.("type");
+        if (type && /^(input|button)$/i.test(tag)) {
+          return `${tag}[type="${CSS.escape(type)}"]`;
         }
-      }
-      const tag = el.tagName.toLowerCase();
+      } catch {}
+
+      try {
+        const role = el.getAttribute?.("role");
+        if (role) return `${tag}[role="${CSS.escape(role)}"]`;
+      } catch {}
+
+      try {
+        if (el.className && typeof el.className === "string") {
+          const classes = el.className.trim().split(/\s+/).filter(Boolean);
+
+          for (const raw of classes) {
+            let escaped = "";
+            try {
+              escaped = CSS.escape(raw);
+            } catch {
+              continue;
+            }
+
+            try {
+              const exact = `.${escaped}`;
+              const matches = document.querySelectorAll(exact);
+              if (matches.length === 1) return exact;
+            } catch {}
+          }
+
+          for (const raw of classes) {
+            let escaped = "";
+            try {
+              escaped = CSS.escape(raw);
+            } catch {
+              continue;
+            }
+
+            try {
+              const exact = `${tag}.${escaped}`;
+              const matches = document.querySelectorAll(exact);
+              if (matches.length >= 1) return exact;
+            } catch {}
+          }
+        }
+      } catch {}
+
       const parent = el.parentElement;
       if (parent) {
         const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
         const index = siblings.indexOf(el) + 1;
-        if (el.className) {
-          const cls = el.className.split(/\s+/)[0];
-          if (cls) return `${tag}.${cls}`;
-        }
         return `${tag}:nth-of-type(${index})`;
       }
+
       return `${tag}:nth-of-type(${idx + 1})`;
     };
 
@@ -613,6 +660,172 @@ async function sendSiteMapToWorker(siteMap) {
   } catch (error) {
     console.error(`[SITEMAP] ✗ Worker send error:`, error.message);
     return false;
+  }
+}
+
+async function openClickableDialogs(page) {
+  try {
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(400);
+
+    return await page.evaluate(async () => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+      const isVisible = (el) => {
+        if (!el) return false;
+        try {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.opacity !== "0"
+          );
+        } catch {
+          return false;
+        }
+      };
+
+      const dialogSelectors = [
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[aria-modal="true"]',
+        '[data-state="open"]',
+        '[data-state="open"][role]',
+        '[class*="dialog"]',
+        '[class*="modal"]',
+        '[class*="drawer"]',
+        '[class*="popup"]',
+        '[class*="overlay"]',
+        '[id*="dialog"]',
+        '[id*="modal"]'
+      ];
+
+      const getOpenDialogs = () => {
+        const out = [];
+        const seen = new Set();
+
+        dialogSelectors.forEach((selector) => {
+          try {
+            document.querySelectorAll(selector).forEach((el) => {
+              if (!isVisible(el)) return;
+              const txt = norm(el.innerText || el.textContent || "");
+              if (!txt || txt.length < 40) return;
+
+              const key = txt.slice(0, 300);
+              if (seen.has(key)) return;
+              seen.add(key);
+
+              out.push({
+                selector_hint: selector,
+                text: txt.slice(0, 6000)
+              });
+            });
+          } catch {}
+        });
+
+        return out;
+      };
+
+      const clickTriggers = Array.from(
+        document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')
+      ).filter((el) => {
+        if (!isVisible(el)) return false;
+
+        const txt = norm(
+          [
+            el.innerText || el.textContent || "",
+            el.getAttribute?.("aria-label") || "",
+            el.getAttribute?.("title") || "",
+            el.getAttribute?.("value") || ""
+          ].join(" ")
+        ).toLowerCase();
+
+        if (!txt || txt.length < 2 || txt.length > 120) return false;
+
+        return /виж\s*детайли|детайли|details|learn more|more info|повече|спецификац|пакет/i.test(txt);
+      });
+
+      const results = [];
+      const seenTexts = new Set();
+
+      const closeDialog = async () => {
+        const closeSelectors = [
+          '[aria-label="Close"]',
+          '[aria-label="close"]',
+          '[aria-label*="затвори"]',
+          '[role="dialog"] button',
+          '[role="alertdialog"] button',
+          '[data-state="open"] button'
+        ];
+
+        for (const selector of closeSelectors) {
+          try {
+            const nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+            for (const node of nodes) {
+              const txt = norm(node.innerText || node.textContent || "").toLowerCase();
+              const aria = norm(node.getAttribute?.("aria-label") || "").toLowerCase();
+
+              if (
+                /close|затвори|cancel|x/.test(txt) ||
+                /close|затвори/.test(aria) ||
+                (node.querySelector && node.querySelector("svg"))
+              ) {
+                try {
+                  node.click();
+                  await sleep(250);
+                  return;
+                } catch {}
+              }
+            }
+          } catch {}
+        }
+
+        try {
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+          await sleep(250);
+        } catch {}
+      };
+
+      for (const trigger of clickTriggers.slice(0, 16)) {
+        try {
+          const triggerText = norm(
+            [
+              trigger.innerText || trigger.textContent || "",
+              trigger.getAttribute?.("aria-label") || "",
+              trigger.getAttribute?.("title") || "",
+              trigger.getAttribute?.("value") || ""
+            ].join(" ")
+          ).slice(0, 160);
+
+          trigger.click();
+          await sleep(900);
+
+          const dialogs = getOpenDialogs();
+          for (const dlg of dialogs) {
+            const key = dlg.text.slice(0, 500);
+            if (seenTexts.has(key)) continue;
+            seenTexts.add(key);
+
+            results.push({
+              trigger_text: triggerText,
+              selector_hint: dlg.selector_hint,
+              dialog_text: dlg.text
+            });
+          }
+
+          await closeDialog();
+          await sleep(250);
+        } catch {}
+      }
+
+      return results;
+    });
+  } catch {
+    return [];
   }
 }
 
@@ -1781,12 +1994,59 @@ async function extractCapabilitiesFromPage(page) {
       // wizard detection is best-effort, never crash
     }
 
+    const dialogs = [];
+
+    try {
+      const dialogSelectors = [
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[aria-modal="true"]',
+        '[data-state="open"]',
+        '[data-state="open"][role]',
+        '[class*="dialog"]',
+        '[class*="modal"]',
+        '[class*="drawer"]',
+        '[class*="popup"]',
+        '[class*="overlay"]',
+        '[id*="dialog"]',
+        '[id*="modal"]'
+      ];
+
+      const seenDialogs = new Set();
+
+      dialogSelectors.forEach((selector) => {
+        try {
+          document.querySelectorAll(selector).forEach((el) => {
+            if (!isVisible(el)) return;
+
+            const txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+            if (!txt || txt.length < 40) return;
+
+            const key = txt.slice(0, 300);
+            if (seenDialogs.has(key)) return;
+            seenDialogs.add(key);
+
+            dialogs.push({
+              kind: "dialog",
+              schema: {
+                ui_type: "dialog_or_modal",
+                selector_hint: selector,
+                text_hint: txt.slice(0, 300),
+                full_text: txt.slice(0, 6000),
+              }
+            });
+          });
+        } catch {}
+      });
+    } catch {}
+
     return {
       url: window.location.href,
       forms,
       wizards,
       iframes,
       availability,
+      dialogs,
     };
   });
 }
@@ -1829,6 +2089,7 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     }
 
     for (const a of p.availability || []) pushCap("availability", a.schema);
+    for (const d of p.dialogs || []) pushCap("dialog", d.schema);
   }
 
   // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
@@ -1945,11 +2206,25 @@ async function extractStructured(page) {
         processedElements.add(el);
       });
 
-      const overlaySelectors = [
-        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
-        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
-        '[class*="alert"]', '[style*="position: fixed"]',
-        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
+    const overlaySelectors = [
+        '[class*="overlay"]',
+        '[class*="modal"]',
+        '[class*="popup"]',
+        '[class*="drawer"]',
+        '[class*="dialog"]',
+        '[class*="tooltip"]',
+        '[class*="banner"]',
+        '[class*="notification"]',
+        '[class*="alert"]',
+        '[style*="position: fixed"]',
+        '[style*="position: absolute"]',
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[aria-modal="true"]',
+        '[data-state="open"]',
+        '[data-state="open"][role]',
+        '[id*="dialog"]',
+        '[id*="modal"]',
       ];
 
       const overlayTexts = [];
@@ -2099,6 +2374,17 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     // Extract structured content
     const data = await extractStructured(page);
 
+    // NEW: actively click "details" buttons and read dialogs/modals/drawers
+    let clickedDialogs = [];
+    try {
+      clickedDialogs = await openClickableDialogs(page);
+      if (clickedDialogs.length > 0) {
+        console.log(`[DIALOGS] Page: ${clickedDialogs.length} clicked/opened dialogs`);
+      }
+    } catch (e) {
+      console.error("[DIALOGS] Extract error:", e.message);
+    }
+
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
     try {
@@ -2163,15 +2449,24 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       return { links: await collectAllLinks(page, base), page: null };
     }
 
+    const dialogContent = (clickedDialogs || [])
+      .map(d => `[Trigger: ${d.trigger_text || ""}]\n${d.dialog_text || ""}`)
+      .filter(Boolean)
+      .join("\n\n");
+
+    const finalContent = dialogContent
+      ? `${content}\n\n=== CLICK_OPENED_DIALOGS ===\n${dialogContent}`
+      : content;
+
     return {
       links: await collectAllLinks(page, base),
       page: {
         url,
         title,
         pageType,
-        content,
-        // ✅ structured output: pricing + contacts
-        structured: { pricing, contacts },
+        content: finalContent,
+        // ✅ structured output: pricing + contacts + dialogs
+        structured: { pricing, contacts, dialogs: clickedDialogs },
         wordCount: totalWords,
         status: "ok",
       }
