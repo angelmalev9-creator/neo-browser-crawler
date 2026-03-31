@@ -1654,16 +1654,38 @@ async function revealHiddenContent(page) {
       });
 
       // --- MODAL/DIALOG TRIGGERS ---
+      // Classic Bootstrap + Radix UI + Headless UI + generic React dialogs
       document.querySelectorAll(
         '[data-toggle="modal"], [data-bs-toggle="modal"], ' +
         '[data-fancybox], [data-lightbox], [data-popup], ' +
         '[class*="modal-trigger"], [class*="dialog-trigger"], ' +
         '[class*="popup-trigger"], [data-target*="modal"], ' +
-        '[data-bs-target*="modal"]'
+        '[data-bs-target*="modal"], ' +
+        // Radix UI / Headless UI / shadcn triggers
+        '[aria-haspopup="dialog"], [data-radix-collection-item], ' +
+        '[data-state][role="button"], button[data-state]'
       ).forEach(el => {
         if (!isVisible(el) || isJunk(el)) return;
         const text = norm(el.textContent).slice(0, 80);
         if (!text || text.length < 2 || seenTexts.has(text)) return;
+        seenTexts.add(text);
+        found.push({ type: "modal", text, index: found.length });
+      });
+
+      // --- CONTENT BUTTONS (catch-all for React SPA sites) ---
+      // Any button inside main content area that looks like it reveals info
+      // (not in nav/header/footer, short text, likely opens dialog/details)
+      const contentButtonRe = /модел|model|план|plan|пакет|package|стая|room|апартамент|apartment|къща|house|вила|villa|студио|studio|офис|office|етаж|floor|тип|type|вариант|variant|опция|option|избери|choose|select|конфигур|config|customize|поръч|order|оферт|offer|промоц|promo|включено|included|standard|basic|premium|pro|deluxe|лукс|luxury|comfort|komfort|екстра|extra/i;
+
+      document.querySelectorAll('button, [role="button"]').forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 3 || text.length > 60) return;
+        if (seenTexts.has(text)) return;
+        // Must match content-related keywords
+        if (!contentButtonRe.test(text)) return;
+        // Must be in main content, not nav/header
+        if (el.closest('nav, header, footer, [class*="menu"], [class*="nav"]')) return;
         seenTexts.add(text);
         found.push({ type: "modal", text, index: found.length });
       });
@@ -1730,7 +1752,7 @@ async function revealHiddenContent(page) {
               selectors = 'button, a, [role="button"], span[onclick], div[onclick]';
               break;
             case "modal":
-              selectors = '[data-toggle="modal"], [data-bs-toggle="modal"], [data-fancybox], [data-lightbox], [data-popup], [class*="modal-trigger"], [class*="dialog-trigger"], [class*="popup-trigger"], [data-target*="modal"], [data-bs-target*="modal"]';
+              selectors = '[data-toggle="modal"], [data-bs-toggle="modal"], [data-fancybox], [data-lightbox], [data-popup], [class*="modal-trigger"], [class*="dialog-trigger"], [class*="popup-trigger"], [data-target*="modal"], [data-bs-target*="modal"], [aria-haspopup="dialog"], [data-radix-collection-item], button[data-state], [data-state][role="button"], button, [role="button"]';
               break;
             case "dropdown":
               selectors = '[data-toggle="dropdown"], [data-bs-toggle="dropdown"], [aria-haspopup="listbox"], [aria-haspopup="menu"]';
@@ -1766,18 +1788,29 @@ async function revealHiddenContent(page) {
         if (trigger.type === "modal") {
           try {
             await page.waitForSelector(
-              '[role="dialog"]:not([style*="display: none"]), .modal.show, .modal.in, .modal[style*="display: block"], [class*="popup"][style*="display: block"]',
-              { timeout: 1000 }
+              '[role="dialog"]:not([style*="display: none"]), ' +
+              '[role="dialog"][data-state="open"], ' +
+              '[data-radix-dialog-content], ' +
+              '.modal.show, .modal.in, .modal[style*="display: block"], ' +
+              '[class*="popup"][style*="display: block"]',
+              { timeout: 1500 }
             );
           } catch {}
+
+          // Extra wait for Radix animations
+          await page.waitForTimeout(200);
 
           // Extract dialog content
           const dialogContent = await page.evaluate(() => {
             const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
             const dialogs = document.querySelectorAll(
+              // Standard
               '[role="dialog"], .modal.show, .modal.in, .modal[style*="display: block"], ' +
               '[class*="popup"][style*="display: block"], [class*="modal-content"], ' +
-              '[class*="dialog-content"], .fancybox-content, .lightbox-content'
+              '[class*="dialog-content"], .fancybox-content, .lightbox-content, ' +
+              // Radix UI / Headless UI / shadcn
+              '[data-radix-dialog-content], [data-state="open"][role="dialog"], ' +
+              '[data-radix-popper-content-wrapper]'
             );
 
             const texts = [];
@@ -1795,25 +1828,40 @@ async function revealHiddenContent(page) {
             console.log(`[UI-REVEAL] Modal "${trigger.text.slice(0,30)}": captured ${dialogContent.length} dialog(s)`);
           }
 
-          // Close the modal
+          // Close the modal — support Radix overlay click + close buttons + Escape
           await page.evaluate(() => {
-            // Try various close methods
+            // Try close buttons (classic + Radix)
             const closeBtn = document.querySelector(
               '.modal.show .close, .modal.show [data-dismiss="modal"], ' +
               '.modal.show [data-bs-dismiss="modal"], .modal.show .btn-close, ' +
               '[role="dialog"] button[aria-label="Close"], ' +
+              '[role="dialog"] button[aria-label="Затвори"], ' +
               '.modal.in .close, [class*="popup"] .close, ' +
-              '[class*="modal-close"], [class*="dialog-close"]'
+              '[class*="modal-close"], [class*="dialog-close"], ' +
+              // Radix close button
+              '[data-radix-dialog-close], ' +
+              '[role="dialog"] button:first-of-type'
             );
             if (closeBtn) {
               closeBtn.click();
               return;
             }
-            // Try pressing Escape via dispatching event
+
+            // Try clicking Radix overlay to dismiss
+            const overlay = document.querySelector(
+              '[data-radix-dialog-overlay], [data-state="open"][data-aria-hidden="true"]'
+            );
+            if (overlay) {
+              overlay.click();
+              return;
+            }
+
+            // Fallback: Escape key
             document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
           });
 
-          await page.waitForTimeout(200);
+          await page.waitForTimeout(300);
         }
 
         // For tabs/accordions/show-more, capture the newly revealed text
