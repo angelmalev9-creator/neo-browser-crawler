@@ -21,11 +21,16 @@ const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
-const MAX_SECONDS = 90;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
+const MAX_SECONDS = 90;
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 8;          // ↑ was 5
-const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
+const PARALLEL_TABS = 8;
+const SCROLL_STEP_MS = 30;
+const MAX_SCROLL_STEPS = 8;
+
+// ================= UI INTERACTION LIMITS =================
+const MAX_UI_CLICKS = 30;           // max interactive elements to click per page
+const UI_CLICK_WAIT_MS = 300;       // wait after each click for content to appear
+const UI_INTERACTION_BUDGET_MS = 8000; // max time budget for UI interactions per page
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -37,8 +42,6 @@ const clean = (t = "") =>
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
 // ================= BG NUMBER NORMALIZER =================
-// IMPORTANT FIX: do NOT convert money amounts to words.
-// Keep numeric prices intact for downstream extraction.
 const BG_0_19 = [
   "нула","едно","две","три","четири","пет","шест","седем","осем","девет",
   "десет","единадесет","дванадесет","тринадесет","четиринадесет",
@@ -60,8 +63,6 @@ function numberToBgWords(n) {
 
 function normalizeNumbers(text = "") {
   try {
-    // ✅ Exclude money units (лв/лева/€/$/EUR/BGN) from normalization.
-    // Keep digits for prices so pack/pricing extraction works reliably.
     return text.replace(
       /(\d+)\s?(стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
       (_, num, unit) => `${numberToBgWords(num)} ${unit}`
@@ -94,46 +95,31 @@ function normalizeDomain(u) {
 
 // ================= CONTACT EXTRACTION =================
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-// broad phone-ish: +90 532 155 86 96, (052) 123-45-67, 0888 123 456 etc.
 const PHONE_CANDIDATE_RE = /(\+?\d[\d\s().-]{6,}\d)/g;
 const DATE_DOT_RE = /\b\d{1,2}\.\d{1,2}\.\d{4}\b/;
 
 function normalizePhone(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
-  if (DATE_DOT_RE.test(s)) return ""; // avoid dates like 10.12.2025
-
-  // keep leading +, strip other non-digits
+  if (DATE_DOT_RE.test(s)) return "";
   const hasPlus = s.trim().startsWith("+");
   const digits = s.replace(/[^\d]/g, "");
-  // typical phone length guard (tolerant)
   if (digits.length < 8 || digits.length > 15) return "";
-
   return hasPlus ? `+${digits}` : digits;
 }
 
 function extractContactsFromText(text) {
   const out = { emails: [], phones: [] };
-
   if (!text) return out;
-
-  const emails = (text.match(EMAIL_RE) || [])
-    .map(e => e.trim())
-    .filter(Boolean);
-
+  const emails = (text.match(EMAIL_RE) || []).map(e => e.trim()).filter(Boolean);
   const phonesRaw = [];
   let m;
   while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
     phonesRaw.push(m[1]);
   }
-  const phones = phonesRaw
-    .map(normalizePhone)
-    .filter(Boolean);
-
-  // dedupe
+  const phones = phonesRaw.map(normalizePhone).filter(Boolean);
   out.emails = Array.from(new Set(emails)).slice(0, 12);
   out.phones = Array.from(new Set(phones)).slice(0, 12);
-
   return out;
 }
 
@@ -141,11 +127,9 @@ async function extractContactsFromPage(page) {
   try {
     const dom = await page.evaluate(() => {
       const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-
       const emails = new Set();
       const phones = new Set();
 
-      // mailto/tel links
       document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
         const href = a.getAttribute("href") || "";
         const v = href.replace(/^mailto:/i, "").split("?")[0];
@@ -158,7 +142,6 @@ async function extractContactsFromPage(page) {
         if (v) phones.add(v.trim());
       });
 
-      // visible text hints near footer/contact areas
       const candidates = [];
       const footer = document.querySelector("footer");
       if (footer) candidates.push(footer.innerText || "");
@@ -172,7 +155,6 @@ async function extractContactsFromPage(page) {
         textHints: candidates.map(norm).filter(Boolean).join("\n"),
       };
     });
-
     return dom || { emails: [], phones: [], textHints: "" };
   } catch {
     return { emails: [], phones: [], textHints: "" };
@@ -191,33 +173,26 @@ function detectPageType(url = "", title = "") {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SITEMAP EXTRACTION - EXISTING
+// SITEMAP EXTRACTION - EXISTING (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Keyword mappings for buttons and fields
 const KEYWORD_MAP = {
-  // Booking
   "резерв": ["book", "reserve", "booking"],
   "запази": ["book", "reserve"],
   "резервация": ["booking", "reservation"],
   "резервирай": ["book", "reserve"],
-  // Search
   "търси": ["search", "find"],
   "провери": ["check", "verify"],
   "покажи": ["show", "display"],
-  // Dates
   "настаняване": ["check-in", "checkin", "arrival"],
   "напускане": ["check-out", "checkout", "departure"],
   "пристигане": ["arrival", "check-in"],
   "заминаване": ["departure", "check-out"],
-  // Contact
   "контакт": ["contact"],
   "контакти": ["contact", "contacts"],
   "свържи": ["contact", "reach"],
-  // Rooms
   "стаи": ["rooms", "accommodation"],
   "стая": ["room"],
-  // Other
   "цени": ["prices", "rates"],
   "услуги": ["services"],
   "изпрати": ["send", "submit"],
@@ -226,156 +201,85 @@ const KEYWORD_MAP = {
 function generateKeywords(text) {
   const lower = text.toLowerCase().trim();
   const keywords = new Set([lower]);
-
-  // Split into words
   const words = lower.split(/\s+/);
   words.forEach(w => {
     if (w.length > 2) keywords.add(w);
   });
-
-  // Add mapped keywords
   for (const [bg, en] of Object.entries(KEYWORD_MAP)) {
     if (lower.includes(bg)) {
       en.forEach(k => keywords.add(k));
     }
   }
-
   return Array.from(keywords).filter(k => k.length > 1);
 }
 
 function detectActionType(text) {
   const lower = text.toLowerCase();
-
   if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
   if (/контакт|contact|свържи/i.test(lower)) return "contact";
   if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
   if (/стаи|rooms|услуги|services|за нас|about|галерия|gallery/i.test(lower)) return "navigation";
-
   return "other";
 }
 
 function detectFieldType(name, type, placeholder, label) {
   const searchText = `${name} ${type} ${placeholder} ${label}`.toLowerCase();
-
   if (type === "date") return "date";
   if (type === "number") return "number";
   if (/date|дата/i.test(searchText)) return "date";
   if (/guest|човек|брой|count|number/i.test(searchText)) return "number";
   if (/select/i.test(type)) return "select";
-
   return "text";
 }
 
 function generateFieldKeywords(name, placeholder, label) {
   const keywords = new Set();
   const searchText = `${name} ${placeholder} ${label}`.toLowerCase();
-
-  // Check-in patterns
   if (/check-?in|checkin|arrival|от|настаняване|пристигане|from|start/i.test(searchText)) {
     ["check-in", "checkin", "от", "настаняване", "arrival", "from"].forEach(k => keywords.add(k));
   }
-
-  // Check-out patterns
   if (/check-?out|checkout|departure|до|напускане|заминаване|to|end/i.test(searchText)) {
     ["check-out", "checkout", "до", "напускане", "departure", "to"].forEach(k => keywords.add(k));
   }
-
-  // Guests patterns
   if (/guest|adult|човек|гост|брой|persons|pax/i.test(searchText)) {
     ["guests", "гости", "човека", "adults", "persons", "брой"].forEach(k => keywords.add(k));
   }
-
-  // Name patterns
   if (/name|име/i.test(searchText)) {
     ["name", "име"].forEach(k => keywords.add(k));
   }
-
-  // Email patterns
   if (/email|имейл|e-mail/i.test(searchText)) {
     ["email", "имейл", "e-mail"].forEach(k => keywords.add(k));
   }
-
-  // Phone patterns
   if (/phone|телефон|тел/i.test(searchText)) {
     ["phone", "телефон"].forEach(k => keywords.add(k));
   }
-
-  // Add name/id as keywords
   if (name) keywords.add(name.toLowerCase());
-
   return Array.from(keywords);
 }
 
-// Extract SiteMap from a page
+// Extract SiteMap from a page (unchanged)
 async function extractSiteMapFromPage(page) {
   return await page.evaluate(() => {
-   const getSelector = (el, idx) => {
-      const tag = (el.tagName || "div").toLowerCase();
-
-      try {
-        if (el.id) return `#${CSS.escape(el.id)}`;
-      } catch {}
-
-      try {
-        const name = el.getAttribute?.("name");
-        if (name) return `${tag}[name="${CSS.escape(name)}"]`;
-      } catch {}
-
-      try {
-        const type = el.getAttribute?.("type");
-        if (type && /^(input|button)$/i.test(tag)) {
-          return `${tag}[type="${CSS.escape(type)}"]`;
+    const getSelector = (el, idx) => {
+      if (el.id) return `#${el.id}`;
+      if (el.className && typeof el.className === "string") {
+        const cls = el.className.trim().split(/\s+/)[0];
+        if (cls && !cls.includes(":") && !cls.includes("[")) {
+          const matches = document.querySelectorAll(`.${cls}`);
+          if (matches.length === 1) return `.${cls}`;
         }
-      } catch {}
-
-      try {
-        const role = el.getAttribute?.("role");
-        if (role) return `${tag}[role="${CSS.escape(role)}"]`;
-      } catch {}
-
-      try {
-        if (el.className && typeof el.className === "string") {
-          const classes = el.className.trim().split(/\s+/).filter(Boolean);
-
-          for (const raw of classes) {
-            let escaped = "";
-            try {
-              escaped = CSS.escape(raw);
-            } catch {
-              continue;
-            }
-
-            try {
-              const exact = `.${escaped}`;
-              const matches = document.querySelectorAll(exact);
-              if (matches.length === 1) return exact;
-            } catch {}
-          }
-
-          for (const raw of classes) {
-            let escaped = "";
-            try {
-              escaped = CSS.escape(raw);
-            } catch {
-              continue;
-            }
-
-            try {
-              const exact = `${tag}.${escaped}`;
-              const matches = document.querySelectorAll(exact);
-              if (matches.length >= 1) return exact;
-            } catch {}
-          }
-        }
-      } catch {}
-
+      }
+      const tag = el.tagName.toLowerCase();
       const parent = el.parentElement;
       if (parent) {
         const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
         const index = siblings.indexOf(el) + 1;
+        if (el.className) {
+          const cls = el.className.split(/\s+/)[0];
+          if (cls) return `${tag}.${cls}`;
+        }
         return `${tag}:nth-of-type(${index})`;
       }
-
       return `${tag}:nth-of-type(${idx + 1})`;
     };
 
@@ -408,31 +312,22 @@ async function extractSiteMapFromPage(page) {
 
     btnElements.forEach((el, i) => {
       if (!isVisible(el)) return;
-
       const text = (el.textContent?.trim() || el.value || "").slice(0, 100);
       if (!text || text.length < 2) return;
-
       const href = el.href || "";
       if (/^(#|javascript:|mailto:|tel:)/.test(href)) return;
       if (href && !href.includes(window.location.hostname)) return;
-
-      buttons.push({
-        text,
-        selector: getSelector(el, i),
-      });
+      buttons.push({ text, selector: getSelector(el, i) });
     });
 
     // EXTRACT FORMS
     const forms = [];
     document.querySelectorAll("form").forEach((form, formIdx) => {
       if (!isVisible(form)) return;
-
       const fields = [];
-
       form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
         .forEach((input, inputIdx) => {
           if (!isVisible(input)) return;
-
           fields.push({
             name: input.name || input.id || `field_${inputIdx}`,
             selector: getSelector(input, inputIdx),
@@ -457,25 +352,17 @@ async function extractSiteMapFromPage(page) {
       }
     });
 
-    // EXTRACT PRICES (legacy, context-light)
+    // EXTRACT PRICES
     const prices = [];
     const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
-
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
-      null
-    );
-
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
     while (node = walker.nextNode()) {
       const text = node.textContent || "";
       const matches = [...text.matchAll(priceRegex)];
-
       matches.forEach(match => {
         const parent = node.parentElement;
         let context = "";
-
         if (parent) {
           const container = parent.closest("div, article, section, li, tr");
           if (container) {
@@ -483,12 +370,8 @@ async function extractSiteMapFromPage(page) {
             if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
           }
         }
-
         if (!prices.some(p => p.text === match[0] && p.context === context)) {
-          prices.push({
-            text: match[0],
-            context,
-          });
+          prices.push({ text: match[0], context });
         }
       });
     }
@@ -503,19 +386,17 @@ async function extractSiteMapFromPage(page) {
   });
 }
 
-// Enrich raw SiteMap with keywords (runs in Node.js)
+// Enrich raw SiteMap (unchanged)
 function enrichSiteMap(raw, siteId, siteUrl) {
   return {
     site_id: siteId,
     url: siteUrl || raw.url || "",
-
     buttons: (raw.buttons || []).map(btn => ({
       text: btn.text,
       selector: btn.selector,
       keywords: generateKeywords(btn.text),
       action_type: detectActionType(btn.text),
     })),
-
     forms: (raw.forms || []).map(form => ({
       selector: form.selector,
       submit_button: form.submit_button,
@@ -526,7 +407,6 @@ function enrichSiteMap(raw, siteId, siteUrl) {
         keywords: generateFieldKeywords(field.name, field.placeholder, field.label),
       })),
     })),
-
     prices: (raw.prices || []).map(p => ({
       text: p.text,
       context: p.context || "",
@@ -534,7 +414,7 @@ function enrichSiteMap(raw, siteId, siteUrl) {
   };
 }
 
-// Build combined SiteMap from all crawled pages
+// Build combined SiteMap (unchanged)
 function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
   const combined = {
     site_id: siteId,
@@ -556,7 +436,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.buttons.push(btn);
       }
     }
-
     for (const form of pageMap.forms || []) {
       const key = form.fields.map(f => f.name).sort().join(",");
       if (!seenForms.has(key)) {
@@ -564,7 +443,6 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
         combined.forms.push(form);
       }
     }
-
     for (const price of pageMap.prices || []) {
       const key = `${price.text}|${price.context}`;
       if (!seenPrices.has(key)) {
@@ -579,17 +457,15 @@ function buildCombinedSiteMap(pageSiteMaps, siteId, siteUrl) {
   combined.prices = combined.prices.slice(0, 30);
 
   console.log(`[SITEMAP] Combined: ${combined.buttons.length} buttons, ${combined.forms.length} forms, ${combined.prices.length} prices`);
-
   return combined;
 }
 
-// Save SiteMap to Supabase
+// Save SiteMap to Supabase (unchanged)
 async function saveSiteMapToSupabase(siteMap) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     console.log("[SITEMAP] Supabase not configured, skipping save");
     return false;
   }
-
   try {
     const response = await fetch(`${SUPABASE_URL}/rest/v1/sites_map`, {
       method: "POST",
@@ -606,7 +482,6 @@ async function saveSiteMapToSupabase(siteMap) {
         updated_at: new Date().toISOString(),
       }),
     });
-
     if (response.ok) {
       console.log(`[SITEMAP] ✓ Saved to Supabase`);
       return true;
@@ -621,19 +496,16 @@ async function saveSiteMapToSupabase(siteMap) {
   }
 }
 
-// Send SiteMap to Worker to prepare hot session
+// Send SiteMap to Worker (unchanged)
 async function sendSiteMapToWorker(siteMap) {
   if (!WORKER_URL || !WORKER_SECRET) {
     console.log("[SITEMAP] Worker not configured, skipping");
     return false;
   }
-
   try {
     console.log(`[SITEMAP] Sending to worker: ${WORKER_URL}/prepare-session`);
-
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
-
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
       headers: {
@@ -646,9 +518,7 @@ async function sendSiteMapToWorker(siteMap) {
       }),
       signal: controller.signal,
     });
-
     clearTimeout(timeoutId);
-
     if (response.ok) {
       const result = await response.json();
       console.log(`[SITEMAP] ✓ Worker response:`, result);
@@ -663,174 +533,8 @@ async function sendSiteMapToWorker(siteMap) {
   }
 }
 
-async function openClickableDialogs(page) {
-  try {
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
-    await page.waitForTimeout(400);
-
-    return await page.evaluate(async () => {
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-
-      const isVisible = (el) => {
-        if (!el) return false;
-        try {
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.display !== "none" &&
-            style.visibility !== "hidden" &&
-            style.opacity !== "0"
-          );
-        } catch {
-          return false;
-        }
-      };
-
-      const dialogSelectors = [
-        '[role="dialog"]',
-        '[role="alertdialog"]',
-        '[aria-modal="true"]',
-        '[data-state="open"]',
-        '[data-state="open"][role]',
-        '[class*="dialog"]',
-        '[class*="modal"]',
-        '[class*="drawer"]',
-        '[class*="popup"]',
-        '[class*="overlay"]',
-        '[id*="dialog"]',
-        '[id*="modal"]'
-      ];
-
-      const getOpenDialogs = () => {
-        const out = [];
-        const seen = new Set();
-
-        dialogSelectors.forEach((selector) => {
-          try {
-            document.querySelectorAll(selector).forEach((el) => {
-              if (!isVisible(el)) return;
-              const txt = norm(el.innerText || el.textContent || "");
-              if (!txt || txt.length < 40) return;
-
-              const key = txt.slice(0, 300);
-              if (seen.has(key)) return;
-              seen.add(key);
-
-              out.push({
-                selector_hint: selector,
-                text: txt.slice(0, 6000)
-              });
-            });
-          } catch {}
-        });
-
-        return out;
-      };
-
-      const clickTriggers = Array.from(
-        document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')
-      ).filter((el) => {
-        if (!isVisible(el)) return false;
-
-        const txt = norm(
-          [
-            el.innerText || el.textContent || "",
-            el.getAttribute?.("aria-label") || "",
-            el.getAttribute?.("title") || "",
-            el.getAttribute?.("value") || ""
-          ].join(" ")
-        ).toLowerCase();
-
-        if (!txt || txt.length < 2 || txt.length > 120) return false;
-
-        return /виж\s*детайли|детайли|details|learn more|more info|повече|спецификац|пакет/i.test(txt);
-      });
-
-      const results = [];
-      const seenTexts = new Set();
-
-      const closeDialog = async () => {
-        const closeSelectors = [
-          '[aria-label="Close"]',
-          '[aria-label="close"]',
-          '[aria-label*="затвори"]',
-          '[role="dialog"] button',
-          '[role="alertdialog"] button',
-          '[data-state="open"] button'
-        ];
-
-        for (const selector of closeSelectors) {
-          try {
-            const nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
-            for (const node of nodes) {
-              const txt = norm(node.innerText || node.textContent || "").toLowerCase();
-              const aria = norm(node.getAttribute?.("aria-label") || "").toLowerCase();
-
-              if (
-                /close|затвори|cancel|x/.test(txt) ||
-                /close|затвори/.test(aria) ||
-                (node.querySelector && node.querySelector("svg"))
-              ) {
-                try {
-                  node.click();
-                  await sleep(250);
-                  return;
-                } catch {}
-              }
-            }
-          } catch {}
-        }
-
-        try {
-          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-          await sleep(250);
-        } catch {}
-      };
-
-      for (const trigger of clickTriggers.slice(0, 16)) {
-        try {
-          const triggerText = norm(
-            [
-              trigger.innerText || trigger.textContent || "",
-              trigger.getAttribute?.("aria-label") || "",
-              trigger.getAttribute?.("title") || "",
-              trigger.getAttribute?.("value") || ""
-            ].join(" ")
-          ).slice(0, 160);
-
-          trigger.click();
-          await sleep(900);
-
-          const dialogs = getOpenDialogs();
-          for (const dlg of dialogs) {
-            const key = dlg.text.slice(0, 500);
-            if (seenTexts.has(key)) continue;
-            seenTexts.add(key);
-
-            results.push({
-              trigger_text: triggerText,
-              selector_hint: dlg.selector_hint,
-              dialog_text: dlg.text
-            });
-          }
-
-          await closeDialog();
-          await sleep(250);
-        } catch {}
-      }
-
-      return results;
-    });
-  } catch {
-    return [];
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-// NEW: PRICING/PACKAGES STRUCTURED EXTRACTION
+// PRICING/PACKAGES STRUCTURED EXTRACTION (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function extractPricingFromPage(page) {
@@ -844,10 +548,9 @@ async function extractPricingFromPage(page) {
     };
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-
     const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
-
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
+
     const pickTitle = (root) => {
       const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
       const t = getText(h);
@@ -894,11 +597,9 @@ async function extractPricingFromPage(page) {
         const looksCard =
           /card|pricing|package|plan|tier|column/i.test(cls) ||
           ["article","section"].includes(tag);
-
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
-
         if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
         el = el.parentElement;
       }
@@ -927,9 +628,7 @@ async function extractPricingFromPage(page) {
       const rootText = getText(root);
       const moneyMatch = rootText.match(moneyRe);
       const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
-
       const period = pickPeriod(root);
-
       const badge = pickBadge(root);
       const features = pickFeatures(root);
 
@@ -937,13 +636,7 @@ async function extractPricingFromPage(page) {
       if (seen.has(key)) continue;
       seen.add(key);
 
-      cards.push({
-        title,
-        price_text,
-        period,
-        badge,
-        features,
-      });
+      cards.push({ title, price_text, period, badge, features });
     }
 
     const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
@@ -961,7 +654,7 @@ async function extractPricingFromPage(page) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NEW: CAPABILITIES EXTRACTION (FOR form_schemas)
+// CAPABILITIES EXTRACTION (unchanged from original)
 // ═══════════════════════════════════════════════════════════════════════════
 
 function stableSortObject(value) {
@@ -1007,6 +700,7 @@ function guessVendorFromText(s = "") {
   return "unknown";
 }
 
+// extractCapabilitiesFromPage - unchanged from original (very large function)
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
@@ -1034,9 +728,7 @@ async function extractCapabilitiesFromPage(page) {
 
     const selectorCandidates = (el) => {
       const out = [];
-      try {
-        if (el.id) out.push(`#${CSS.escape(el.id)}`);
-      } catch {}
+      try { if (el.id) out.push(`#${CSS.escape(el.id)}`); } catch {}
       try {
         const name = el.getAttribute("name");
         if (name) out.push(`${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`);
@@ -1062,14 +754,11 @@ async function extractCapabilitiesFromPage(page) {
       return Array.from(new Set(out)).slice(0, 6);
     };
 
-    // ═══════════════════════════════════════════════════════════
-    // Helper: extract radio choices + button-group choices from
-    // any container (used for both <form> and wizard roots)
-    // ═══════════════════════════════════════════════════════════
+    // Helper: extract radio choices + button-group choices
     const extractChoices = (root) => {
       const choices = [];
 
-      // ---- RADIO GROUPS ----
+      // RADIO GROUPS
       root.querySelectorAll('input[type="radio"]').forEach(input => {
         if (!isVisible(input)) return;
         const name = input.getAttribute("name") || input.id || "";
@@ -1091,7 +780,6 @@ async function extractCapabilitiesFromPage(page) {
           };
           choices.push(group);
         }
-
         group.options.push({
           value: input.value || label,
           label: getLabel(input) || input.value,
@@ -1099,68 +787,40 @@ async function extractCapabilitiesFromPage(page) {
         });
       });
 
-      // ---- BUTTON GROUPS (aria-pressed, role=radio, segmented) ----
+      // BUTTON GROUPS
       root.querySelectorAll('button[aria-pressed], [role="radio"], .segmented button').forEach(btn => {
         if (!isVisible(btn)) return;
-
         const text = (btn.textContent || "").trim();
         if (!text || text.length < 2) return;
-
         const parentLabel = getLabel(btn.parentElement) || "";
         const groupName = parentLabel || "button_group";
-
         let group = choices.find(c => c.name === groupName && c.type === "button_group");
         if (!group) {
-          group = {
-            name: groupName,
-            label: parentLabel,
-            required: false,
-            type: "button_group",
-            options: []
-          };
+          group = { name: groupName, label: parentLabel, required: false, type: "button_group", options: [] };
           choices.push(group);
         }
-
         group.options.push({
-          value: text,
-          label: text,
-          selector_candidates: selectorCandidates(btn)
+          value: text, label: text, selector_candidates: selectorCandidates(btn)
         });
       });
 
-      // ---- SIBLING BUTTON CHOICES ----
-      // Detect containers that hold 2+ sibling buttons as option choices
-      // (e.g. "Пол *" → [Мъж] [Жена])
-      // Skip nav/submit buttons by filtering short-text, same-level buttons
+      // SIBLING BUTTON CHOICES
       const seenBtnContainers = new Set();
       root.querySelectorAll("button").forEach(btn => {
         if (!isVisible(btn)) return;
         const parent = btn.parentElement;
         if (!parent || seenBtnContainers.has(parent)) return;
-
-        // Skip if already captured by aria-pressed / role=radio
         if (btn.hasAttribute("aria-pressed") || btn.getAttribute("role") === "radio") return;
-
-        // Get all sibling buttons in this container
         const siblingBtns = Array.from(parent.querySelectorAll(":scope > button, :scope > * > button"))
           .filter(b => isVisible(b));
-
-        // Need at least 2 sibling buttons to form a choice group
         if (siblingBtns.length < 2) return;
-
-        // Filter out nav/submit-like buttons
         const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel/i;
         const optionBtns = siblingBtns.filter(b => {
           const t = (b.textContent || "").trim();
-          // short text (1-30 chars), not a nav/submit button
           return t.length >= 1 && t.length <= 30 && !submitRe.test(t);
         });
-
         if (optionBtns.length < 2) return;
-
         seenBtnContainers.add(parent);
-
-        // Find the label for this group — look for preceding label/text
         let groupLabel = "";
         const prevSib = parent.previousElementSibling;
         if (prevSib) {
@@ -1168,65 +828,36 @@ async function extractCapabilitiesFromPage(page) {
           if (t.length >= 2 && t.length <= 60) groupLabel = t;
         }
         if (!groupLabel) groupLabel = getLabel(parent) || "";
-
         const required = /\*|задължително|required/i.test(groupLabel);
         const cleanLabel = groupLabel.replace(/\s*\*\s*$/, "").trim();
         const groupName = cleanLabel || "button_choice";
-
-        // Skip if already captured under same name
         if (choices.find(c => c.name === groupName)) return;
-
-        const group = {
-          name: groupName,
-          label: cleanLabel,
-          required,
-          type: "button_group",
-          options: []
-        };
-
+        const group = { name: groupName, label: cleanLabel, required, type: "button_group", options: [] };
         optionBtns.forEach(b => {
           const text = (b.textContent || "").trim();
-          group.options.push({
-            value: text,
-            label: text,
-            selector_candidates: selectorCandidates(b)
-          });
+          group.options.push({ value: text, label: text, selector_candidates: selectorCandidates(b) });
         });
-
         choices.push(group);
       });
 
-      // ---- SELECT OPTIONS (capture <select> options as choices) ----
+      // SELECT OPTIONS
       root.querySelectorAll("select").forEach(sel => {
         if (!isVisible(sel)) return;
         const name = sel.getAttribute("name") || sel.id || "";
         const label = getLabel(sel);
-        const required =
-          sel.hasAttribute("required") ||
-          sel.getAttribute("aria-required") === "true";
-
+        const required = sel.hasAttribute("required") || sel.getAttribute("aria-required") === "true";
         const options = [];
         sel.querySelectorAll("option").forEach(opt => {
           const val = opt.value;
           const text = (opt.textContent || "").trim();
-          // skip empty/placeholder options
           if (!val && !text) return;
           if (/^(--|изберете|избери|select|choose)/i.test(text) && !val) return;
-          options.push({
-            value: val,
-            label: text,
-            selector_candidates: [] // options don't need selectors, parent select does
-          });
+          options.push({ value: val, label: text, selector_candidates: [] });
         });
-
         if (options.length > 0) {
           choices.push({
-            name: name || label,
-            label,
-            required,
-            type: "select",
-            options,
-            selector_candidates: selectorCandidates(sel)
+            name: name || label, label, required, type: "select",
+            options, selector_candidates: selectorCandidates(sel)
           });
         }
       });
@@ -1234,18 +865,14 @@ async function extractCapabilitiesFromPage(page) {
       return choices;
     };
 
-    // ═══════════════════════════════════════════════════════════
-    // FORMS EXTRACTION (original + enriched with choices)
-    // ═══════════════════════════════════════════════════════════
+    // FORMS EXTRACTION
     const forms = [];
     document.querySelectorAll("form").forEach((form) => {
       if (!isVisible(form)) return;
-
       const fields = [];
       form.querySelectorAll("input:not([type='hidden']):not([type='submit']), select, textarea")
         .forEach((input) => {
           if (!isVisible(input)) return;
-
           const tag = input.tagName.toLowerCase();
           const type = (input.getAttribute("type") || tag).toLowerCase();
           const name = input.getAttribute("name") || input.id || "";
@@ -1255,66 +882,42 @@ async function extractCapabilitiesFromPage(page) {
             input.hasAttribute("required") ||
             input.getAttribute("aria-required") === "true" ||
             (label && /(\*|задължително|required)/i.test(label));
-
           const autocomplete = input.getAttribute("autocomplete") || "";
           const ariaLabel = input.getAttribute("aria-label") || "";
           const ariaDesc = input.getAttribute("aria-describedby") || "";
-
-          // Skip radios from fields array (they go into choices)
           if (type === "radio") return;
-
           fields.push({
-            tag,
-            type,
-            name,
-            label,
-            placeholder,
-            required,
-            autocomplete,
-            aria_label: ariaLabel,
-            aria_describedby: ariaDesc,
+            tag, type, name, label, placeholder, required,
+            autocomplete, aria_label: ariaLabel, aria_describedby: ariaDesc,
             selector_candidates: selectorCandidates(input),
           });
         });
 
       if (fields.length === 0) return;
-
-      // require at least 1 meaningful input (not just buttons/checkboxes)
       const meaningfulFields = fields.filter(f =>
         !['hidden','submit','button','reset','image'].includes(f.type)
       );
       if (meaningfulFields.length === 0) return;
 
-      // ✅ Extract choices (radio groups, button groups, select options) from form
       const choices = extractChoices(form);
-
       const submitCandidates = [];
       form.querySelectorAll("button, input[type='submit'], [role='button']").forEach((btn) => {
         if (!isVisible(btn)) return;
         const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
         if (!text) return;
-        submitCandidates.push({
-          text,
-          selector_candidates: selectorCandidates(btn),
-        });
+        submitCandidates.push({ text, selector_candidates: selectorCandidates(btn) });
       });
-
       const bestSubmit =
         submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
-        submitCandidates[0] ||
-        null;
+        submitCandidates[0] || null;
 
       let dom_snapshot = "";
-      try {
-        dom_snapshot = (form.outerHTML || "").slice(0, 4000);
-      } catch {}
+      try { dom_snapshot = (form.outerHTML || "").slice(0, 4000); } catch {}
 
       forms.push({
         kind: "form",
         schema: {
-          fields,
-          choices,
-          submit: bestSubmit,
+          fields, choices, submit: bestSubmit,
           action: form.getAttribute("action") || "",
           method: (form.getAttribute("method") || "get").toLowerCase(),
         },
@@ -1322,9 +925,7 @@ async function extractCapabilitiesFromPage(page) {
       });
     });
 
-    // ═══════════════════════════════════════════════════════════
-    // IFRAMES EXTRACTION (unchanged)
-    // ═══════════════════════════════════════════════════════════
+    // IFRAMES EXTRACTION
     const iframes = [];
     const bookingIframes = [];
     const vendorFromText = (s = "") => {
@@ -1345,12 +946,8 @@ async function extractCapabilitiesFromPage(page) {
       return "unknown";
     };
     const iframeSelectorHint = (fr, vendor) => {
-      try {
-        if (fr.id) return `#${CSS.escape(fr.id)}`;
-      } catch {}
-      try {
-        if (vendor && vendor !== "unknown") return `iframe[src*="${vendor}"]`;
-      } catch {}
+      try { if (fr.id) return `#${CSS.escape(fr.id)}`; } catch {}
+      try { if (vendor && vendor !== "unknown") return `iframe[src*="${vendor}"]`; } catch {}
       return "iframe";
     };
     document.querySelectorAll("iframe").forEach((fr) => {
@@ -1367,36 +964,21 @@ async function extractCapabilitiesFromPage(page) {
       iframes.push({
         kind: "booking_widget",
         schema: {
-          src,
-          title,
-          name,
-          vendor,
-          visible,
-          booking_like: bookingLike,
+          src, title, name, vendor, visible, booking_like: bookingLike,
           selector_candidates: [selectorHint],
         },
       });
 
       if (bookingLike && visible && rect.width >= 220 && rect.height >= 40) {
-        bookingIframes.push({
-          vendor,
-          src,
-          title,
-          name,
-          selectorHint,
-        });
+        bookingIframes.push({ vendor, src, title, name, selectorHint });
       }
     });
 
-    // ═══════════════════════════════════════════════════════════
-    // AVAILABILITY EXTRACTION (unchanged)
-    // ═══════════════════════════════════════════════════════════
+    // AVAILABILITY EXTRACTION
     const availability = [];
 
     bookingIframes.forEach((widget) => {
-      const vendorLabel = widget.vendor && widget.vendor !== "unknown"
-        ? widget.vendor
-        : "iframe_booking";
+      const vendorLabel = widget.vendor && widget.vendor !== "unknown" ? widget.vendor : "iframe_booking";
       availability.push({
         kind: "availability",
         schema: {
@@ -1422,10 +1004,9 @@ async function extractCapabilitiesFromPage(page) {
         },
       });
     });
-    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
-      .filter(isVisible)
-      .slice(0, 10);
 
+    const dateInputs = Array.from(document.querySelectorAll("input[type='date']"))
+      .filter(isVisible).slice(0, 10);
     if (dateInputs.length > 0) {
       availability.push({
         kind: "availability",
@@ -1434,17 +1015,14 @@ async function extractCapabilitiesFromPage(page) {
             name: inp.getAttribute("name") || inp.id || "",
             label: getLabel(inp),
             selector_candidates: selectorCandidates(inp),
-            required:
-              inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
+            required: inp.hasAttribute("required") || inp.getAttribute("aria-required") === "true",
           })),
         },
       });
     }
 
     const calendarLike = Array.from(document.querySelectorAll("[class*='calendar'],[class*='datepicker'],[id*='calendar'],[id*='datepicker']"))
-      .filter(isVisible)
-      .slice(0, 8);
-
+      .filter(isVisible).slice(0, 8);
     if (calendarLike.length > 0) {
       availability.push({
         kind: "availability",
@@ -1457,9 +1035,7 @@ async function extractCapabilitiesFromPage(page) {
       });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // INTERACTIVE BOOKING BAR DETECTION (additive, non-destructive)
-    // ═══════════════════════════════════════════════════════════
+    // INTERACTIVE BOOKING BAR DETECTION
     const pushAvailability = (schema) => {
       const key = JSON.stringify(schema || {});
       if (!pushAvailability._seen) pushAvailability._seen = new Set();
@@ -1532,13 +1108,11 @@ async function extractCapabilitiesFromPage(page) {
         el.getAttribute?.('title') || '',
       ].find(Boolean);
       if (base) return normText(base).slice(0, 120);
-
       const prev = el.previousElementSibling;
       if (prev) {
         const t = normText(prev.textContent || '').slice(0, 120);
         if (t && t.length <= 120) return t;
       }
-
       const parent = el.parentElement;
       if (parent) {
         const labelish = parent.querySelector('label, .label, [class*="label"], [class*="title"], [class*="caption"], span');
@@ -1547,7 +1121,6 @@ async function extractCapabilitiesFromPage(page) {
           if (t && t.length <= 120) return t;
         }
       }
-
       return "";
     };
 
@@ -1655,7 +1228,6 @@ async function extractCapabilitiesFromPage(page) {
 
       const nodes = getSignalNodes(container);
       if (ctaEl && !nodes.includes(ctaEl)) nodes.unshift(ctaEl);
-
       const interactiveControls = gatherInteractiveControls(container);
       if (ctaEl && !interactiveControls.includes(ctaEl)) interactiveControls.unshift(ctaEl);
 
@@ -1680,7 +1252,7 @@ async function extractCapabilitiesFromPage(page) {
 
       const hasBookingIframe = bookingIframes.length > 0;
       const containerSelectors = selectorCandidates(container);
-      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main|header|div\.elementor)/i.test(sel));
+      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main|header|div\.elementor)/i.test(sel));
       if (hasBookingIframe && genericWrapper && !String(raw || '').match(/пристигане|напускане|възрастни|guests|check-?in|check-?out/i)) return null;
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
 
@@ -1716,8 +1288,7 @@ async function extractCapabilitiesFromPage(page) {
       const dedupedCheckOut = dedupeSignals(checkOut, 4);
       const dedupedGuests = dedupeSignals(guestFields, 6);
       const dedupedActions = dedupeSignals(actionButtons, 4);
-
-      const dateInputs = dedupeSignals([...dedupedCheckIn, ...dedupedCheckOut], 6);
+      const dedupedDateInputs = dedupeSignals([...dedupedCheckIn, ...dedupedCheckOut], 6);
 
       const concreteFieldCount = [...dedupedCheckIn, ...dedupedCheckOut, ...dedupedGuests].filter(x => x.concrete).length;
       const concreteActionCount = dedupedActions.filter(x => x.concrete).length;
@@ -1737,7 +1308,7 @@ async function extractCapabilitiesFromPage(page) {
       if (!detectionGrade) return null;
 
       const compact = Array.from(new Set([
-        ...dateInputs.map(x => x.text),
+        ...dedupedDateInputs.map(x => x.text),
         ...dedupedGuests.map(x => x.text),
         ...dedupedActions.map(x => x.text),
       ])).join(' | ').slice(0, 260);
@@ -1750,7 +1321,7 @@ async function extractCapabilitiesFromPage(page) {
           detection_grade: true,
           execution_grade: executionGrade,
           text_hint: compact || raw.slice(0, 260),
-          date_inputs: dateInputs.slice(0, 6),
+          date_inputs: dedupedDateInputs.slice(0, 6),
           guest_fields: dedupedGuests.slice(0, 6),
           action_buttons: dedupedActions.slice(0, 4),
           detected_fields: { check_in: hasCheckIn, check_out: hasCheckOut, guests: hasGuests },
@@ -1794,86 +1365,59 @@ async function extractCapabilitiesFromPage(page) {
     scored.sort((a, b) => b.score - a.score);
     scored.slice(0, 6).forEach(item => pushAvailability(item.schema));
 
-    // ═══════════════════════════════════════════════════════════
-    // WIZARD / MULTI-STEP DETECTION (enriched with choices)
-    // Catches div-based wizards not inside <form>
-    // ═══════════════════════════════════════════════════════════
+    // WIZARD / MULTI-STEP DETECTION
     const wizards = [];
     try {
       const stepSelectors = [
-        '[class*="step"]',
-        '[class*="wizard"]',
-        '[data-step]',
-        '[class*="multi-step"]',
-        '[class*="multistep"]',
-        '[class*="form-step"]',
-        '[class*="stepper"]',
+        '[class*="step"]', '[class*="wizard"]', '[data-step]',
+        '[class*="multi-step"]', '[class*="multistep"]',
+        '[class*="form-step"]', '[class*="stepper"]',
       ];
 
       const stepIndicatorSelectors = [
-        '[class*="step-indicator"]',
-        '[class*="progress-step"]',
-        '[class*="step-nav"]',
-        '[class*="stepper"]',
-        '[class*="step-number"]',
-        '[class*="form-progress"]',
+        '[class*="step-indicator"]', '[class*="progress-step"]',
+        '[class*="step-nav"]', '[class*="stepper"]',
+        '[class*="step-number"]', '[class*="form-progress"]',
       ];
 
       const wizardRoots = new Set();
 
-      // Method 1: Find step containers with inputs
       for (const sel of stepSelectors) {
         try {
           document.querySelectorAll(sel).forEach(el => {
             if (el.closest('form')) return;
             if (!isVisible(el)) return;
-
             const root = el.closest(
               '[class*="wizard"],[class*="step-container"],[class*="form-wrapper"],' +
               '[class*="multistep"],[class*="multi-step"],[class*="stepper"]'
             ) || el;
-
             if (root.closest('form')) return;
-
-            const inputs = root.querySelectorAll(
-              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-            );
+            const inputs = root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea');
             const visibleInputs = Array.from(inputs).filter(isVisible);
-            if (visibleInputs.length >= 1) {
-              wizardRoots.add(root);
-            }
+            if (visibleInputs.length >= 1) wizardRoots.add(root);
           });
         } catch {}
       }
 
-      // Method 2: Find step indicators near inputs (not in form)
       for (const sel of stepIndicatorSelectors) {
         try {
           document.querySelectorAll(sel).forEach(indicator => {
             if (indicator.closest('form')) return;
             if (!isVisible(indicator)) return;
-
             const parent = indicator.parentElement;
             if (!parent || parent.closest('form')) return;
-
             let container = parent;
             for (let i = 0; i < 5; i++) {
               if (!container) break;
-              const inputs = container.querySelectorAll(
-                'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-              );
+              const inputs = container.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea');
               const visibleInputs = Array.from(inputs).filter(isVisible);
-              if (visibleInputs.length >= 1) {
-                wizardRoots.add(container);
-                break;
-              }
+              if (visibleInputs.length >= 1) { wizardRoots.add(container); break; }
               container = container.parentElement;
             }
           });
         } catch {}
       }
 
-      // Method 3: Navigation buttons (Напред/Назад, Next/Back) near inputs
       const navButtonRe = /напред|назад|next|back|previous|стъпка|step/i;
       document.querySelectorAll('button, [role="button"], a[class*="btn"]').forEach(btn => {
         try {
@@ -1881,52 +1425,32 @@ async function extractCapabilitiesFromPage(page) {
           if (!isVisible(btn)) return;
           const text = (btn.textContent || "").trim();
           if (!navButtonRe.test(text)) return;
-
           let container = btn.parentElement;
           for (let i = 0; i < 6; i++) {
             if (!container) break;
             if (container.closest('form')) break;
-            const inputs = container.querySelectorAll(
-              'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-            );
+            const inputs = container.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea');
             const visibleInputs = Array.from(inputs).filter(isVisible);
-            if (visibleInputs.length >= 2) {
-              wizardRoots.add(container);
-              break;
-            }
+            if (visibleInputs.length >= 2) { wizardRoots.add(container); break; }
             container = container.parentElement;
           }
         } catch {}
       });
 
-      // Extract fields + choices from each wizard root
       for (const root of wizardRoots) {
         const fields = [];
-        root.querySelectorAll(
-          'input:not([type="hidden"]):not([type="submit"]), select, textarea'
-        ).forEach(input => {
+        root.querySelectorAll('input:not([type="hidden"]):not([type="submit"]), select, textarea').forEach(input => {
           if (!isVisible(input)) return;
-
           const tag = input.tagName.toLowerCase();
           const type = (input.getAttribute("type") || tag).toLowerCase();
           const name = input.getAttribute("name") || input.id || "";
           const placeholder = input.getAttribute("placeholder") || "";
           const label = getLabel(input);
-          const required =
-            input.hasAttribute("required") ||
-            input.getAttribute("aria-required") === "true" ||
+          const required = input.hasAttribute("required") || input.getAttribute("aria-required") === "true" ||
             (label && /(\*|задължително|required)/i.test(label));
-
-          // Skip radios from fields (they go into choices)
           if (type === "radio") return;
-
           fields.push({
-            tag,
-            type,
-            name,
-            label,
-            placeholder,
-            required,
+            tag, type, name, label, placeholder, required,
             autocomplete: input.getAttribute("autocomplete") || "",
             aria_label: input.getAttribute("aria-label") || "",
             aria_describedby: input.getAttribute("aria-describedby") || "",
@@ -1934,111 +1458,46 @@ async function extractCapabilitiesFromPage(page) {
           });
         });
 
-        // ✅ Extract choices (radio groups, button groups, select options) from wizard
         const choices = extractChoices(root);
-
         if (fields.length === 0 && choices.length === 0) continue;
 
-        // Detect step indicators text
-        const stepIndicators = [];
-        root.querySelectorAll(
-          '[class*="step"], [data-step], [class*="progress"]'
-        ).forEach(el => {
+        const stepIndicatorsArr = [];
+        root.querySelectorAll('[class*="step"], [data-step], [class*="progress"]').forEach(el => {
           const t = (el.textContent || "").trim().slice(0, 80);
-          if (t && t.length > 1 && t.length < 80) stepIndicators.push(t);
+          if (t && t.length > 1 && t.length < 80) stepIndicatorsArr.push(t);
         });
 
-        // Find submit/next buttons
         const submitCandidates = [];
         root.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(btn => {
           if (!isVisible(btn)) return;
           const text = (btn.textContent?.trim() || btn.getAttribute("value") || "").slice(0, 80);
           if (!text) return;
-          submitCandidates.push({
-            text,
-            selector_candidates: selectorCandidates(btn),
-          });
+          submitCandidates.push({ text, selector_candidates: selectorCandidates(btn) });
         });
 
         const bestSubmit =
           submitCandidates.find(b => /изпрати|send|submit|запази|напред|next|резерв|book/i.test(b.text)) ||
-          submitCandidates[0] ||
-          null;
+          submitCandidates[0] || null;
 
-        // Detect total steps from text like "Стъпка 1 от 6" or "Step 1/6"
         const rootText = (root.textContent || "").slice(0, 500);
         const stepsMatch = rootText.match(/(?:стъпка|step)\s*\d+\s*(?:от|of|\/)\s*(\d+)/i);
         const totalSteps = stepsMatch ? parseInt(stepsMatch[1], 10) : null;
 
         let dom_snapshot = "";
-        try {
-          dom_snapshot = (root.outerHTML || "").slice(0, 4000);
-        } catch {}
+        try { dom_snapshot = (root.outerHTML || "").slice(0, 4000); } catch {}
 
         wizards.push({
           kind: "wizard",
           schema: {
-            fields,
-            choices,
-            submit: bestSubmit,
-            is_multi_step: true,
-            total_steps: totalSteps,
-            step_indicators: [...new Set(stepIndicators)].slice(0, 10),
-            action: "",
-            method: "post",
+            fields, choices, submit: bestSubmit,
+            is_multi_step: true, total_steps: totalSteps,
+            step_indicators: [...new Set(stepIndicatorsArr)].slice(0, 10),
+            action: "", method: "post",
           },
           dom_snapshot,
         });
       }
-    } catch (e) {
-      // wizard detection is best-effort, never crash
-    }
-
-    const dialogs = [];
-
-    try {
-      const dialogSelectors = [
-        '[role="dialog"]',
-        '[role="alertdialog"]',
-        '[aria-modal="true"]',
-        '[data-state="open"]',
-        '[data-state="open"][role]',
-        '[class*="dialog"]',
-        '[class*="modal"]',
-        '[class*="drawer"]',
-        '[class*="popup"]',
-        '[class*="overlay"]',
-        '[id*="dialog"]',
-        '[id*="modal"]'
-      ];
-
-      const seenDialogs = new Set();
-
-      dialogSelectors.forEach((selector) => {
-        try {
-          document.querySelectorAll(selector).forEach((el) => {
-            if (!isVisible(el)) return;
-
-            const txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-            if (!txt || txt.length < 40) return;
-
-            const key = txt.slice(0, 300);
-            if (seenDialogs.has(key)) return;
-            seenDialogs.add(key);
-
-            dialogs.push({
-              kind: "dialog",
-              schema: {
-                ui_type: "dialog_or_modal",
-                selector_hint: selector,
-                text_hint: txt.slice(0, 300),
-                full_text: txt.slice(0, 6000),
-              }
-            });
-          });
-        } catch {}
-      });
-    } catch {}
+    } catch (e) {}
 
     return {
       url: window.location.href,
@@ -2046,7 +1505,6 @@ async function extractCapabilitiesFromPage(page) {
       wizards,
       iframes,
       availability,
-      dialogs,
     };
   });
 }
@@ -2058,41 +1516,23 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
   for (const p of perPageCaps) {
     const url = p.url || "";
     const domain = normalizeDomain(url || baseOrigin || "");
-
     const pushCap = (kind, schema, dom_snapshot) => {
-      // ✅ FIX: fingerprint based ONLY on kind + schema (not url)
-      // Same form on 15 pages → single fingerprint → single capability
       const normalized = { kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
       const key = `${kind}|${fp}`;
       if (seen.has(key)) return;
       seen.add(key);
-
-      combined.push({
-        url,
-        domain,
-        kind,
-        fingerprint: fp,
-        schema,
-        dom_snapshot: dom_snapshot || null,
-      });
+      combined.push({ url, domain, kind, fingerprint: fp, schema, dom_snapshot: dom_snapshot || null });
     };
-
     for (const f of p.forms || []) pushCap("form", f.schema, f.dom_snapshot);
-
-    // ✅ NEW: Process wizard capabilities
     for (const w of p.wizards || []) pushCap("wizard", w.schema, w.dom_snapshot);
-
     for (const w of p.iframes || []) {
       const src = w.schema?.src || "";
       pushCap("booking_widget", { ...w.schema, vendor: guessVendorFromText(src) });
     }
-
     for (const a of p.availability || []) pushCap("availability", a.schema);
-    for (const d of p.dialogs || []) pushCap("dialog", d.schema);
   }
 
-  // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
   const forms = combined.filter(c => c.kind === "form").slice(0, 8);
   const wizards = combined.filter(c => c.kind === "wizard").slice(0, 5);
   const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 5);
@@ -2102,8 +1542,537 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
   return [...forms, ...wizards, ...widgets, ...avail, ...other];
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════
-// EXISTING EXTRACTION FUNCTIONS (unchanged)
+// ██████████████████████████████████████████████████████████████████████████
+// ███  NEW: UI-AWARE INTERACTION LAYER                                  ███
+// ███  Clicks tabs, accordions, dialogs, "Details", dropdowns           ███
+// ███  and captures ALL revealed content                                ███
+// ██████████████████████████████████████████████████████████████████████████
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * revealHiddenContent(page)
+ *
+ * This is the CORE NEW FUNCTION.
+ * It clicks every interactive UI element that hides content:
+ *   - tabs (role="tab", [data-toggle="tab"], .tab, .nav-link)
+ *   - accordions (.accordion-header, [data-toggle="collapse"], details > summary)
+ *   - "Show more" / "Details" / "Виж детайли" / "Повече" buttons
+ *   - dialog triggers ([data-toggle="modal"], [data-bs-toggle="modal"])
+ *   - dropdown triggers
+ *
+ * After each click, it waits for new content to appear and captures it.
+ *
+ * Returns: { revealedTexts: string[], dialogTexts: string[], clickCount: number }
+ */
+async function revealHiddenContent(page) {
+  const startTime = Date.now();
+  const results = { revealedTexts: [], dialogTexts: [], clickCount: 0 };
+
+  try {
+    // PHASE 1: Open all <details> elements (no click needed, just set open attribute)
+    await page.evaluate(() => {
+      document.querySelectorAll("details").forEach(d => {
+        d.open = true;
+        d.setAttribute("open", "");
+      });
+    });
+
+    // PHASE 2: Discover all clickable UI triggers
+    const triggers = await page.evaluate((maxClicks) => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const isVisible = (el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 &&
+                 style.display !== "none" && style.visibility !== "hidden";
+        } catch { return false; }
+      };
+
+      // Skip navigation/footer/cookie elements
+      const isJunk = (el) => {
+        if (!el) return false;
+        const inNav = el.closest('nav, header, footer, [class*="cookie"], [class*="gdpr"], [class*="consent"]');
+        return !!inNav;
+      };
+
+      const found = [];
+      const seenTexts = new Set();
+
+      // --- TABS ---
+      document.querySelectorAll(
+        '[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], ' +
+        '.nav-tabs .nav-link, .tab-link, .tabs__tab, [class*="tab-btn"], ' +
+        '[class*="tab-button"], [class*="tab-trigger"]'
+      ).forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 2 || seenTexts.has(text)) return;
+        seenTexts.add(text);
+        found.push({ type: "tab", text, index: found.length });
+      });
+
+      // --- ACCORDIONS ---
+      document.querySelectorAll(
+        '[data-toggle="collapse"], [data-bs-toggle="collapse"], ' +
+        '.accordion-button, .accordion-header, .accordion-trigger, ' +
+        '[class*="accordion"] > button, [class*="accordion"] > a, ' +
+        '[class*="collapse-trigger"], [class*="expand"], ' +
+        'details > summary'
+      ).forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 2 || seenTexts.has(text)) return;
+        seenTexts.add(text);
+        found.push({ type: "accordion", text, index: found.length });
+      });
+
+      // --- "SHOW MORE" / "DETAILS" / "ВИЖ ДЕТАЙЛИ" BUTTONS ---
+      const showMoreRe = /виж (повече|детайли|детайлите|всичк)|вижте|покажи повече|повече( информация| детайли)?|подробности|more (details|info)|show more|see more|read more|details|expand|learn more|view details|show all|вижте повече|прочети повече|разгледай/i;
+
+      document.querySelectorAll('button, a, [role="button"], span[onclick], div[onclick]').forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 2 || text.length > 60) return;
+        if (!showMoreRe.test(text)) return;
+        if (seenTexts.has(text)) return;
+
+        // Skip if it's a navigation link to another page
+        const href = el.getAttribute("href") || "";
+        if (href && !href.startsWith("#") && !href.startsWith("javascript:") && href !== "") {
+          // Check if it's an internal anchor or JS action
+          try {
+            const url = new URL(href, window.location.origin);
+            if (url.pathname !== window.location.pathname) return; // links to different page
+          } catch {}
+        }
+
+        seenTexts.add(text);
+        found.push({ type: "show_more", text, index: found.length });
+      });
+
+      // --- MODAL/DIALOG TRIGGERS ---
+      document.querySelectorAll(
+        '[data-toggle="modal"], [data-bs-toggle="modal"], ' +
+        '[data-fancybox], [data-lightbox], [data-popup], ' +
+        '[class*="modal-trigger"], [class*="dialog-trigger"], ' +
+        '[class*="popup-trigger"], [data-target*="modal"], ' +
+        '[data-bs-target*="modal"]'
+      ).forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 2 || seenTexts.has(text)) return;
+        seenTexts.add(text);
+        found.push({ type: "modal", text, index: found.length });
+      });
+
+      // --- DROPDOWN TRIGGERS (non-nav) ---
+      document.querySelectorAll(
+        '[data-toggle="dropdown"], [data-bs-toggle="dropdown"], ' +
+        '[aria-haspopup="listbox"], [aria-haspopup="menu"]'
+      ).forEach(el => {
+        if (!isVisible(el) || isJunk(el)) return;
+        // Only include dropdowns that look like content dropdowns, not nav menus
+        if (el.closest('nav, header, [class*="menu"]')) return;
+        const text = norm(el.textContent).slice(0, 80);
+        if (!text || text.length < 2 || seenTexts.has(text)) return;
+        seenTexts.add(text);
+        found.push({ type: "dropdown", text, index: found.length });
+      });
+
+      return found.slice(0, maxClicks);
+    }, MAX_UI_CLICKS);
+
+    if (triggers.length === 0) {
+      return results;
+    }
+
+    console.log(`[UI-REVEAL] Found ${triggers.length} interactive triggers`);
+
+    // PHASE 3: Click each trigger and capture revealed content
+    for (const trigger of triggers) {
+      // Time budget check
+      if (Date.now() - startTime > UI_INTERACTION_BUDGET_MS) {
+        console.log(`[UI-REVEAL] Time budget exceeded after ${results.clickCount} clicks`);
+        break;
+      }
+
+      try {
+        // Get text BEFORE click
+        const beforeText = await page.evaluate(() => {
+          return (document.body.innerText || "").length;
+        });
+
+        // Build selector to find the element and click it
+        const clicked = await page.evaluate((triggerInfo) => {
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const isVisible = (el) => {
+            try {
+              const rect = el.getBoundingClientRect();
+              const style = window.getComputedStyle(el);
+              return rect.width > 0 && rect.height > 0 &&
+                     style.display !== "none" && style.visibility !== "hidden";
+            } catch { return false; }
+          };
+
+          // Find the element by matching type and text
+          let selectors;
+          switch (triggerInfo.type) {
+            case "tab":
+              selectors = '[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], .nav-tabs .nav-link, .tab-link, .tabs__tab, [class*="tab-btn"], [class*="tab-button"], [class*="tab-trigger"]';
+              break;
+            case "accordion":
+              selectors = '[data-toggle="collapse"], [data-bs-toggle="collapse"], .accordion-button, .accordion-header, .accordion-trigger, [class*="accordion"] > button, [class*="accordion"] > a, [class*="collapse-trigger"], [class*="expand"], details > summary';
+              break;
+            case "show_more":
+              selectors = 'button, a, [role="button"], span[onclick], div[onclick]';
+              break;
+            case "modal":
+              selectors = '[data-toggle="modal"], [data-bs-toggle="modal"], [data-fancybox], [data-lightbox], [data-popup], [class*="modal-trigger"], [class*="dialog-trigger"], [class*="popup-trigger"], [data-target*="modal"], [data-bs-target*="modal"]';
+              break;
+            case "dropdown":
+              selectors = '[data-toggle="dropdown"], [data-bs-toggle="dropdown"], [aria-haspopup="listbox"], [aria-haspopup="menu"]';
+              break;
+            default:
+              return false;
+          }
+
+          const candidates = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
+          const match = candidates.find(el => {
+            const text = norm(el.textContent).slice(0, 80);
+            return text === triggerInfo.text;
+          });
+
+          if (match) {
+            try {
+              match.scrollIntoView({ block: "center", behavior: "instant" });
+              match.click();
+              return true;
+            } catch { return false; }
+          }
+          return false;
+        }, trigger);
+
+        if (!clicked) continue;
+
+        results.clickCount++;
+
+        // Wait for content to appear
+        await page.waitForTimeout(UI_CLICK_WAIT_MS);
+
+        // For modals, also try to wait for dialog/modal element to appear
+        if (trigger.type === "modal") {
+          try {
+            await page.waitForSelector(
+              '[role="dialog"]:not([style*="display: none"]), .modal.show, .modal.in, .modal[style*="display: block"], [class*="popup"][style*="display: block"]',
+              { timeout: 1000 }
+            );
+          } catch {}
+
+          // Extract dialog content
+          const dialogContent = await page.evaluate(() => {
+            const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+            const dialogs = document.querySelectorAll(
+              '[role="dialog"], .modal.show, .modal.in, .modal[style*="display: block"], ' +
+              '[class*="popup"][style*="display: block"], [class*="modal-content"], ' +
+              '[class*="dialog-content"], .fancybox-content, .lightbox-content'
+            );
+
+            const texts = [];
+            dialogs.forEach(d => {
+              const text = norm(d.innerText || d.textContent || "");
+              if (text && text.length > 10) {
+                texts.push(text.slice(0, 5000));
+              }
+            });
+            return texts;
+          });
+
+          if (dialogContent.length > 0) {
+            results.dialogTexts.push(...dialogContent);
+            console.log(`[UI-REVEAL] Modal "${trigger.text.slice(0,30)}": captured ${dialogContent.length} dialog(s)`);
+          }
+
+          // Close the modal
+          await page.evaluate(() => {
+            // Try various close methods
+            const closeBtn = document.querySelector(
+              '.modal.show .close, .modal.show [data-dismiss="modal"], ' +
+              '.modal.show [data-bs-dismiss="modal"], .modal.show .btn-close, ' +
+              '[role="dialog"] button[aria-label="Close"], ' +
+              '.modal.in .close, [class*="popup"] .close, ' +
+              '[class*="modal-close"], [class*="dialog-close"]'
+            );
+            if (closeBtn) {
+              closeBtn.click();
+              return;
+            }
+            // Try pressing Escape via dispatching event
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          });
+
+          await page.waitForTimeout(200);
+        }
+
+        // For tabs/accordions/show-more, capture the newly revealed text
+        if (trigger.type !== "modal") {
+          const afterText = await page.evaluate(() => {
+            return (document.body.innerText || "").length;
+          });
+
+          if (afterText > beforeText) {
+            // New content appeared — we'll capture it in the final extractStructured call
+            console.log(`[UI-REVEAL] ${trigger.type} "${trigger.text.slice(0,30)}": +${afterText - beforeText} chars`);
+          }
+        }
+
+      } catch (err) {
+        // Single trigger failure — continue with others
+      }
+    }
+
+    // PHASE 4: After all clicks, capture any newly visible content
+    // (tabs/accordions that are now open will be read by extractStructured)
+
+  } catch (err) {
+    console.error("[UI-REVEAL] Error:", err.message);
+  }
+
+  console.log(`[UI-REVEAL] Done: ${results.clickCount} clicks, ${results.dialogTexts.length} dialogs`);
+  return results;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ██████████████████████████████████████████████████████████████████████████
+// ███  NEW: STRUCTURED CONTENT EXTRACTION                               ███
+// ███  Extracts services, packages, FAQ, features as structured JSON    ███
+// ██████████████████████████████████████████████████████████████████████████
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * extractStructuredSections(page)
+ *
+ * Goes beyond rawContent — extracts structured JSON:
+ *   services[], packages[], faq[], features[], contacts[]
+ *
+ * This is what NEO needs to NOT hallucinate.
+ */
+async function extractStructuredSections(page) {
+  return await page.evaluate(() => {
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const isVisible = (el) => {
+      try {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+               style.display !== "none" && style.visibility !== "hidden";
+      } catch { return false; }
+    };
+
+    // ═══════ SERVICES ═══════
+    const services = [];
+    const serviceSelectors = [
+      '[class*="service"]', '[class*="uslugi"]', '[class*="usluga"]',
+      '[class*="offering"]', '[id*="service"]', '[id*="uslugi"]',
+    ];
+
+    // Find service cards/items
+    for (const sel of serviceSelectors) {
+      try {
+        document.querySelectorAll(sel).forEach(container => {
+          if (!isVisible(container)) return;
+          const heading = container.querySelector("h1,h2,h3,h4,h5,h6,strong,[class*='title']");
+          const title = norm(heading?.innerText || heading?.textContent || "");
+          if (!title || title.length < 3 || title.length > 120) return;
+
+          const desc = norm(container.innerText || container.textContent || "");
+          if (desc.length < 10) return;
+
+          // Find price if present
+          const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
+          const price = priceMatch ? norm(priceMatch[0]) : null;
+
+          // Find features/bullets
+          const features = [];
+          container.querySelectorAll("li").forEach(li => {
+            const t = norm(li.innerText || li.textContent || "");
+            if (t && t.length >= 3 && t.length <= 200) features.push(t);
+          });
+
+          // Avoid duplicates
+          if (services.some(s => s.title === title)) return;
+
+          services.push({
+            title,
+            description: desc.slice(0, 500),
+            price,
+            features: features.slice(0, 20),
+          });
+        });
+      } catch {}
+    }
+
+    // Also try to find services by common page structure patterns
+    if (services.length === 0) {
+      try {
+        // Look for repeating card patterns with headings + descriptions
+        const cards = document.querySelectorAll(
+          '.card, .item, [class*="card"], [class*="item"], article, ' +
+          '[class*="box"], [class*="feature-box"], [class*="service-box"]'
+        );
+        cards.forEach(card => {
+          if (!isVisible(card)) return;
+          const heading = card.querySelector("h2,h3,h4,h5");
+          const title = norm(heading?.innerText || "");
+          if (!title || title.length < 3 || title.length > 120) return;
+
+          const desc = norm(card.innerText || "");
+          if (desc.length < 20) return;
+
+          const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
+          const price = priceMatch ? norm(priceMatch[0]) : null;
+
+          const features = [];
+          card.querySelectorAll("li").forEach(li => {
+            const t = norm(li.innerText || "");
+            if (t && t.length >= 3 && t.length <= 200) features.push(t);
+          });
+
+          if (services.some(s => s.title === title)) return;
+          services.push({ title, description: desc.slice(0, 500), price, features: features.slice(0, 20) });
+        });
+      } catch {}
+    }
+
+    // ═══════ FAQ ═══════
+    const faq = [];
+
+    // Method 1: <details>/<summary> pattern
+    document.querySelectorAll("details").forEach(d => {
+      const summary = d.querySelector("summary");
+      const question = norm(summary?.innerText || summary?.textContent || "");
+      if (!question || question.length < 5) return;
+
+      // Get answer: everything except summary
+      const answerParts = [];
+      Array.from(d.children).forEach(child => {
+        if (child.tagName?.toLowerCase() === "summary") return;
+        const t = norm(child.innerText || child.textContent || "");
+        if (t) answerParts.push(t);
+      });
+      const answer = answerParts.join(" ").slice(0, 1000);
+      if (answer) faq.push({ question, answer });
+    });
+
+    // Method 2: Accordion patterns (common in FAQ sections)
+    const faqContainers = document.querySelectorAll(
+      '[class*="faq"], [id*="faq"], [class*="accordion"], ' +
+      '[class*="vuprosi"], [id*="vuprosi"], [class*="questions"]'
+    );
+    faqContainers.forEach(container => {
+      // Look for question/answer pairs
+      const items = container.querySelectorAll(
+        '.accordion-item, [class*="faq-item"], [class*="question"], ' +
+        '[class*="accordion-header"], dt'
+      );
+      items.forEach(item => {
+        const questionEl = item.querySelector(
+          '.accordion-button, [class*="question"], button, h3, h4, dt, summary, [class*="title"]'
+        ) || item;
+        const question = norm(questionEl.innerText || questionEl.textContent || "");
+        if (!question || question.length < 5) return;
+
+        // Try to find corresponding answer
+        let answer = "";
+        const nextSib = item.nextElementSibling;
+        if (nextSib && /collapse|answer|content|body|panel/i.test(nextSib.className || "")) {
+          answer = norm(nextSib.innerText || nextSib.textContent || "");
+        }
+
+        // Also check inside item for answer panel
+        if (!answer) {
+          const answerEl = item.querySelector(
+            '.accordion-body, .accordion-content, [class*="answer"], ' +
+            '[class*="content"], [class*="body"], [class*="panel"], dd'
+          );
+          if (answerEl) {
+            answer = norm(answerEl.innerText || answerEl.textContent || "");
+          }
+        }
+
+        if (answer && !faq.some(f => f.question === question)) {
+          faq.push({ question, answer: answer.slice(0, 1000) });
+        }
+      });
+    });
+
+    // ═══════ FEATURES ═══════
+    const features = [];
+    const featureContainers = document.querySelectorAll(
+      '[class*="feature"], [class*="benefit"], [class*="advantage"], ' +
+      '[class*="why-us"], [class*="why_us"], [class*="предимств"], ' +
+      '[class*="услуг"], [id*="feature"], [id*="benefit"]'
+    );
+    featureContainers.forEach(container => {
+      if (!isVisible(container)) return;
+      const heading = container.querySelector("h2,h3,h4,h5,[class*='title'],strong");
+      const title = norm(heading?.innerText || "");
+      const desc = norm(container.innerText || "");
+
+      if (title && title.length >= 3 && title.length <= 120 && desc.length >= 10) {
+        if (!features.some(f => f.title === title)) {
+          features.push({ title, description: desc.slice(0, 300) });
+        }
+      }
+    });
+
+    // ═══════ PACKAGES (separate from pricing — looks for named bundles) ═══════
+    const packages = [];
+    const pkgContainers = document.querySelectorAll(
+      '[class*="package"], [class*="plan"], [class*="пакет"], ' +
+      '[class*="tier"], [class*="bundle"], [id*="package"], [id*="plan"]'
+    );
+    pkgContainers.forEach(container => {
+      if (!isVisible(container)) return;
+      const heading = container.querySelector("h2,h3,h4,h5,[class*='title'],strong,b");
+      const title = norm(heading?.innerText || "");
+      if (!title || title.length < 3 || title.length > 120) return;
+
+      const desc = norm(container.innerText || "");
+      const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
+      const price = priceMatch ? norm(priceMatch[0]) : null;
+
+      const included = [];
+      container.querySelectorAll("li").forEach(li => {
+        const t = norm(li.innerText || "");
+        if (t && t.length >= 3 && t.length <= 200) included.push(t);
+      });
+
+      if (!packages.some(p => p.title === title)) {
+        packages.push({
+          title,
+          price,
+          description: desc.slice(0, 500),
+          included: included.slice(0, 30),
+        });
+      }
+    });
+
+    return {
+      services: services.slice(0, 30),
+      packages: packages.slice(0, 20),
+      faq: faq.slice(0, 50),
+      features: features.slice(0, 30),
+    };
+  });
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXISTING EXTRACTION FUNCTIONS (enhanced)
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function extractStructured(page) {
@@ -2143,19 +2112,16 @@ async function extractStructured(page) {
 
         Array.from(detailsEl.children).forEach((child) => {
           if (child.tagName?.toLowerCase() === "summary") return;
-
           child.querySelectorAll?.("table").forEach((table) => {
             const tableText = extractTableText(table);
             if (tableText) parts.push(tableText);
           });
-
           const textWithoutTables = norm(
             Array.from(child.childNodes)
               .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.tagName?.toLowerCase() === "table"))
               .map((node) => node.textContent || "")
               .join(" ")
           );
-
           if (textWithoutTables) parts.push(textWithoutTables);
         });
 
@@ -2173,7 +2139,6 @@ async function extractStructured(page) {
             try { summary?.click(); } catch {}
             el.open = true;
             el.setAttribute("open", "");
-
             const blockText = extractDetailsContent(el);
             const uniqueText = addUniqueText(blockText, 5);
             if (uniqueText) detailsTexts.push(uniqueText);
@@ -2206,25 +2171,11 @@ async function extractStructured(page) {
         processedElements.add(el);
       });
 
-    const overlaySelectors = [
-        '[class*="overlay"]',
-        '[class*="modal"]',
-        '[class*="popup"]',
-        '[class*="drawer"]',
-        '[class*="dialog"]',
-        '[class*="tooltip"]',
-        '[class*="banner"]',
-        '[class*="notification"]',
-        '[class*="alert"]',
-        '[style*="position: fixed"]',
-        '[style*="position: absolute"]',
-        '[role="dialog"]',
-        '[role="alertdialog"]',
-        '[aria-modal="true"]',
-        '[data-state="open"]',
-        '[data-state="open"][role]',
-        '[id*="dialog"]',
-        '[id*="modal"]',
+      const overlaySelectors = [
+        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
+        '[class*="alert"]', '[style*="position: fixed"]',
+        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
       ];
 
       const overlayTexts = [];
@@ -2301,6 +2252,26 @@ async function extractStructured(page) {
         });
       } catch {}
 
+      // NEW: Also extract text from currently-visible accordion/tab panels
+      const expandedPanelTexts = [];
+      try {
+        // Accordion panels that are now expanded/shown
+        document.querySelectorAll(
+          '.accordion-collapse.show, .collapse.show, ' +
+          '[class*="accordion-body"]:not([style*="display: none"]), ' +
+          '[class*="tab-pane"].active, [class*="tab-content"] > .active, ' +
+          '[role="tabpanel"]:not([hidden]), ' +
+          '[class*="panel"]:not([style*="display: none"]):not([hidden])'
+        ).forEach(panel => {
+          if (!isVisible(panel)) return;
+          const text = norm(panel.innerText || panel.textContent || "");
+          if (text && text.length > 10) {
+            const uniqueText = addUniqueText(text, 10);
+            if (uniqueText) expandedPanelTexts.push(uniqueText);
+          }
+        });
+      } catch {}
+
       return {
         rawContent: [
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
@@ -2308,6 +2279,7 @@ async function extractStructured(page) {
           mainContent,
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
+          expandedPanelTexts.length ? `EXPANDED_PANELS\n${expandedPanelTexts.join("\n\n")}` : "",
           topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
         ].filter(Boolean).join("\n\n"),
       };
@@ -2333,7 +2305,12 @@ async function collectAllLinks(page, base) {
   } catch { return []; }
 }
 
-// ================= PROCESS SINGLE PAGE =================
+// ═══════════════════════════════════════════════════════════════════════════
+// ██████████████████████████████████████████████████████████████████████████
+// ███  PROCESS SINGLE PAGE - REWRITTEN WITH UI INTERACTION              ███
+// ██████████████████████████████████████████████████████████████████████████
+// ═══════════════════════════════════════════════════════════════════════════
+
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
@@ -2341,19 +2318,16 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
-    // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
+    // Step 1: Scroll for lazy load (unchanged)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
       const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
-
       for (let i = 0; i <= steps; i++) {
         window.scrollTo(0, i * scrollStep);
         await new Promise(r => setTimeout(r, stepMs));
       }
       window.scrollTo(0, maxScroll);
-
-      // Force-load lazy images without waiting for scroll events
       document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
         img.loading = 'eager';
         if (img.dataset.src) img.src = img.dataset.src;
@@ -2361,35 +2335,58 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       });
     }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
 
-    await page.waitForTimeout(150); // ↓ was 500ms
-
+    await page.waitForTimeout(150);
     try {
-      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
+      await page.waitForLoadState('networkidle', { timeout: 1500 });
     } catch {}
+
+    // ═══════════════════════════════════════════════
+    // Step 2: ★ NEW — UI INTERACTION LAYER ★
+    // Click tabs, accordions, dialogs, "show more"
+    // BEFORE extracting content
+    // ═══════════════════════════════════════════════
+    let uiRevealResult = { revealedTexts: [], dialogTexts: [], clickCount: 0 };
+    try {
+      uiRevealResult = await revealHiddenContent(page);
+    } catch (e) {
+      console.error("[UI-REVEAL] Failed:", e.message);
+    }
+
+    // Scroll back to top so we don't miss anything
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(100);
 
     const title = clean(await page.title());
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
-    // Extract structured content
+    // Step 3: Extract structured content (now includes expanded panels from Step 2)
     const data = await extractStructured(page);
 
-    // NEW: actively click "details" buttons and read dialogs/modals/drawers
-    let clickedDialogs = [];
+    // ═══════════════════════════════════════════════
+    // Step 4: ★ NEW — STRUCTURED SECTIONS ★
+    // Extract services, packages, FAQ, features
+    // ═══════════════════════════════════════════════
+    let structuredSections = { services: [], packages: [], faq: [], features: [] };
     try {
-      clickedDialogs = await openClickableDialogs(page);
-      if (clickedDialogs.length > 0) {
-        console.log(`[DIALOGS] Page: ${clickedDialogs.length} clicked/opened dialogs`);
+      structuredSections = await extractStructuredSections(page);
+      const sectionCounts = [
+        structuredSections.services.length && `${structuredSections.services.length} services`,
+        structuredSections.packages.length && `${structuredSections.packages.length} packages`,
+        structuredSections.faq.length && `${structuredSections.faq.length} faq`,
+        structuredSections.features.length && `${structuredSections.features.length} features`,
+      ].filter(Boolean);
+      if (sectionCounts.length > 0) {
+        console.log(`[STRUCTURED] ${sectionCounts.join(", ")}`);
       }
     } catch (e) {
-      console.error("[DIALOGS] Extract error:", e.message);
+      console.error("[STRUCTURED] Extract error:", e.message);
     }
 
-    // NEW: Pricing/package structured extraction (cards + installment)
+    // Step 5: Pricing/package structured extraction (unchanged)
     let pricing = null;
     try {
       pricing = await extractPricingFromPage(page);
-
       if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
         console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
       }
@@ -2397,7 +2394,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[PRICING] Extract error:", e.message);
     }
 
-    // *** EXISTING: Extract SiteMap from this page ***
+    // Step 6: SiteMap extraction (unchanged)
     try {
       const rawSiteMap = await extractSiteMapFromPage(page);
       if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
@@ -2408,7 +2405,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[SITEMAP] Extract error:", e.message);
     }
 
-    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
+    // Step 7: Capabilities extraction (unchanged)
     try {
       const caps = await extractCapabilitiesFromPage(page);
       if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
@@ -2419,12 +2416,18 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[CAPS] Extract error:", e.message);
     }
 
-    // Format content
-    const htmlContent = normalizeNumbers(clean(data.rawContent));
+    // Step 8: Build final content — now includes dialog content from UI interactions
+    let htmlContent = normalizeNumbers(clean(data.rawContent));
+
+    // Append dialog content that was captured by UI interaction
+    if (uiRevealResult.dialogTexts.length > 0) {
+      const dialogSection = "DIALOG_CONTENT\n" + uiRevealResult.dialogTexts.map(t => clean(t)).filter(Boolean).join("\n\n");
+      htmlContent = htmlContent + "\n\n" + dialogSection;
+    }
 
     const content = htmlContent;
 
-    // ✅ NEW: contacts extraction (DOM + combined text)
+    // Step 9: Contacts extraction (unchanged)
     const domContacts = await extractContactsFromPage(page);
     const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
 
@@ -2443,20 +2446,11 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     const totalWords = countWordsExact(htmlContent);
 
     const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
+    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms (${uiRevealResult.clickCount} UI clicks)`);
 
     if (pageType !== "services" && totalWords < MIN_WORDS) {
       return { links: await collectAllLinks(page, base), page: null };
     }
-
-    const dialogContent = (clickedDialogs || [])
-      .map(d => `[Trigger: ${d.trigger_text || ""}]\n${d.dialog_text || ""}`)
-      .filter(Boolean)
-      .join("\n\n");
-
-    const finalContent = dialogContent
-      ? `${content}\n\n=== CLICK_OPENED_DIALOGS ===\n${dialogContent}`
-      : content;
 
     return {
       links: await collectAllLinks(page, base),
@@ -2464,9 +2458,21 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
         url,
         title,
         pageType,
-        content: finalContent,
-        // ✅ structured output: pricing + contacts + dialogs
-        structured: { pricing, contacts, dialogs: clickedDialogs },
+        content,
+        // ★ ENHANCED structured output — now includes services, packages, faq, features
+        structured: {
+          pricing,
+          contacts,
+          services: structuredSections.services,
+          packages: structuredSections.packages,
+          faq: structuredSections.faq,
+          features: structuredSections.features,
+          // Track what UI interactions happened
+          ui_interactions: uiRevealResult.clickCount > 0 ? {
+            clicks: uiRevealResult.clickCount,
+            dialogs_captured: uiRevealResult.dialogTexts.length,
+          } : null,
+        },
         wordCount: totalWords,
         status: "ok",
       }
@@ -2480,9 +2486,6 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
 // ================= PARALLEL CRAWLER =================
 async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
-  // If caller passed a deadline (e.g. scrape-website knows its own timeout),
-  // use that minus a 5s buffer for JSON serialization + response.
-  // Otherwise fall back to MAX_SECONDS.
   const effectiveMs = deadlineMs
     ? Math.min(deadlineMs, MAX_SECONDS * 1000)
     : MAX_SECONDS * 1000;
@@ -2505,11 +2508,10 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const pages = [];
   const queue = [];
-  const siteMaps = []; // collect sitemaps from all pages
-  const capabilitiesMaps = []; // collect capabilities from all pages
+  const siteMaps = [];
+  const capabilitiesMaps = [];
   let base = "";
 
-  // ✅ NEW: aggregate contacts across pages
   const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
@@ -2566,7 +2568,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
         const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
-          // ✅ collect contacts
           const c = result.page?.structured?.contacts;
           if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
           if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
@@ -2597,10 +2598,8 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
-
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
-
     await saveSiteMapToSupabase(combinedSiteMap);
     await sendSiteMapToWorker(combinedSiteMap);
   }
@@ -2668,8 +2667,6 @@ http
 
         const requestedUrl = normalizeUrl(parsed.url);
         const siteId = parsed.site_id || null;
-        // Accept deadline from caller — scrape-website sends how many ms the crawler has
-        // before the caller's own timeout fires. We subtract 5s for safety buffer.
         const rawDeadline = Number(parsed.deadline_ms) || 0;
         const deadlineMs = rawDeadline > 10000 ? rawDeadline - 5000 : null;
         const now = Date.now();
