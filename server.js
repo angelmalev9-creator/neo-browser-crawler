@@ -1601,6 +1601,28 @@ async function revealHiddenContent(page) {
       const found = [];
       const seenTexts = new Set();
 
+      const getSelector = (el) => {
+        try {
+          if (el.id) return `#${CSS.escape(el.id)}`;
+
+          const name = el.getAttribute?.("name");
+          if (name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+
+          const aria = el.getAttribute?.("aria-label");
+          if (aria) return `${el.tagName.toLowerCase()}[aria-label="${CSS.escape(aria)}"]`;
+
+          const cls = (el.className && typeof el.className === "string")
+            ? el.className.trim().split(/\s+/).filter(Boolean)[0]
+            : "";
+
+          if (cls) return `${el.tagName.toLowerCase()}.${cls}`;
+
+          return el.tagName.toLowerCase();
+        } catch {
+          return el.tagName ? el.tagName.toLowerCase() : "*";
+        }
+      };
+
       // --- TABS ---
       document.querySelectorAll(
         '[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], ' +
@@ -1611,7 +1633,7 @@ async function revealHiddenContent(page) {
         const text = norm(el.textContent).slice(0, 80);
         if (!text || text.length < 2 || seenTexts.has(text)) return;
         seenTexts.add(text);
-        found.push({ type: "tab", text, index: found.length });
+        found.push({ type: "tab", text, selector: getSelector(el) });
       });
 
       // --- ACCORDIONS ---
@@ -1626,7 +1648,7 @@ async function revealHiddenContent(page) {
         const text = norm(el.textContent).slice(0, 80);
         if (!text || text.length < 2 || seenTexts.has(text)) return;
         seenTexts.add(text);
-        found.push({ type: "accordion", text, index: found.length });
+        found.push({ type: "accordion", text, selector: getSelector(el) });
       });
 
       // --- "SHOW MORE" / "DETAILS" / "ВИЖ ДЕТАЙЛИ" BUTTONS ---
@@ -1650,84 +1672,82 @@ async function revealHiddenContent(page) {
         }
 
         seenTexts.add(text);
-        found.push({ type: "show_more", text, index: found.length });
+        found.push({ type: "show_more", text, selector: getSelector(el) });
       });
 
       // --- MODAL/DIALOG TRIGGERS ---
       // Classic Bootstrap + Radix UI + Headless UI + generic React dialogs
       document.querySelectorAll(
         '[data-toggle="modal"], [data-bs-toggle="modal"], ' +
-        '[data-fancybox], [data-lightbox], [data-popup], ' +
-        '[class*="modal-trigger"], [class*="dialog-trigger"], ' +
-        '[class*="popup-trigger"], [data-target*="modal"], ' +
-        '[data-bs-target*="modal"], ' +
-        // Radix UI / Headless UI / shadcn triggers
-        '[aria-haspopup="dialog"], [data-radix-collection-item], ' +
-        '[data-state][role="button"], button[data-state]'
+        '[data-fancybox], [data-lightbox], [data-popup], [data-dialog], ' +
+        '[aria-haspopup="dialog"], [aria-controls*="dialog"], [aria-controls*="modal"], ' +
+        '[data-radix-collection-item], [data-state], ' +
+        'button, a, [role="button"]'
       ).forEach(el => {
         if (!isVisible(el) || isJunk(el)) return;
-        const text = norm(el.textContent).slice(0, 80);
-        if (!text || text.length < 2 || seenTexts.has(text)) return;
-        seenTexts.add(text);
-        found.push({ type: "modal", text, index: found.length });
-      });
 
-      // --- CONTENT BUTTONS (catch-all for React SPA sites) ---
-      // Any button inside main content area that looks like it reveals info
-      // (not in nav/header/footer, short text, likely opens dialog/details)
-      const contentButtonRe = /модел|model|план|plan|пакет|package|стая|room|апартамент|apartment|къща|house|вила|villa|студио|studio|офис|office|етаж|floor|тип|type|вариант|variant|опция|option|избери|choose|select|конфигур|config|customize|поръч|order|оферт|offer|промоц|promo|включено|included|standard|basic|premium|pro|deluxe|лукс|luxury|comfort|komfort|екстра|extra/i;
+        const text = norm(
+          el.textContent ||
+          el.getAttribute("aria-label") ||
+          el.getAttribute("title") ||
+          ""
+        ).slice(0, 80);
 
-      document.querySelectorAll('button, [role="button"]').forEach(el => {
-        if (!isVisible(el) || isJunk(el)) return;
-        const text = norm(el.textContent).slice(0, 80);
-        if (!text || text.length < 3 || text.length > 60) return;
+        if (!text || text.length < 2 || text.length > 60) return;
+
+        const attrs = (
+          (el.outerHTML || "").slice(0, 500) +
+          " " +
+          Array.from(el.attributes).map(a => `${a.name}="${a.value}"`).join(" ")
+        ).toLowerCase();
+
+        const modalRe = /modal|dialog|popup|lightbox|drawer|sheet|details|open|show|виж|повече|детайли|info|разгледай|прочети|fancybox|radix|headless|aria-haspopup="dialog"/i;
+
+        if (!modalRe.test(text) && !modalRe.test(attrs)) return;
+
+        // Skip obvious navigation
+        const href = el.getAttribute("href") || "";
+        if (href && !href.startsWith("#") && !href.startsWith("javascript:") && href !== "") {
+          try {
+            const url = new URL(href, window.location.origin);
+            if (url.pathname !== window.location.pathname && !url.hash) return;
+          } catch {}
+        }
+
         if (seenTexts.has(text)) return;
-        // Must match content-related keywords
-        if (!contentButtonRe.test(text)) return;
-        // Must be in main content, not nav/header
-        if (el.closest('nav, header, footer, [class*="menu"], [class*="nav"]')) return;
         seenTexts.add(text);
-        found.push({ type: "modal", text, index: found.length });
+        found.push({ type: "modal", text, selector: getSelector(el) });
       });
 
-      // --- DROPDOWN TRIGGERS (non-nav) ---
+      // --- DROPDOWNS ---
       document.querySelectorAll(
-        '[data-toggle="dropdown"], [data-bs-toggle="dropdown"], ' +
-        '[aria-haspopup="listbox"], [aria-haspopup="menu"]'
+        'select, [role="combobox"], [aria-haspopup="listbox"], [aria-expanded], ' +
+        '.dropdown-toggle, [class*="dropdown"] > button'
       ).forEach(el => {
         if (!isVisible(el) || isJunk(el)) return;
-        // Only include dropdowns that look like content dropdowns, not nav menus
-        if (el.closest('nav, header, [class*="menu"]')) return;
-        const text = norm(el.textContent).slice(0, 80);
-        if (!text || text.length < 2 || seenTexts.has(text)) return;
-        seenTexts.add(text);
-        found.push({ type: "dropdown", text, index: found.length });
+        const text = norm(
+          el.textContent ||
+          el.getAttribute("aria-label") ||
+          el.getAttribute("placeholder") ||
+          ""
+        ).slice(0, 80);
+        const key = text || `dropdown-${found.length}`;
+        if (seenTexts.has(key)) return;
+        seenTexts.add(key);
+        found.push({ type: "dropdown", text: key, selector: getSelector(el) });
       });
 
       return found.slice(0, maxClicks);
     }, MAX_UI_CLICKS);
 
-    if (triggers.length === 0) {
-      return results;
-    }
-
-    console.log(`[UI-REVEAL] Found ${triggers.length} interactive triggers`);
-
-    // PHASE 3: Click each trigger and capture revealed content
+    // PHASE 3: Click triggers one by one
     for (const trigger of triggers) {
-      // Time budget check
-      if (Date.now() - startTime > UI_INTERACTION_BUDGET_MS) {
-        console.log(`[UI-REVEAL] Time budget exceeded after ${results.clickCount} clicks`);
-        break;
-      }
+      if ((Date.now() - startTime) > UI_INTERACTION_BUDGET_MS) break;
 
       try {
-        // Get text BEFORE click
-        const beforeText = await page.evaluate(() => {
-          return (document.body.innerText || "").length;
-        });
+        const beforeText = await page.evaluate(() => (document.body.innerText || "").length);
 
-        // Build selector to find the element and click it
+        // Click trigger inside page context, finding by type/text
         const clicked = await page.evaluate((triggerInfo) => {
           const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
           const isVisible = (el) => {
@@ -1739,38 +1759,42 @@ async function revealHiddenContent(page) {
             } catch { return false; }
           };
 
-          // Find the element by matching type and text
-          let selectors;
-          switch (triggerInfo.type) {
-            case "tab":
-              selectors = '[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], .nav-tabs .nav-link, .tab-link, .tabs__tab, [class*="tab-btn"], [class*="tab-button"], [class*="tab-trigger"]';
-              break;
-            case "accordion":
-              selectors = '[data-toggle="collapse"], [data-bs-toggle="collapse"], .accordion-button, .accordion-header, .accordion-trigger, [class*="accordion"] > button, [class*="accordion"] > a, [class*="collapse-trigger"], [class*="expand"], details > summary';
-              break;
-            case "show_more":
-              selectors = 'button, a, [role="button"], span[onclick], div[onclick]';
-              break;
-            case "modal":
-              selectors = '[data-toggle="modal"], [data-bs-toggle="modal"], [data-fancybox], [data-lightbox], [data-popup], [class*="modal-trigger"], [class*="dialog-trigger"], [class*="popup-trigger"], [data-target*="modal"], [data-bs-target*="modal"], [aria-haspopup="dialog"], [data-radix-collection-item], button[data-state], [data-state][role="button"], button, [role="button"]';
-              break;
-            case "dropdown":
-              selectors = '[data-toggle="dropdown"], [data-bs-toggle="dropdown"], [aria-haspopup="listbox"], [aria-haspopup="menu"]';
-              break;
-            default:
-              return false;
+          let selectors = 'button, a, [role="button"], summary, select, [role="combobox"], [aria-expanded]';
+          if (triggerInfo.type === "tab") {
+            selectors = '[role="tab"], [data-toggle="tab"], [data-bs-toggle="tab"], .nav-tabs .nav-link, .tab-link, .tabs__tab';
+          } else if (triggerInfo.type === "accordion") {
+            selectors = '[data-toggle="collapse"], [data-bs-toggle="collapse"], .accordion-button, .accordion-header, .accordion-trigger, details > summary';
           }
 
-          const candidates = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
-          const match = candidates.find(el => {
-            const text = norm(el.textContent).slice(0, 80);
-            return text === triggerInfo.text;
-          });
+          let match = null;
+
+          if (triggerInfo.selector) {
+            try {
+              const bySelector = document.querySelector(triggerInfo.selector);
+              if (bySelector && isVisible(bySelector)) {
+                match = bySelector;
+              }
+            } catch {}
+          }
+
+          if (!match) {
+            const candidates = Array.from(document.querySelectorAll(selectors)).filter(isVisible);
+            match = candidates.find(el => {
+              const text = norm(el.textContent).slice(0, 80);
+              return text === triggerInfo.text;
+            }) || null;
+          }
 
           if (match) {
             try {
               match.scrollIntoView({ block: "center", behavior: "instant" });
-              match.click();
+
+              try {
+                match.click();
+              } catch {
+                match.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+              }
+
               return true;
             } catch { return false; }
           }
@@ -1791,16 +1815,19 @@ async function revealHiddenContent(page) {
               '[role="dialog"]:not([style*="display: none"]), ' +
               '[role="dialog"][data-state="open"], ' +
               '[data-radix-dialog-content], ' +
+              '[data-state="open"][role="dialog"], ' +
               '.modal.show, .modal.in, .modal[style*="display: block"], ' +
-              '[class*="popup"][style*="display: block"]',
-              { timeout: 1500 }
+              '[class*="popup"][style*="display: block"], ' +
+              '[class*="dialog-content"], ' +
+              '[data-radix-popper-content-wrapper]',
+              { timeout: 2500 }
             );
           } catch {}
 
-          // Extra wait for Radix animations
-          await page.waitForTimeout(200);
+          // Extra wait for Radix / React animations + content mount
+          await page.waitForTimeout(500);
 
-          // Extract dialog content
+          // Capture dialog content immediately
           const dialogContent = await page.evaluate(() => {
             const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
             const dialogs = document.querySelectorAll(
@@ -1814,23 +1841,50 @@ async function revealHiddenContent(page) {
             );
 
             const texts = [];
+
             dialogs.forEach(d => {
-              const text = norm(d.innerText || d.textContent || "");
-              if (text && text.length > 10) {
-                texts.push(text.slice(0, 5000));
-              }
+              try {
+                const scrollTargets = [
+                  d,
+                  ...Array.from(d.querySelectorAll('*')).filter(el => {
+                    try {
+                      return el.scrollHeight > el.clientHeight + 40;
+                    } catch {
+                      return false;
+                    }
+                  })
+                ];
+
+                scrollTargets.forEach(el => {
+                  try {
+                    el.scrollTop = 0;
+                    let last = -1;
+                    for (let i = 0; i < 12; i++) {
+                      el.scrollTop += 600;
+                      if (el.scrollTop === last) break;
+                      last = el.scrollTop;
+                    }
+                  } catch {}
+                });
+
+                const text = norm(d.innerText || d.textContent || "");
+                if (text && text.length > 10) {
+                  texts.push(text.slice(0, 12000));
+                }
+              } catch {}
             });
-            return texts;
+
+            return Array.from(new Set(texts));
           });
 
           if (dialogContent.length > 0) {
             results.dialogTexts.push(...dialogContent);
-            console.log(`[UI-REVEAL] Modal "${trigger.text.slice(0,30)}": captured ${dialogContent.length} dialog(s)`);
+            console.log(`[UI-REVEAL] Captured dialog: ${dialogContent[0].slice(0, 80)}...`);
           }
 
-          // Close the modal — support Radix overlay click + close buttons + Escape
+          // Try to close modal/dialog so we can continue
           await page.evaluate(() => {
-            // Try close buttons (classic + Radix)
+            // Try close buttons (classic + Radix) — no generic first button
             const closeBtn = document.querySelector(
               '.modal.show .close, .modal.show [data-dismiss="modal"], ' +
               '.modal.show [data-bs-dismiss="modal"], .modal.show .btn-close, ' +
@@ -1838,9 +1892,8 @@ async function revealHiddenContent(page) {
               '[role="dialog"] button[aria-label="Затвори"], ' +
               '.modal.in .close, [class*="popup"] .close, ' +
               '[class*="modal-close"], [class*="dialog-close"], ' +
-              // Radix close button
               '[data-radix-dialog-close], ' +
-              '[role="dialog"] button:first-of-type'
+              '[role="dialog"] [data-state="closed"]'
             );
             if (closeBtn) {
               closeBtn.click();
@@ -1861,7 +1914,7 @@ async function revealHiddenContent(page) {
             document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
           });
 
-          await page.waitForTimeout(300);
+          await page.waitForTimeout(500);
         }
 
         // For tabs/accordions/show-more, capture the newly revealed text
@@ -1878,6 +1931,7 @@ async function revealHiddenContent(page) {
 
       } catch (err) {
         // Single trigger failure — continue with others
+        console.log(`[UI-REVEAL] Trigger failed: ${trigger.type} "${(trigger.text || "").slice(0, 40)}"`);
       }
     }
 
@@ -1892,891 +1946,604 @@ async function revealHiddenContent(page) {
   return results;
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
-// ██████████████████████████████████████████████████████████████████████████
-// ███  NEW: STRUCTURED CONTENT EXTRACTION                               ███
-// ███  Extracts services, packages, FAQ, features as structured JSON    ███
-// ██████████████████████████████████████████████████████████████████████████
+// STRUCTURED EXTRACTION (main readable content per page)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * extractStructuredSections(page)
- *
- * Goes beyond rawContent — extracts structured JSON:
- *   services[], packages[], faq[], features[], contacts[]
- *
- * This is what NEO needs to NOT hallucinate.
- */
-async function extractStructuredSections(page) {
-  return await page.evaluate(() => {
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+async function extractStructured(page, url) {
+  return await page.evaluate((pageUrl) => {
+    const cleanText = (s) =>
+      (s || "")
+        .replace(/\r/g, "")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+    const normLine = (s) => cleanText(s).replace(/\s+/g, " ").trim();
+
     const isVisible = (el) => {
       try {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 &&
-               style.display !== "none" && style.visibility !== "hidden";
+        const st = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return (
+          st.display !== "none" &&
+          st.visibility !== "hidden" &&
+          +st.opacity !== 0 &&
+          r.width > 0 &&
+          r.height > 0
+        );
       } catch { return false; }
     };
 
-    // ═══════ SERVICES ═══════
-    const services = [];
-    const serviceSelectors = [
-      '[class*="service"]', '[class*="uslugi"]', '[class*="usluga"]',
-      '[class*="offering"]', '[id*="service"]', '[id*="uslugi"]',
+    const getText = (el) => cleanText(el?.innerText || el?.textContent || "");
+
+    const unique = (arr) => Array.from(new Set(arr.filter(Boolean)));
+
+    // Remove obvious junk areas from text extraction
+    const junkSelectors = [
+      "script","style","noscript","svg","canvas",
+      "nav","header","footer","aside",
+      "[role='navigation']","[aria-label='breadcrumb']",
+      ".cookie",".cookies",".gdpr",".consent",".popup-newsletter"
     ];
+    const junkNodes = Array.from(document.querySelectorAll(junkSelectors.join(",")));
 
-    // Find service cards/items
-    for (const sel of serviceSelectors) {
-      try {
-        document.querySelectorAll(sel).forEach(container => {
-          if (!isVisible(container)) return;
-          const heading = container.querySelector("h1,h2,h3,h4,h5,h6,strong,[class*='title']");
-          const title = norm(heading?.innerText || heading?.textContent || "");
-          if (!title || title.length < 3 || title.length > 120) return;
+    const isInsideJunk = (el) => junkNodes.some(j => j.contains(el));
 
-          const desc = norm(container.innerText || container.textContent || "");
-          if (desc.length < 10) return;
+    // HEADINGS
+    const headings = [];
+    document.querySelectorAll("h1,h2,h3").forEach(el => {
+      if (!isVisible(el) || isInsideJunk(el)) return;
+      const text = normLine(getText(el));
+      if (text && text.length >= 2 && text.length <= 180) headings.push(text);
+    });
 
-          // Find price if present
-          const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
-          const price = priceMatch ? norm(priceMatch[0]) : null;
+    // SECTIONS (heading + nearby text)
+    const sections = [];
+    document.querySelectorAll("section, article, main > div, .section, .container").forEach(root => {
+      if (!isVisible(root) || isInsideJunk(root)) return;
 
-          // Find features/bullets
-          const features = [];
-          container.querySelectorAll("li").forEach(li => {
-            const t = norm(li.innerText || li.textContent || "");
-            if (t && t.length >= 3 && t.length <= 200) features.push(t);
-          });
+      const titleEl = root.querySelector("h1,h2,h3,h4");
+      const title = normLine(getText(titleEl));
+      let body = normLine(getText(root));
+      if (!body || body.length < 40) return;
 
-          // Avoid duplicates
-          if (services.some(s => s.title === title)) return;
+      // keep section compact
+      body = body.slice(0, 2500);
 
-          services.push({
-            title,
-            description: desc.slice(0, 500),
-            price,
-            features: features.slice(0, 20),
-          });
-        });
-      } catch {}
+      // avoid giant duplicates
+      const key = `${title}__${body.slice(0,120)}`;
+      sections.push({ title, body, key });
+    });
+
+    const dedupSectionMap = new Map();
+    sections.forEach(s => {
+      if (!dedupSectionMap.has(s.key)) dedupSectionMap.set(s.key, { title: s.title, body: s.body });
+    });
+
+    // FAQ-ish
+    const faqs = [];
+    document.querySelectorAll("details, .faq, .accordion, [class*='faq']").forEach(root => {
+      if (!isVisible(root) || isInsideJunk(root)) return;
+      const txt = normLine(getText(root));
+      if (txt && txt.length >= 20) faqs.push(txt.slice(0, 1200));
+    });
+
+    // PRICE LINES
+    const priceRe = /(\d{1,3}(?:[ \u00A0]?\d{3})*(?:[.,]\d{1,2})?\s?(?:лв\.?|BGN|EUR|€|\$|лева))/i;
+    const priceLines = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const parent = node.parentElement;
+      if (!parent || !isVisible(parent) || isInsideJunk(parent)) continue;
+      const t = normLine(node.textContent || "");
+      if (!t || t.length > 300) continue;
+      if (priceRe.test(t)) priceLines.push(t);
     }
 
-    // Also try to find services by common page structure patterns
-    if (services.length === 0) {
-      try {
-        // Look for repeating card patterns with headings + descriptions
-        const cards = document.querySelectorAll(
-          '.card, .item, [class*="card"], [class*="item"], article, ' +
-          '[class*="box"], [class*="feature-box"], [class*="service-box"]'
-        );
-        cards.forEach(card => {
-          if (!isVisible(card)) return;
-          const heading = card.querySelector("h2,h3,h4,h5");
-          const title = norm(heading?.innerText || "");
-          if (!title || title.length < 3 || title.length > 120) return;
+    // CTA / button texts
+    const buttons = [];
+    document.querySelectorAll("button, a, [role='button']").forEach(el => {
+      if (!isVisible(el) || isInsideJunk(el)) return;
+      const t = normLine(getText(el));
+      if (!t || t.length < 2 || t.length > 80) return;
+      buttons.push(t);
+    });
 
-          const desc = norm(card.innerText || "");
-          if (desc.length < 20) return;
+    // CONTACTS from DOM
+    const emails = [];
+    const phones = [];
+    document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
+      const v = (a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0].trim();
+      if (v) emails.push(v);
+    });
+    document.querySelectorAll('a[href^="tel:"]').forEach(a => {
+      const v = (a.getAttribute("href") || "").replace(/^tel:/i, "").trim();
+      if (v) phones.push(v);
+    });
 
-          const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
-          const price = priceMatch ? norm(priceMatch[0]) : null;
+    // Main body text compact
+    let mainText = "";
+    const mainCandidates = [
+      document.querySelector("main"),
+      document.querySelector("article"),
+      document.body
+    ].filter(Boolean);
 
-          const features = [];
-          card.querySelectorAll("li").forEach(li => {
-            const t = norm(li.innerText || "");
-            if (t && t.length >= 3 && t.length <= 200) features.push(t);
-          });
-
-          if (services.some(s => s.title === title)) return;
-          services.push({ title, description: desc.slice(0, 500), price, features: features.slice(0, 20) });
-        });
-      } catch {}
+    for (const c of mainCandidates) {
+      const txt = cleanText(c.innerText || "");
+      if (txt && txt.length > mainText.length) mainText = txt;
     }
 
-    // ═══════ FAQ ═══════
-    const faq = [];
-
-    // Method 1: <details>/<summary> pattern
-    document.querySelectorAll("details").forEach(d => {
-      const summary = d.querySelector("summary");
-      const question = norm(summary?.innerText || summary?.textContent || "");
-      if (!question || question.length < 5) return;
-
-      // Get answer: everything except summary
-      const answerParts = [];
-      Array.from(d.children).forEach(child => {
-        if (child.tagName?.toLowerCase() === "summary") return;
-        const t = norm(child.innerText || child.textContent || "");
-        if (t) answerParts.push(t);
-      });
-      const answer = answerParts.join(" ").slice(0, 1000);
-      if (answer) faq.push({ question, answer });
+    // Pull dialog text if open dialogs still exist
+    const dialogTexts = [];
+    document.querySelectorAll(
+      '[role="dialog"], .modal.show, .modal.in, [data-radix-dialog-content], [data-state="open"][role="dialog"]'
+    ).forEach(d => {
+      if (!isVisible(d)) return;
+      const txt = normLine(getText(d));
+      if (txt && txt.length > 20) dialogTexts.push(txt.slice(0, 8000));
     });
 
-    // Method 2: Accordion patterns (common in FAQ sections)
-    const faqContainers = document.querySelectorAll(
-      '[class*="faq"], [id*="faq"], [class*="accordion"], ' +
-      '[class*="vuprosi"], [id*="vuprosi"], [class*="questions"]'
-    );
-    faqContainers.forEach(container => {
-      // Look for question/answer pairs
-      const items = container.querySelectorAll(
-        '.accordion-item, [class*="faq-item"], [class*="question"], ' +
-        '[class*="accordion-header"], dt'
-      );
-      items.forEach(item => {
-        const questionEl = item.querySelector(
-          '.accordion-button, [class*="question"], button, h3, h4, dt, summary, [class*="title"]'
-        ) || item;
-        const question = norm(questionEl.innerText || questionEl.textContent || "");
-        if (!question || question.length < 5) return;
-
-        // Try to find corresponding answer
-        let answer = "";
-        const nextSib = item.nextElementSibling;
-        if (nextSib && /collapse|answer|content|body|panel/i.test(nextSib.className || "")) {
-          answer = norm(nextSib.innerText || nextSib.textContent || "");
-        }
-
-        // Also check inside item for answer panel
-        if (!answer) {
-          const answerEl = item.querySelector(
-            '.accordion-body, .accordion-content, [class*="answer"], ' +
-            '[class*="content"], [class*="body"], [class*="panel"], dd'
-          );
-          if (answerEl) {
-            answer = norm(answerEl.innerText || answerEl.textContent || "");
-          }
-        }
-
-        if (answer && !faq.some(f => f.question === question)) {
-          faq.push({ question, answer: answer.slice(0, 1000) });
-        }
-      });
-    });
-
-    // ═══════ FEATURES ═══════
-    const features = [];
-    const featureContainers = document.querySelectorAll(
-      '[class*="feature"], [class*="benefit"], [class*="advantage"], ' +
-      '[class*="why-us"], [class*="why_us"], [class*="предимств"], ' +
-      '[class*="услуг"], [id*="feature"], [id*="benefit"]'
-    );
-    featureContainers.forEach(container => {
-      if (!isVisible(container)) return;
-      const heading = container.querySelector("h2,h3,h4,h5,[class*='title'],strong");
-      const title = norm(heading?.innerText || "");
-      const desc = norm(container.innerText || "");
-
-      if (title && title.length >= 3 && title.length <= 120 && desc.length >= 10) {
-        if (!features.some(f => f.title === title)) {
-          features.push({ title, description: desc.slice(0, 300) });
-        }
-      }
-    });
-
-    // ═══════ PACKAGES (separate from pricing — looks for named bundles) ═══════
-    const packages = [];
-    const pkgContainers = document.querySelectorAll(
-      '[class*="package"], [class*="plan"], [class*="пакет"], ' +
-      '[class*="tier"], [class*="bundle"], [id*="package"], [id*="plan"]'
-    );
-    pkgContainers.forEach(container => {
-      if (!isVisible(container)) return;
-      const heading = container.querySelector("h2,h3,h4,h5,[class*='title'],strong,b");
-      const title = norm(heading?.innerText || "");
-      if (!title || title.length < 3 || title.length > 120) return;
-
-      const desc = norm(container.innerText || "");
-      const priceMatch = desc.match(/(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/i);
-      const price = priceMatch ? norm(priceMatch[0]) : null;
-
-      const included = [];
-      container.querySelectorAll("li").forEach(li => {
-        const t = norm(li.innerText || "");
-        if (t && t.length >= 3 && t.length <= 200) included.push(t);
-      });
-
-      if (!packages.some(p => p.title === title)) {
-        packages.push({
-          title,
-          price,
-          description: desc.slice(0, 500),
-          included: included.slice(0, 30),
-        });
-      }
-    });
-
+    // Final compact payload
     return {
-      services: services.slice(0, 30),
-      packages: packages.slice(0, 20),
-      faq: faq.slice(0, 50),
-      features: features.slice(0, 30),
+      url: pageUrl,
+      title: document.title || "",
+      headings: unique(headings).slice(0, 80),
+      sections: Array.from(dedupSectionMap.values()).slice(0, 40),
+      faqs: unique(faqs).slice(0, 30),
+      prices: unique(priceLines).slice(0, 60),
+      buttons: unique(buttons).slice(0, 80),
+      contacts: {
+        emails: unique(emails).slice(0, 20),
+        phones: unique(phones).slice(0, 20),
+      },
+      dialog_texts: unique(dialogTexts).slice(0, 20),
+      text: mainText.slice(0, 20000),
     };
-  });
+  }, url);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PAGE PROCESSING
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function processPage(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(1200).catch(() => {});
+
+  // Small scroll to trigger lazy areas
+  for (let i = 0; i < MAX_SCROLL_STEPS; i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.7))).catch(() => {});
+    await page.waitForTimeout(SCROLL_STEP_MS).catch(() => {});
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+
+  // Reveal hidden UI content
+  const uiReveal = await revealHiddenContent(page).catch(() => ({
+    revealedTexts: [],
+    dialogTexts: [],
+    clickCount: 0,
+  }));
+
+  const structured = await extractStructured(page, url).catch(() => ({
+    url,
+    title: "",
+    headings: [],
+    sections: [],
+    faqs: [],
+    prices: [],
+    buttons: [],
+    contacts: { emails: [], phones: [] },
+    dialog_texts: [],
+    text: "",
+  }));
+
+  const contactsDom = await extractContactsFromPage(page);
+  const contactsText = extractContactsFromText(
+    [
+      structured.text || "",
+      structured.sections.map(s => `${s.title}\n${s.body}`).join("\n\n"),
+      uiReveal.dialogTexts.join("\n\n"),
+      contactsDom.textHints || "",
+    ].join("\n\n")
+  );
+
+  const pricing = await extractPricingFromPage(page).catch(() => ({
+    pricing_cards: [],
+    installment_plans: [],
+  }));
+
+  const rawSiteMap = await extractSiteMapFromPage(page).catch(() => ({
+    url,
+    title: structured.title || "",
+    buttons: [],
+    forms: [],
+    prices: [],
+  }));
+
+  const caps = await extractCapabilitiesFromPage(page).catch(() => ({
+    url,
+    forms: [],
+    wizards: [],
+    iframes: [],
+    availability: [],
+  }));
+
+  const mergedContacts = {
+    emails: Array.from(new Set([...(contactsDom.emails || []), ...(contactsText.emails || [])])).slice(0, 20),
+    phones: Array.from(new Set([...(contactsDom.phones || []), ...(contactsText.phones || [])])).slice(0, 20),
+  };
+
+  return {
+    url,
+    title: structured.title || "",
+    page_type: detectPageType(url, structured.title || ""),
+    headings: structured.headings || [],
+    sections: structured.sections || [],
+    faqs: structured.faqs || [],
+    prices: structured.prices || [],
+    pricing_cards: pricing.pricing_cards || [],
+    installment_plans: pricing.installment_plans || [],
+    buttons: structured.buttons || [],
+    text: structured.text || "",
+    dialog_texts: Array.from(new Set([...(structured.dialog_texts || []), ...(uiReveal.dialogTexts || [])])).slice(0, 30),
+    contacts: mergedContacts,
+    ui_clicks: uiReveal.clickCount || 0,
+    raw_site_map: rawSiteMap,
+    capabilities: caps,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
-// EXISTING EXTRACTION FUNCTIONS (enhanced)
+// URL DISCOVERY
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function extractStructured(page) {
-  try {
-    await page.waitForSelector("body", { timeout: 1500 });
-  } catch {}
+async function discoverInternalLinks(page, baseUrl) {
+  return await page.evaluate((origin) => {
+    const out = new Set();
+    document.querySelectorAll("a[href]").forEach(a => {
+      const href = a.getAttribute("href") || "";
+      if (!href) return;
+      if (/^(mailto:|tel:|javascript:|#)/i.test(href)) return;
 
-  try {
-    return await page.evaluate(() => {
-      const seenTexts = new Set();
-
-      function addUniqueText(text, minLength = 10) {
-        const normalized = text.trim().replace(/\s+/g, ' ');
-        if (normalized.length < minLength || seenTexts.has(normalized)) return "";
-        seenTexts.add(normalized);
-        return normalized;
-      }
-
-      const norm = (s = "") => s.replace(/\s+/g, " ").trim();
-
-      const extractTableText = (table) => {
-        const rows = [];
-        table.querySelectorAll("tr").forEach((tr) => {
-          const cells = Array.from(tr.querySelectorAll("th, td"))
-            .map((cell) => norm(cell.innerText || cell.textContent || ""))
-            .filter(Boolean);
-          if (cells.length > 0) rows.push(cells.join(" | "));
-        });
-        return rows.join("\n");
-      };
-
-      const extractDetailsContent = (detailsEl) => {
-        const parts = [];
-        const summaryEl = detailsEl.querySelector(":scope > summary");
-        const summaryText = norm(summaryEl?.innerText || summaryEl?.textContent || "");
-        if (summaryText) parts.push(summaryText);
-
-        Array.from(detailsEl.children).forEach((child) => {
-          if (child.tagName?.toLowerCase() === "summary") return;
-          child.querySelectorAll?.("table").forEach((table) => {
-            const tableText = extractTableText(table);
-            if (tableText) parts.push(tableText);
-          });
-          const textWithoutTables = norm(
-            Array.from(child.childNodes)
-              .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.tagName?.toLowerCase() === "table"))
-              .map((node) => node.textContent || "")
-              .join(" ")
-          );
-          if (textWithoutTables) parts.push(textWithoutTables);
-        });
-
-        return parts.filter(Boolean).join("\n");
-      };
-
-      const detailsTexts = [];
       try {
-        const detailsBlocks = Array.from(document.querySelectorAll("details.wp-block-details, details"));
-        detailsBlocks.forEach((el) => {
-          try {
-            const summary = el.querySelector(":scope > summary");
-            el.open = true;
-            el.setAttribute("open", "");
-            try { summary?.click(); } catch {}
-            el.open = true;
-            el.setAttribute("open", "");
-            const blockText = extractDetailsContent(el);
-            const uniqueText = addUniqueText(blockText, 5);
-            if (uniqueText) detailsTexts.push(uniqueText);
-          } catch {}
-        });
+        const u = new URL(href, origin);
+        if (u.origin !== new URL(origin).origin) return;
+        out.add(u.toString());
       } catch {}
-
-      const sections = [];
-      let current = null;
-      const processedElements = new Set();
-
-      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
-        if (processedElements.has(el)) return;
-        if (el.closest("details.wp-block-details, details")) return;
-        let parent = el.parentElement;
-        while (parent) {
-          if (processedElements.has(parent)) return;
-          parent = parent.parentElement;
-        }
-        const text = el.innerText?.trim();
-        if (!text) return;
-        const uniqueText = addUniqueText(text, 5);
-        if (!uniqueText) return;
-        if (el.tagName.startsWith("H")) {
-          current = { heading: uniqueText, text: "" };
-          sections.push(current);
-        } else if (current) {
-          current.text += " " + uniqueText;
-        }
-        processedElements.add(el);
-      });
-
-      const overlaySelectors = [
-        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
-        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
-        '[class*="alert"]', '[style*="position: fixed"]',
-        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
-      ];
-
-      const overlayTexts = [];
-      overlaySelectors.forEach(selector => {
-        try {
-          document.querySelectorAll(selector).forEach(el => {
-            if (processedElements.has(el)) return;
-            const text = el.innerText?.trim();
-            if (!text) return;
-            const uniqueText = addUniqueText(text);
-            if (uniqueText) {
-              overlayTexts.push(uniqueText);
-              processedElements.add(el);
-            }
-          });
-        } catch {}
-      });
-
-      const pseudoTexts = [];
-      try {
-        document.querySelectorAll("*").forEach(el => {
-          const before = window.getComputedStyle(el, "::before").content;
-          const after = window.getComputedStyle(el, "::after").content;
-          if (before && before !== "none" && before !== '""') {
-            const cleaned = before.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-          if (after && after !== "none" && after !== '""') {
-            const cleaned = after.replace(/^["']|["']$/g, "");
-            const uniqueText = addUniqueText(cleaned, 3);
-            if (uniqueText) pseudoTexts.push(uniqueText);
-          }
-        });
-      } catch {}
-
-      let mainContent = "";
-      const mainEl = document.querySelector("main") || document.querySelector("article");
-      if (mainEl && !processedElements.has(mainEl)) {
-        const text = mainEl.innerText?.trim();
-        if (text) mainContent = addUniqueText(text) || "";
-      }
-
-      const isVisible = (el) => {
-        try {
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-        } catch {
-          return false;
-        }
-      };
-
-      const topControlTexts = [];
-      const seenControls = new Set();
-      try {
-        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], summary');
-        controls.forEach((el) => {
-          if (!isVisible(el)) return;
-          const rect = el.getBoundingClientRect();
-          if (rect.top > Math.max(window.innerHeight + 250, 1100)) return;
-          const parts = [
-            el.textContent || "",
-            el.getAttribute?.("aria-label") || "",
-            el.getAttribute?.("placeholder") || "",
-            el.getAttribute?.("value") || "",
-            el.getAttribute?.("title") || "",
-          ].join(" ").replace(/\s+/g, " ").trim();
-          if (!parts || parts.length < 2 || parts.length > 80) return;
-          const key = parts.toLowerCase();
-          if (seenControls.has(key)) return;
-          seenControls.add(key);
-          topControlTexts.push(parts);
-        });
-      } catch {}
-
-      // NEW: Also extract text from currently-visible accordion/tab panels
-      const expandedPanelTexts = [];
-      try {
-        // Accordion panels that are now expanded/shown
-        document.querySelectorAll(
-          '.accordion-collapse.show, .collapse.show, ' +
-          '[class*="accordion-body"]:not([style*="display: none"]), ' +
-          '[class*="tab-pane"].active, [class*="tab-content"] > .active, ' +
-          '[role="tabpanel"]:not([hidden]), ' +
-          '[class*="panel"]:not([style*="display: none"]):not([hidden])'
-        ).forEach(panel => {
-          if (!isVisible(panel)) return;
-          const text = norm(panel.innerText || panel.textContent || "");
-          if (text && text.length > 10) {
-            const uniqueText = addUniqueText(text, 10);
-            if (uniqueText) expandedPanelTexts.push(uniqueText);
-          }
-        });
-      } catch {}
-
-      return {
-        rawContent: [
-          detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
-          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
-          mainContent,
-          overlayTexts.join("\n"),
-          pseudoTexts.join(" "),
-          expandedPanelTexts.length ? `EXPANDED_PANELS\n${expandedPanelTexts.join("\n\n")}` : "",
-          topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
-        ].filter(Boolean).join("\n\n"),
-      };
     });
-  } catch (e) {
-    return { rawContent: "" };
-  }
-}
-
-// ================= LINK DISCOVERY =================
-async function collectAllLinks(page, base) {
-  try {
-    return await page.evaluate(base => {
-      const urls = new Set();
-      document.querySelectorAll("a[href]").forEach(a => {
-        try {
-          const u = new URL(a.href, base);
-          if (u.origin === base) urls.add(u.href.split("#")[0]);
-        } catch {}
-      });
-      return Array.from(urls);
-    }, base);
-  } catch { return []; }
+    return Array.from(out);
+  }, baseUrl).catch(() => []);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ██████████████████████████████████████████████████████████████████████████
-// ███  PROCESS SINGLE PAGE - REWRITTEN WITH UI INTERACTION              ███
-// ██████████████████████████████████████████████████████████████████████████
+// BUILD SUMMARY / HTML CONTENT
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
-  const startTime = Date.now();
+function buildSummary(result) {
+  const lines = [];
 
-  try {
-    console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+  lines.push(`SITE: ${result.url || ""}`);
+  if (result.title) lines.push(`TITLE: ${result.title}`);
 
-    // Step 1: Scroll for lazy load (unchanged)
-    await page.evaluate(async ({ stepMs, maxSteps }) => {
-      const scrollStep = window.innerHeight;
-      const maxScroll = document.body.scrollHeight;
-      const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
-      for (let i = 0; i <= steps; i++) {
-        window.scrollTo(0, i * scrollStep);
-        await new Promise(r => setTimeout(r, stepMs));
-      }
-      window.scrollTo(0, maxScroll);
-      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
-        img.loading = 'eager';
-        if (img.dataset.src) img.src = img.dataset.src;
-        if (img.dataset.lazy) img.src = img.dataset.lazy;
-      });
-    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
-
-    await page.waitForTimeout(150);
-    try {
-      await page.waitForLoadState('networkidle', { timeout: 1500 });
-    } catch {}
-
-    // ═══════════════════════════════════════════════
-    // Step 2: ★ NEW — UI INTERACTION LAYER ★
-    // Click tabs, accordions, dialogs, "show more"
-    // BEFORE extracting content
-    // ═══════════════════════════════════════════════
-    let uiRevealResult = { revealedTexts: [], dialogTexts: [], clickCount: 0 };
-    try {
-      uiRevealResult = await revealHiddenContent(page);
-    } catch (e) {
-      console.error("[UI-REVEAL] Failed:", e.message);
-    }
-
-    // Scroll back to top so we don't miss anything
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(100);
-
-    const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
-    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
-
-    // Step 3: Extract structured content (now includes expanded panels from Step 2)
-    const data = await extractStructured(page);
-
-    // ═══════════════════════════════════════════════
-    // Step 4: ★ NEW — STRUCTURED SECTIONS ★
-    // Extract services, packages, FAQ, features
-    // ═══════════════════════════════════════════════
-    let structuredSections = { services: [], packages: [], faq: [], features: [] };
-    try {
-      structuredSections = await extractStructuredSections(page);
-      const sectionCounts = [
-        structuredSections.services.length && `${structuredSections.services.length} services`,
-        structuredSections.packages.length && `${structuredSections.packages.length} packages`,
-        structuredSections.faq.length && `${structuredSections.faq.length} faq`,
-        structuredSections.features.length && `${structuredSections.features.length} features`,
-      ].filter(Boolean);
-      if (sectionCounts.length > 0) {
-        console.log(`[STRUCTURED] ${sectionCounts.join(", ")}`);
-      }
-    } catch (e) {
-      console.error("[STRUCTURED] Extract error:", e.message);
-    }
-
-    // Step 5: Pricing/package structured extraction (unchanged)
-    let pricing = null;
-    try {
-      pricing = await extractPricingFromPage(page);
-      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
-      }
-    } catch (e) {
-      console.error("[PRICING] Extract error:", e.message);
-    }
-
-    // Step 6: SiteMap extraction (unchanged)
-    try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
-      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
-        siteMaps.push(rawSiteMap);
-        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
-      }
-    } catch (e) {
-      console.error("[SITEMAP] Extract error:", e.message);
-    }
-
-    // Step 7: Capabilities extraction (unchanged)
-    try {
-      const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
-        capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
-      }
-    } catch (e) {
-      console.error("[CAPS] Extract error:", e.message);
-    }
-
-    // Step 8: Build final content — now includes dialog content from UI interactions
-    let htmlContent = normalizeNumbers(clean(data.rawContent));
-
-    // Append dialog content that was captured by UI interaction
-    if (uiRevealResult.dialogTexts.length > 0) {
-      const dialogSection = "DIALOG_CONTENT\n" + uiRevealResult.dialogTexts.map(t => clean(t)).filter(Boolean).join("\n\n");
-      htmlContent = htmlContent + "\n\n" + dialogSection;
-    }
-
-    const content = htmlContent;
-
-    // Step 9: Contacts extraction (unchanged)
-    const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
-
-    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
-    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
-
-    const contacts = {
-      emails: mergedEmails,
-      phones: mergedPhones,
-    };
-
-    if (contacts.emails.length || contacts.phones.length) {
-      console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
-    }
-
-    const totalWords = countWordsExact(htmlContent);
-
-    const elapsed = Date.now() - startTime;
-    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms (${uiRevealResult.clickCount} UI clicks)`);
-
-    if (pageType !== "services" && totalWords < MIN_WORDS) {
-      return { links: await collectAllLinks(page, base), page: null };
-    }
-
-    return {
-      links: await collectAllLinks(page, base),
-      page: {
-        url,
-        title,
-        pageType,
-        content,
-        // ★ ENHANCED structured output — now includes services, packages, faq, features
-        structured: {
-          pricing,
-          contacts,
-          services: structuredSections.services,
-          packages: structuredSections.packages,
-          faq: structuredSections.faq,
-          features: structuredSections.features,
-          // Track what UI interactions happened
-          ui_interactions: uiRevealResult.clickCount > 0 ? {
-            clicks: uiRevealResult.clickCount,
-            dialogs_captured: uiRevealResult.dialogTexts.length,
-          } : null,
-        },
-        wordCount: totalWords,
-        status: "ok",
-      }
-    };
-  } catch (e) {
-    console.error("[PAGE ERROR]", url, e.message);
-    stats.errors++;
-    return { links: [], page: null };
+  if (result.contacts?.emails?.length || result.contacts?.phones?.length) {
+    lines.push(`CONTACTS:`);
+    if (result.contacts.emails?.length) lines.push(`Emails: ${result.contacts.emails.join(", ")}`);
+    if (result.contacts.phones?.length) lines.push(`Phones: ${result.contacts.phones.join(", ")}`);
   }
+
+  if (result.pages?.length) {
+    for (const p of result.pages) {
+      lines.push(`\n=== PAGE: ${p.url} ===`);
+      if (p.title) lines.push(`Title: ${p.title}`);
+      if (p.headings?.length) lines.push(`Headings: ${p.headings.slice(0, 12).join(" | ")}`);
+
+      if (p.pricing_cards?.length) {
+        lines.push(`Pricing Cards:`);
+        p.pricing_cards.slice(0, 8).forEach(card => {
+          lines.push(`- ${card.title || "Untitled"} | ${card.price_text || ""} | ${card.badge || ""}`);
+          if (card.features?.length) lines.push(`  Features: ${card.features.slice(0, 8).join(" ; ")}`);
+        });
+      }
+
+      if (p.installment_plans?.length) {
+        lines.push(`Installment Plans:`);
+        p.installment_plans.slice(0, 8).forEach(card => {
+          lines.push(`- ${card.title || "Untitled"} | ${card.price_text || ""}`);
+        });
+      }
+
+      if (p.sections?.length) {
+        lines.push(`Sections:`);
+        p.sections.slice(0, 10).forEach(s => {
+          lines.push(`- ${s.title || "(no title)"}: ${String(s.body || "").slice(0, 500)}`);
+        });
+      }
+
+      if (p.faqs?.length) {
+        lines.push(`FAQ:`);
+        p.faqs.slice(0, 8).forEach(f => lines.push(`- ${String(f).slice(0, 400)}`));
+      }
+
+      if (p.dialog_texts?.length) {
+        lines.push(`Dialog Content:`);
+        p.dialog_texts.slice(0, 10).forEach(d => lines.push(`- ${String(d).slice(0, 800)}`));
+      }
+
+      if (p.prices?.length) {
+        lines.push(`Price Lines:`);
+        p.prices.slice(0, 15).forEach(pr => lines.push(`- ${pr}`));
+      }
+    }
+  }
+
+  return clean(lines.join("\n"));
 }
 
-// ================= PARALLEL CRAWLER =================
-async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
-  const effectiveMs = deadlineMs
-    ? Math.min(deadlineMs, MAX_SECONDS * 1000)
-    : MAX_SECONDS * 1000;
-  const deadline = Date.now() + effectiveMs;
-  console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, deadline in ${Math.round(effectiveMs / 1000)}s`);
-  if (siteId) console.log(`[SITE ID] ${siteId}`);
+function buildHtmlContent(result) {
+  const parts = [];
 
+  for (const p of result.pages || []) {
+    parts.push(`\n<!-- PAGE: ${p.url} -->`);
+
+    if (p.title) parts.push(`<h1>${p.title}</h1>`);
+
+    (p.headings || []).forEach(h => {
+      parts.push(`<h2>${h}</h2>`);
+    });
+
+    (p.sections || []).forEach(s => {
+      const title = s.title ? `<h3>${s.title}</h3>` : "";
+      parts.push(`<section>${title}<p>${String(s.body || "").replace(/\n/g, "<br>")}</p></section>`);
+    });
+
+    if (p.dialog_texts?.length) {
+      parts.push(`<section><h3>DIALOG_CONTENT</h3>`);
+      p.dialog_texts.forEach(d => {
+        parts.push(`<div>${String(d).replace(/\n/g, "<br>")}</div>`);
+      });
+      parts.push(`</section>`);
+    }
+
+    if (p.faqs?.length) {
+      parts.push(`<section><h3>FAQ</h3>`);
+      p.faqs.forEach(f => parts.push(`<p>${String(f).replace(/\n/g, "<br>")}</p>`));
+      parts.push(`</section>`);
+    }
+  }
+
+  return clean(parts.join("\n"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN CRAWL
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function crawlSite(siteUrl) {
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
 
-  const stats = {
-    visited: 0,
-    saved: 0,
-    byType: {},
-    errors: 0,
-  };
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 2200 },
+    locale: "bg-BG",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+  });
 
-  const pages = [];
-  const queue = [];
-  const siteMaps = [];
-  const capabilitiesMaps = [];
-  let base = "";
+  const seedPage = await context.newPage();
 
-  const contactAgg = { emails: new Set(), phones: new Set() };
+  let origin = siteUrl;
+  try {
+    const u = new URL(siteUrl);
+    origin = `${u.protocol}//${u.host}`;
+  } catch {}
+
+  const pagesToVisit = [siteUrl];
+  const pageResults = [];
+  const perPageSiteMaps = [];
+  const perPageCaps = [];
+  const startedAt = Date.now();
 
   try {
-    const initContext = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    });
-    const initPage = await initContext.newPage();
+    await seedPage.goto(siteUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    await seedPage.waitForTimeout(1200).catch(() => {});
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
-    base = new URL(initPage.url()).origin;
+    const discovered = await discoverInternalLinks(seedPage, origin);
+    const filtered = discovered
+      .map(normalizeUrl)
+      .filter(Boolean)
+      .filter(u => !SKIP_URL_RE.test(u))
+      .slice(0, 25);
 
-    const initialLinks = await collectAllLinks(initPage, base);
-    queue.push(normalizeUrl(initPage.url()));
-    initialLinks.forEach(l => {
-      const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
-        queue.push(nl);
-      }
-    });
-
-    await initPage.close();
-    await initContext.close();
-
-    console.log(`[CRAWL] Found ${queue.length} URLs`);
-
-    const createWorker = async () => {
-      const ctx = await browser.newContext({
-        viewport: { width: 1920, height: 1080 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      });
-      const pg = await ctx.newPage();
-
-      while (Date.now() < deadline) {
-        let url = null;
-        while (queue.length > 0) {
-          const candidate = queue.shift();
-          const normalized = normalizeUrl(candidate);
-          if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
-            visited.add(normalized);
-            url = normalized;
-            break;
-          }
-        }
-
-        if (!url) {
-          await new Promise(r => setTimeout(r, 30));
-          if (queue.length === 0) break;
-          continue;
-        }
-
-        stats.visited++;
-
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
-
-        if (result.page) {
-          const c = result.page?.structured?.contacts;
-          if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
-          if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
-
-          pages.push(result.page);
-          stats.saved++;
-        }
-
-        result.links.forEach(l => {
-          const nl = normalizeUrl(l);
-          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
-            queue.push(nl);
-          }
-        });
-      }
-
-      await pg.close();
-      await ctx.close();
-    };
-
-    await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
-
-  } finally {
-    await browser.close();
-    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
-  }
-
-  let combinedSiteMap = null;
-  if (siteMaps.length > 0 && siteId) {
-    console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
-    const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
-    combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
-    await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap);
-  }
-
-  let combinedCapabilities = [];
-  if (capabilitiesMaps.length > 0) {
-    combinedCapabilities = buildCombinedCapabilities(capabilitiesMaps, base);
-    console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/wizards/widgets/availability)`);
-  }
-
-  const contacts = {
-    emails: Array.from(contactAgg.emails).filter(Boolean).slice(0, 20),
-    phones: Array.from(contactAgg.phones).filter(Boolean).slice(0, 20),
-  };
-
-  if (contacts.emails.length || contacts.phones.length) {
-    console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
-  }
-
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
-}
-
-// ================= HTTP SERVER =================
-http
-  .createServer((req, res) => {
-    if (req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({
-        status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
-        crawlInProgress,
-        crawlFinished,
-        lastCrawlUrl,
-        lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
-        resultAvailable: !!lastResult,
-        pagesCount: lastResult?.pages?.length || 0,
-        capabilitiesCount: lastResult?.capabilities?.length || 0,
-        contacts: lastResult?.contacts || null,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
-      }));
+    for (const u of filtered) {
+      if (!pagesToVisit.includes(u)) pagesToVisit.push(u);
     }
 
-    if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Method not allowed" }));
+    await seedPage.close().catch(() => {});
+  } catch {
+    await seedPage.close().catch(() => {});
+  }
+
+  const queue = pagesToVisit.slice(0, 20);
+  const workers = [];
+
+  async function workerLoop() {
+    while (queue.length && (Date.now() - startedAt) < MAX_SECONDS * 1000) {
+      const next = queue.shift();
+      if (!next) break;
+      const normalized = normalizeUrl(next);
+      if (visited.has(normalized)) continue;
+      visited.add(normalized);
+
+      const page = await context.newPage();
+      try {
+        console.log(`[CRAWL] Visiting ${normalized}`);
+        const pageData = await processPage(page, normalized);
+
+        const sectionText = [
+          pageData.title || "",
+          ...(pageData.headings || []),
+          ...(pageData.sections || []).map(s => `${s.title}\n${s.body}`),
+          ...(pageData.dialog_texts || []),
+          ...(pageData.faqs || []),
+          pageData.text || "",
+        ].join("\n\n");
+
+        if (countWordsExact(sectionText) >= MIN_WORDS) {
+          pageResults.push(pageData);
+          if (pageData.raw_site_map) perPageSiteMaps.push(enrichSiteMap(pageData.raw_site_map, normalizeDomain(siteUrl), siteUrl));
+          if (pageData.capabilities) perPageCaps.push(pageData.capabilities);
+        }
+      } catch (err) {
+        console.error(`[CRAWL] Page failed ${normalized}:`, err.message);
+      } finally {
+        await page.close().catch(() => {});
+      }
+    }
+  }
+
+  for (let i = 0; i < PARALLEL_TABS; i++) {
+    workers.push(workerLoop());
+  }
+
+  await Promise.allSettled(workers);
+
+  await context.close().catch(() => {});
+  await browser.close().catch(() => {});
+
+  const rootTitle = pageResults.find(p => p.url === normalizeUrl(siteUrl))?.title || pageResults[0]?.title || "";
+  const contacts = {
+    emails: Array.from(new Set(pageResults.flatMap(p => p.contacts?.emails || []))).slice(0, 20),
+    phones: Array.from(new Set(pageResults.flatMap(p => p.contacts?.phones || []))).slice(0, 20),
+  };
+
+  const siteMap = buildCombinedSiteMap(perPageSiteMaps, normalizeDomain(siteUrl), siteUrl);
+  const combinedCapabilities = buildCombinedCapabilities(perPageCaps, siteUrl);
+
+  const result = {
+    success: true,
+    url: siteUrl,
+    title: rootTitle,
+    contacts,
+    pages: pageResults,
+    site_map: siteMap,
+    form_schemas: combinedCapabilities,
+  };
+
+  result.summary = buildSummary(result);
+  result.htmlContent = buildHtmlContent(result);
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SERVER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const server = http.createServer(async (req, res) => {
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      ok: true,
+      crawlInProgress,
+      crawlFinished,
+      lastCrawlUrl,
+      lastCrawlTime,
+    }));
+  }
+
+  if (req.method === "GET" && req.url === "/result") {
+    if (!lastResult) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "No result yet" }));
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(lastResult));
+  }
+
+  if (req.method === "POST" && req.url === "/crawl") {
+    if (crawlInProgress) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Crawl already in progress" }));
     }
 
     let body = "";
-    req.on("data", c => (body += c));
-    req.on("error", err => {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, error: "Request error" }));
-    });
-
+    req.on("data", chunk => { body += chunk.toString(); });
     req.on("end", async () => {
       try {
-        const parsed = JSON.parse(body || "{}");
+        const payload = JSON.parse(body || "{}");
+        const siteUrl = payload.url || payload.siteUrl;
 
-        if (!parsed.url) {
+        if (!siteUrl) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({
-            success: false,
-            error: "Missing 'url' parameter"
-          }));
+          return res.end(JSON.stringify({ error: "Missing url" }));
         }
 
-        const requestedUrl = normalizeUrl(parsed.url);
-        const siteId = parsed.site_id || null;
-        const rawDeadline = Number(parsed.deadline_ms) || 0;
-        const deadlineMs = rawDeadline > 10000 ? rawDeadline - 5000 : null;
         const now = Date.now();
-
-        if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
-          if (now - lastCrawlTime < RESULT_TTL_MS) {
-            console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ success: true, cached: true, ...lastResult }));
-          }
-        }
-
-        if (crawlInProgress) {
-          if (lastCrawlUrl === requestedUrl) {
-            res.writeHead(202, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              success: false,
-              status: "in_progress",
-              message: "Crawl in progress for this URL"
-            }));
-          } else {
-            res.writeHead(429, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({
-              success: false,
-              error: "Crawler busy with different URL"
-            }));
-          }
+        if (
+          lastResult &&
+          lastCrawlUrl === siteUrl &&
+          now - lastCrawlTime < RESULT_TTL_MS
+        ) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify(lastResult));
         }
 
         crawlInProgress = true;
         crawlFinished = false;
-        lastCrawlUrl = requestedUrl;
-        visited.clear();
+        lastCrawlUrl = siteUrl;
 
-        console.log("[CRAWL START] New crawl for:", requestedUrl);
-        if (siteId) console.log("[SITE ID]", siteId);
-        if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
+        const result = await crawlSite(siteUrl);
 
-        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
+        // Save SiteMap + send to worker, but don't fail crawl if these fail
+        try {
+          if (result.site_map) {
+            await saveSiteMapToSupabase(result.site_map);
+            await sendSiteMapToWorker(result.site_map);
+          }
+        } catch (err) {
+          console.error("[POST-CRAWL] SiteMap pipeline error:", err.message);
+        }
 
-        crawlInProgress = false;
-        crawlFinished = true;
         lastResult = result;
         lastCrawlTime = Date.now();
-
-        console.log("[CRAWL DONE] Result ready for:", requestedUrl);
+        crawlFinished = true;
+        crawlInProgress = false;
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, ...result }));
-      } catch (e) {
+        return res.end(JSON.stringify(result));
+      } catch (err) {
         crawlInProgress = false;
-        console.error("[CRAWL ERROR]", e.message);
+        crawlFinished = false;
+        console.error("[SERVER] Crawl error:", err.message);
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        return res.end(JSON.stringify({ error: err.message || "Unknown error" }));
       }
     });
-  })
-  .listen(PORT, () => {
-    console.log("Crawler running on", PORT);
-    console.log(`Config: ${PARALLEL_TABS} tabs`);
-    console.log(`Worker: ${WORKER_URL}`);
-  });
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+server.listen(PORT, () => {
+  console.log(`[CRAWLER] listening on :${PORT}`);
+});
