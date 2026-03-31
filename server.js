@@ -26,9 +26,6 @@ const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
-const UI_ACTION_LIMIT = 24;
-const UI_CLICK_WAIT_MS = 180;
-const UI_POST_PASS_WAIT_MS = 350;
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -1470,7 +1467,7 @@ async function extractCapabilitiesFromPage(page) {
 
       const hasBookingIframe = bookingIframes.length > 0;
       const containerSelectors = selectorCandidates(container);
-      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main\b|header\b|div\.elementor\b)/i.test(sel));
+      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main|header|div\.elementor)/i.test(sel));
       if (hasBookingIframe && genericWrapper && !String(raw || '').match(/пристигане|напускане|възрастни|guests|check-?in|check-?out/i)) return null;
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
 
@@ -1834,372 +1831,794 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
     for (const a of p.availability || []) pushCap("availability", a.schema);
   }
 
-  return combined;
+  // ✅ FIX: Much tighter limits (was 40/30/30 → now 8/5/5/5)
+  const forms = combined.filter(c => c.kind === "form").slice(0, 8);
+  const wizards = combined.filter(c => c.kind === "wizard").slice(0, 5);
+  const widgets = combined.filter(c => c.kind === "booking_widget").slice(0, 5);
+  const avail = combined.filter(c => c.kind === "availability").slice(0, 10);
+  const other = combined.filter(c => !["form","wizard","booking_widget","availability"].includes(c.kind)).slice(0, 10);
+
+  return [...forms, ...wizards, ...widgets, ...avail, ...other];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NEW: UI-AWARE PASS
+// UI-AWARE: EXPAND HIDDEN CONTENT (accordions, tabs, "Виж детайли" etc.)
+// Връща string с текст от dialogs (Radix/React) — конкатенира се към content
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function runUiAwarePass(page) {
-  const interactions = [];
+async function expandHiddenContent(page) {
+  let dialogTexts = "";
 
   try {
-    await page.evaluate(() => {
-      const clickState = {
-        openedSelectors: new Set(),
-      };
-      window.__neoUiClickState = clickState;
-    });
-  } catch {}
+    // ── Фаза 1: accordions, tabs, details (без dialog) ────────────────────
+    await page.evaluate(async () => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  const clickCandidatePass = async (label, selectorList, maxClicks = 8) => {
-    let clicks = 0;
-
-    for (const selector of selectorList) {
-      if (interactions.length >= UI_ACTION_LIMIT || clicks >= maxClicks) break;
-
-      let handles = [];
-      try {
-        handles = await page.$$(selector);
-      } catch {
-        continue;
-      }
-
-      for (const handle of handles) {
-        if (interactions.length >= UI_ACTION_LIMIT || clicks >= maxClicks) break;
-
+      const isVisible = (el) => {
         try {
-          const meta = await handle.evaluate((el) => {
-            const txt = (el.innerText || el.textContent || el.getAttribute?.("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 120);
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            const visible =
-              rect.width > 0 &&
-              rect.height > 0 &&
-              style.display !== "none" &&
-              style.visibility !== "hidden" &&
-              style.opacity !== "0";
-
-            const key = [
-              el.tagName,
-              el.id || "",
-              typeof el.className === "string" ? el.className : "",
-              txt,
-            ].join("|");
-
-            return {
-              text: txt,
-              visible,
-              key,
-              disabled:
-                el.hasAttribute?.("disabled") ||
-                el.getAttribute?.("aria-disabled") === "true",
-            };
-          });
-
-          if (!meta?.visible || meta?.disabled) continue;
-
-          const alreadyOpened = await page.evaluate((key) => {
-            const st = window.__neoUiClickState;
-            if (!st) return false;
-            if (st.openedSelectors.has(key)) return true;
-            st.openedSelectors.add(key);
-            return false;
-          }, meta.key);
-
-          if (alreadyOpened) continue;
-
-          await handle.scrollIntoViewIfNeeded().catch(() => {});
-          await handle.click({ timeout: 1200 }).catch(() => null);
-          await page.waitForTimeout(UI_CLICK_WAIT_MS);
-
-          interactions.push({
-            type: label,
-            text: meta.text || "",
-          });
-
-          clicks += 1;
-        } catch {}
-      }
-    }
-  };
-
-  // 1) Native details/summary
-  try {
-    const openedDetails = await page.evaluate(() => {
-      const out = [];
-      document.querySelectorAll("details").forEach((el) => {
-        if (!el.open) {
-          el.open = true;
-          const txt = (el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 120);
-          out.push({ type: "details", text: txt });
-        }
-      });
-      return out;
-    });
-    interactions.push(...openedDetails.slice(0, 10));
-  } catch {}
-
-  // 2) Tabs / accordions / “more” / “details”
-  await clickCandidatePass("tab_or_accordion", [
-    '[role="tab"]',
-    '.tab',
-    '.tabs button',
-    '.accordion button',
-    '.accordion-header',
-    '.faq-question',
-    '.collapse-toggle',
-    '.elementor-tab-title',
-    '.vc_tta-panel-title a',
-    'button[aria-expanded="false"]',
-    '[data-bs-toggle="collapse"]',
-    '[data-toggle="collapse"]',
-    'button',
-    'a',
-  ], 14);
-
-  // 3) Dialog / modal triggers
-  await clickCandidatePass("dialog_trigger", [
-    '[data-bs-toggle="modal"]',
-    '[data-toggle="modal"]',
-    '[aria-haspopup="dialog"]',
-    '[aria-controls*="modal"]',
-    '[class*="modal"] button',
-    'button',
-    'a',
-  ], 8);
-
-  // 4) Dropdowns / selects
-  try {
-    const dropdownInteractions = await page.evaluate(() => {
-      const out = [];
-      const visible = (el) => {
-        const r = el.getBoundingClientRect();
-        const s = window.getComputedStyle(el);
-        return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.opacity !== "0";
+        } catch { return false; }
       };
 
-      document.querySelectorAll("select").forEach((sel) => {
-        if (!visible(sel)) return;
-        const options = Array.from(sel.options || []).filter(opt => {
-          const t = (opt.textContent || "").trim();
-          if (!t) return false;
-          if (/изберете|select|choose|--/i.test(t)) return false;
-          return true;
+      // 1. aria-expanded="false"
+      const collapsed = Array.from(document.querySelectorAll('[aria-expanded="false"]'))
+        .filter(isVisible).slice(0, 20);
+      for (const el of collapsed) {
+        try { el.click(); await sleep(80); } catch {}
+      }
+
+      // 2. Accordion headers
+      const accordionSelectors = [
+        '[class*="accordion"] [class*="header"]',
+        '[class*="accordion"] [class*="title"]',
+        '[class*="accordion"] > * > button',
+        '[class*="accordion"] > button',
+        '[class*="collapse-trigger"]',
+        '[data-toggle="collapse"]',
+        '[data-bs-toggle="collapse"]',
+        '[class*="faq"] [class*="question"]',
+        '[class*="faq"] button',
+        '[class*="faq"] summary',
+      ];
+      const seenAccordion = new Set();
+      for (const sel of accordionSelectors) {
+        const els = Array.from(document.querySelectorAll(sel)).filter(isVisible).slice(0, 15);
+        for (const el of els) {
+          if (seenAccordion.has(el)) continue;
+          seenAccordion.add(el);
+          try { el.click(); await sleep(80); } catch {}
+        }
+      }
+
+      // 3. Tabs
+      const tabEls = Array.from(document.querySelectorAll('[role="tab"]')).filter(isVisible).slice(0, 12);
+      for (const tab of tabEls) {
+        try { tab.click(); await sleep(100); } catch {}
+      }
+
+      // 4. "Виж детайли" / текстови trigger бутони (НЕ-dialog)
+      const textTriggerRe = /виж детайли|виж повече|повече информация|разгъни|покажи|show more|read more|expand|see more/i;
+      const skipRe = /nav|menu|header|footer|cookie|gdpr/i;
+      const clickable = Array.from(document.querySelectorAll(
+        'button, [role="button"], a[href="#"], a[href="javascript:void(0)"], span[onclick], div[onclick]'
+      )).filter(isVisible).slice(0, 30);
+      for (const btn of clickable) {
+        const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
+        if (!textTriggerRe.test(text)) continue;
+        if (skipRe.test(btn.closest('[class]')?.className || '')) continue;
+        // Пропусни ако отваря dialog — ще се handle-ва отделно
+        if (btn.getAttribute('aria-haspopup') === 'dialog') continue;
+        try { btn.click(); await sleep(120); } catch {}
+      }
+
+      // 5. <details> force open
+      document.querySelectorAll('details:not([open])').forEach(d => {
+        try { d.open = true; d.setAttribute('open', ''); } catch {}
+      });
+
+      await sleep(200);
+    });
+
+    await page.waitForTimeout(200);
+  } catch {}
+
+  // ── Фаза 2: Radix UI / React Dialogs — клик → извлечи текст → затвори ──
+  try {
+    // Намери всички dialog trigger бутони
+    const triggerTexts = await page.evaluate(() => {
+      const isVisible = (el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 &&
+            style.display !== "none" && style.visibility !== "hidden";
+        } catch { return false; }
+      };
+
+      const dialogTriggerRe = /пакет|basic|standard|premium|детайли|спецификация|виж|повече|цена|price|package|details|план|plan/i;
+      const skipRe = /nav|menu|header|footer|cookie|gdpr/i;
+
+      // Radix: aria-haspopup="dialog" или data-state="closed" на бутони
+      const radixTriggers = Array.from(document.querySelectorAll(
+        '[aria-haspopup="dialog"], button[data-state="closed"], [data-radix-collection-item]'
+      )).filter(isVisible).slice(0, 15);
+
+      // Текстови triggers за пакети
+      const textTriggers = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .filter(isVisible)
+        .filter(el => dialogTriggerRe.test(el.textContent || el.getAttribute('aria-label') || ''))
+        .filter(el => !skipRe.test(el.closest('[class]')?.className || ''))
+        .slice(0, 15);
+
+      // Обедини и dedupe
+      const all = new Set([...radixTriggers, ...textTriggers]);
+      return Array.from(all).map((el, i) => {
+        el.setAttribute('data-crawler-trigger', String(i));
+        return { idx: i, text: (el.textContent || '').trim().slice(0, 60) };
+      });
+    });
+
+    // За всеки trigger: клик → изчакай → вземи текст → затвори
+    const collected = [];
+    for (const { idx } of triggerTexts) {
+      try {
+        await page.evaluate((idx) => {
+          const el = document.querySelector(`[data-crawler-trigger="${idx}"]`);
+          if (el) el.click();
+        }, idx);
+
+        await page.waitForTimeout(450); // React re-render
+
+        const text = await page.evaluate(() => {
+          // Вземи текст от отворения dialog
+          const dialog = document.querySelector(
+            '[role="dialog"][data-state="open"], [role="dialog"]:not([data-state="closed"]), [role="dialog"]'
+          );
+          if (!dialog) return '';
+          return (dialog.innerText || dialog.textContent || '').replace(/\s+/g, ' ').trim();
         });
 
-        if (options.length > 0) {
-          sel.value = options[0].value;
-          sel.dispatchEvent(new Event("change", { bubbles: true }));
-          out.push({
-            type: "dropdown_select",
-            text: (options[0].textContent || "").trim().slice(0, 120),
-          });
+        if (text && text.length > 20) {
+          collected.push(text);
+          console.log(`[DIALOG] Извлечен текст: ${text.slice(0, 80)}...`);
         }
-      });
 
-      return out;
-    });
+        // Затвори dialog-а
+        await page.evaluate(() => {
+          // Опит 1: Escape key
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          // Опит 2: Close бутон
+          const closeBtn = document.querySelector(
+            '[role="dialog"] button[aria-label*="close" i], [role="dialog"] button[aria-label*="затвори" i], ' +
+            '[role="dialog"] [data-radix-focus-guard] ~ * button:first-child'
+          );
+          if (closeBtn) closeBtn.click();
+          // Опит 3: data-state бутон
+          const stateBtn = document.querySelector('[role="dialog"] button[data-state]');
+          if (stateBtn) stateBtn.click();
+        });
 
-    interactions.push(...dropdownInteractions.slice(0, 8));
-  } catch {}
+        await page.waitForTimeout(200);
+      } catch {}
+    }
 
-  // 5) Booking/search CTA
-  await clickCandidatePass("booking_cta", [
-    'button',
-    'a',
-    '[role="button"]',
-  ], 6);
-
-  if (interactions.length > 0) {
-    await page.waitForTimeout(UI_POST_PASS_WAIT_MS);
+    dialogTexts = collected.join('\n\n---DIALOG---\n\n');
+  } catch (e) {
+    console.error('[DIALOG] Error:', e.message);
   }
 
-  return interactions.slice(0, UI_ACTION_LIMIT);
+  await page.waitForTimeout(150);
+  return dialogTexts;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NEW: STRUCTURED CONTENT EXTRACTION AFTER UI PASS
+// EXISTING EXTRACTION FUNCTIONS (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function extractUiAwareStructuredContent(page) {
-  return await page.evaluate(() => {
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+async function extractStructured(page) {
+  try {
+    await page.waitForSelector("body", { timeout: 1500 });
+  } catch {}
 
-    const isVisible = (el) => {
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        style.opacity !== "0";
-    };
-
-    const looksLikeNoise = (txt = "") =>
-      /cookie|cookies|accept all|privacy policy|terms of use|navigation|menu|footer/i.test(txt);
-
-    const dialogs = [];
-    document.querySelectorAll('dialog,[role="dialog"],.modal,.popup,.mfp-wrap,.fancybox-content').forEach((el) => {
-      if (!isVisible(el)) return;
-      const txt = norm(el.innerText || el.textContent || "");
-      if (!txt || txt.length < 20 || looksLikeNoise(txt)) return;
-      dialogs.push(txt.slice(0, 4000));
-    });
-
-    const hiddenSections = [];
-    document.querySelectorAll(
-      '.tab-content,.accordion-content,.collapse.show,.elementor-tab-content,[role="tabpanel"],details[open],.faq-answer'
-    ).forEach((el) => {
-      if (!isVisible(el)) return;
-      const txt = norm(el.innerText || el.textContent || "");
-      if (!txt || txt.length < 20 || looksLikeNoise(txt)) return;
-      hiddenSections.push(txt.slice(0, 4000));
-    });
-
-    return {
-      dialogs: Array.from(new Set(dialogs)).slice(0, 20),
-      hidden_sections: Array.from(new Set(hiddenSections)).slice(0, 30),
-    };
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// CONTENT EXTRACTION
-// ═══════════════════════════════════════════════════════════════════════════
-
-async function extractTextContent(page) {
   try {
     return await page.evaluate(() => {
-      const selectorsToRemove = [
-        "script", "style", "noscript", "svg", "canvas", "video", "audio",
-        "nav", "header nav", "footer",
-        '[role="navigation"]',
-        ".cookie", ".cookies", "#cookie", "#cookies",
-        ".cookie-banner", ".cookie-notice",
-        ".popup-consent", ".gdpr",
-      ];
+      const seenTexts = new Set();
 
-      selectorsToRemove.forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => el.remove());
-      });
-
-      const blocks = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
-
-      let node;
-      while ((node = walker.nextNode())) {
-        const tag = node.tagName?.toLowerCase();
-        if (!tag) continue;
-
-        if (!["h1","h2","h3","h4","h5","h6","p","li","td","th","span","div","section","article"].includes(tag)) continue;
-
-        const style = window.getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        const visible = rect.width > 0 && rect.height > 0 &&
-          style.display !== "none" &&
-          style.visibility !== "hidden";
-
-        if (!visible) continue;
-
-        const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
-        if (!text || text.length < 2) continue;
-
-        if (text.length > 1500) continue;
-
-        blocks.push(text);
+      function addUniqueText(text, minLength = 10) {
+        const normalized = text.trim().replace(/\s+/g, ' ');
+        if (normalized.length < minLength || seenTexts.has(normalized)) return "";
+        seenTexts.add(normalized);
+        return normalized;
       }
 
-      return Array.from(new Set(blocks)).join("\n");
-    });
-  } catch {
-    return "";
-  }
-}
+      const norm = (s = "") => s.replace(/\s+/g, " ").trim();
 
-async function extractLinks(page, baseUrl) {
-  try {
-    return await page.evaluate((base) => {
-      const out = [];
-      const baseHost = new URL(base).hostname.replace(/^www\./, "");
+      const extractTableText = (table) => {
+        const rows = [];
+        table.querySelectorAll("tr").forEach((tr) => {
+          const cells = Array.from(tr.querySelectorAll("th, td"))
+            .map((cell) => norm(cell.innerText || cell.textContent || ""))
+            .filter(Boolean);
+          if (cells.length > 0) rows.push(cells.join(" | "));
+        });
+        return rows.join("\n");
+      };
 
-      document.querySelectorAll("a[href]").forEach(a => {
-        const href = a.href || "";
-        if (!href) return;
+      const extractDetailsContent = (detailsEl) => {
+        const parts = [];
+        const summaryEl = detailsEl.querySelector(":scope > summary");
+        const summaryText = norm(summaryEl?.innerText || summaryEl?.textContent || "");
+        if (summaryText) parts.push(summaryText);
 
+        Array.from(detailsEl.children).forEach((child) => {
+          if (child.tagName?.toLowerCase() === "summary") return;
+
+          child.querySelectorAll?.("table").forEach((table) => {
+            const tableText = extractTableText(table);
+            if (tableText) parts.push(tableText);
+          });
+
+          const textWithoutTables = norm(
+            Array.from(child.childNodes)
+              .filter((node) => !(node.nodeType === Node.ELEMENT_NODE && node.tagName?.toLowerCase() === "table"))
+              .map((node) => node.textContent || "")
+              .join(" ")
+          );
+
+          if (textWithoutTables) parts.push(textWithoutTables);
+        });
+
+        return parts.filter(Boolean).join("\n");
+      };
+
+      const detailsTexts = [];
+      try {
+        const detailsBlocks = Array.from(document.querySelectorAll("details.wp-block-details, details"));
+        detailsBlocks.forEach((el) => {
+          try {
+            const summary = el.querySelector(":scope > summary");
+            el.open = true;
+            el.setAttribute("open", "");
+            try { summary?.click(); } catch {}
+            el.open = true;
+            el.setAttribute("open", "");
+
+            const blockText = extractDetailsContent(el);
+            const uniqueText = addUniqueText(blockText, 5);
+            if (uniqueText) detailsTexts.push(uniqueText);
+          } catch {}
+        });
+      } catch {}
+
+      const sections = [];
+      let current = null;
+      const processedElements = new Set();
+
+      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
+        if (processedElements.has(el)) return;
+        if (el.closest("details.wp-block-details, details")) return;
+        let parent = el.parentElement;
+        while (parent) {
+          if (processedElements.has(parent)) return;
+          parent = parent.parentElement;
+        }
+        const text = el.innerText?.trim();
+        if (!text) return;
+        const uniqueText = addUniqueText(text, 5);
+        if (!uniqueText) return;
+        if (el.tagName.startsWith("H")) {
+          current = { heading: uniqueText, text: "" };
+          sections.push(current);
+        } else if (current) {
+          current.text += " " + uniqueText;
+        }
+        processedElements.add(el);
+      });
+
+      const overlaySelectors = [
+        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
+        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
+        '[class*="alert"]', '[style*="position: fixed"]',
+        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
+      ];
+
+      const overlayTexts = [];
+      overlaySelectors.forEach(selector => {
         try {
-          const u = new URL(href, base);
-          const host = u.hostname.replace(/^www\./, "");
-          if (host !== baseHost) return;
-          if (!/^https?:/i.test(u.protocol)) return;
-
-          out.push(u.toString());
+          document.querySelectorAll(selector).forEach(el => {
+            if (processedElements.has(el)) return;
+            const text = el.innerText?.trim();
+            if (!text) return;
+            const uniqueText = addUniqueText(text);
+            if (uniqueText) {
+              overlayTexts.push(uniqueText);
+              processedElements.add(el);
+            }
+          });
         } catch {}
       });
 
-      return Array.from(new Set(out));
-    }, baseUrl);
-  } catch {
-    return [];
+      const pseudoTexts = [];
+      try {
+        document.querySelectorAll("*").forEach(el => {
+          const before = window.getComputedStyle(el, "::before").content;
+          const after = window.getComputedStyle(el, "::after").content;
+          if (before && before !== "none" && before !== '""') {
+            const cleaned = before.replace(/^["']|["']$/g, "");
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
+          }
+          if (after && after !== "none" && after !== '""') {
+            const cleaned = after.replace(/^["']|["']$/g, "");
+            const uniqueText = addUniqueText(cleaned, 3);
+            if (uniqueText) pseudoTexts.push(uniqueText);
+          }
+        });
+      } catch {}
+
+      let mainContent = "";
+      const mainEl = document.querySelector("main") || document.querySelector("article");
+      if (mainEl && !processedElements.has(mainEl)) {
+        const text = mainEl.innerText?.trim();
+        if (text) mainContent = addUniqueText(text) || "";
+      }
+
+      const isVisible = (el) => {
+        try {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+        } catch {
+          return false;
+        }
+      };
+
+      const topControlTexts = [];
+      const seenControls = new Set();
+      try {
+        const controls = document.querySelectorAll('button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], summary');
+        controls.forEach((el) => {
+          if (!isVisible(el)) return;
+          const rect = el.getBoundingClientRect();
+          if (rect.top > Math.max(window.innerHeight + 250, 1100)) return;
+          const parts = [
+            el.textContent || "",
+            el.getAttribute?.("aria-label") || "",
+            el.getAttribute?.("placeholder") || "",
+            el.getAttribute?.("value") || "",
+            el.getAttribute?.("title") || "",
+          ].join(" ").replace(/\s+/g, " ").trim();
+          if (!parts || parts.length < 2 || parts.length > 80) return;
+          const key = parts.toLowerCase();
+          if (seenControls.has(key)) return;
+          seenControls.add(key);
+          topControlTexts.push(parts);
+        });
+      } catch {}
+
+      return {
+        rawContent: [
+          detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
+          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
+          mainContent,
+          overlayTexts.join("\n"),
+          pseudoTexts.join(" "),
+          topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
+        ].filter(Boolean).join("\n\n"),
+      };
+    });
+  } catch (e) {
+    return { rawContent: "" };
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// NEW: HIGH-LEVEL STRUCTURED SIGNAL EXTRACTION
-// ═══════════════════════════════════════════════════════════════════════════
+// ================= LINK DISCOVERY =================
+async function collectAllLinks(page, base) {
+  try {
+    return await page.evaluate(base => {
+      const urls = new Set();
+      document.querySelectorAll("a[href]").forEach(a => {
+        try {
+          const u = new URL(a.href, base);
+          if (u.origin === base) urls.add(u.href.split("#")[0]);
+        } catch {}
+      });
+      return Array.from(urls);
+    }, base);
+  } catch { return []; }
+}
 
-async function extractStructuredSignals(page) {
-  return await page.evaluate(() => {
-    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+// ================= PROCESS SINGLE PAGE =================
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
+  const startTime = Date.now();
 
-    const isVisible = (el) => {
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden";
+  try {
+    console.log("[PAGE]", url);
+    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+
+    // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
+    await page.evaluate(async ({ stepMs, maxSteps }) => {
+      const scrollStep = window.innerHeight;
+      const maxScroll = document.body.scrollHeight;
+      const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
+
+      for (let i = 0; i <= steps; i++) {
+        window.scrollTo(0, i * scrollStep);
+        await new Promise(r => setTimeout(r, stepMs));
+      }
+      window.scrollTo(0, maxScroll);
+
+      // Force-load lazy images without waiting for scroll events
+      document.querySelectorAll('img[loading="lazy"], img[data-src], img[data-lazy]').forEach(img => {
+        img.loading = 'eager';
+        if (img.dataset.src) img.src = img.dataset.src;
+        if (img.dataset.lazy) img.src = img.dataset.lazy;
+      });
+    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
+
+    await page.waitForTimeout(150); // ↓ was 500ms
+
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
+    } catch {}
+
+    // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
+    const dialogTexts = await expandHiddenContent(page);
+    if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
+
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+
+    // Extract structured content
+    const data = await extractStructured(page);
+
+    // NEW: Pricing/package structured extraction (cards + installment)
+    let pricing = null;
+    try {
+      pricing = await extractPricingFromPage(page);
+
+      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+      }
+    } catch (e) {
+      console.error("[PRICING] Extract error:", e.message);
+    }
+
+    // *** EXISTING: Extract SiteMap from this page ***
+    try {
+      const rawSiteMap = await extractSiteMapFromPage(page);
+      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
+        siteMaps.push(rawSiteMap);
+        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+      }
+    } catch (e) {
+      console.error("[SITEMAP] Extract error:", e.message);
+    }
+
+    // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
+    try {
+      const caps = await extractCapabilitiesFromPage(page);
+      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+        capabilitiesMaps.push(caps);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+      }
+    } catch (e) {
+      console.error("[CAPS] Extract error:", e.message);
+    }
+
+    // Format content — включва и текст от Radix/React dialogs
+    const rawAll = dialogTexts
+      ? `${data.rawContent}\n\nDIALOG_CONTENT\n${dialogTexts}`
+      : data.rawContent;
+    const htmlContent = normalizeNumbers(clean(rawAll));
+
+    const content = htmlContent;
+
+    // ✅ NEW: contacts extraction (DOM + combined text)
+    const domContacts = await extractContactsFromPage(page);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
+
+    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
+    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
+
+    const contacts = {
+      emails: mergedEmails,
+      phones: mergedPhones,
     };
 
-    const uniq = (arr) => Array.from(new Set(arr.filter(Boolean)));
+    if (contacts.emails.length || contacts.phones.length) {
+      console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
+    }
 
-    const services = [];
-    const packages = [];
-    const features = [];
-    const faq = [];
-    const contacts = [];
+    const totalWords = countWordsExact(htmlContent);
 
-    document.querySelectorAll("section, article, div").forEach((root) => {
-      if (!isVisible(root)) return;
-      const txt = norm(root.innerText || "");
-      if (!txt || txt.length < 10) return;
+    const elapsed = Date.now() - startTime;
+    console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
-      const heading = norm(root.querySelector("h1,h2,h3,h4,h5,h6,strong,b")?.textContent || "");
+    if (pageType !== "services" && totalWords < MIN_WORDS) {
+      return { links: await collectAllLinks(page, base), page: null };
+    }
 
-      if (/услуги|services/i.test(heading)) {
-        root.querySelectorAll("li").forEach(li => {
-          const t = norm(li.textContent || "");
-          if (t && t.length <= 180) services.push(t);
-        });
+    return {
+      links: await collectAllLinks(page, base),
+      page: {
+        url,
+        title,
+        pageType,
+        content,
+        // ✅ structured output: pricing + contacts
+        structured: { pricing, contacts },
+        wordCount: totalWords,
+        status: "ok",
       }
+    };
+  } catch (e) {
+    console.error("[PAGE ERROR]", url, e.message);
+    stats.errors++;
+    return { links: [], page: null };
+  }
+}
 
-      if (/пакет|package|plan|tier/i.test(heading)) {
-        const cardText = txt.slice(0, 1200);
-        if (cardText.length > 20) packages.push(cardText);
-      }
+// ================= PARALLEL CRAWLER =================
+async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
+  // If caller passed a deadline (e.g. scrape-website knows its own timeout),
+  // use that minus a 5s buffer for JSON serialization + response.
+  // Otherwise fall back to MAX_SECONDS.
+  const effectiveMs = deadlineMs
+    ? Math.min(deadlineMs, MAX_SECONDS * 1000)
+    : MAX_SECONDS * 1000;
+  const deadline = Date.now() + effectiveMs;
+  console.log("\n[CRAWL START]", startUrl);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, deadline in ${Math.round(effectiveMs / 1000)}s`);
+  if (siteId) console.log(`[SITE ID] ${siteId}`);
 
-      if (/faq|често задавани|въпроси/i.test(heading)) {
-        root.querySelectorAll("details, .faq-item, .accordion-item, [role='tabpanel']").forEach(item => {
-          const t = norm(item.innerText || "");
-          if (t && t.length > 8 && t.length <= 1000) faq.push(t);
-        });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
+  });
+
+  const stats = {
+    visited: 0,
+    saved: 0,
+    byType: {},
+    errors: 0,
+  };
+
+  const pages = [];
+  const queue = [];
+  const siteMaps = []; // collect sitemaps from all pages
+  const capabilitiesMaps = []; // collect capabilities from all pages
+  let base = "";
+
+  // ✅ NEW: aggregate contacts across pages
+  const contactAgg = { emails: new Set(), phones: new Set() };
+
+  try {
+    const initContext = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    });
+    const initPage = await initContext.newPage();
+
+    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    base = new URL(initPage.url()).origin;
+
+    const initialLinks = await collectAllLinks(initPage, base);
+    queue.push(normalizeUrl(initPage.url()));
+    initialLinks.forEach(l => {
+      const nl = normalizeUrl(l);
+      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+        queue.push(nl);
       }
     });
 
-    document.querySelectorAll("li").forEach(li => {
-      if (!isVisible(li)) return;
-      const t = norm(li.textContent || "");
-      if (t && t.length >= 3 && t.length <= 180) features.push(t);
+    await initPage.close();
+    await initContext.close();
+
+    console.log(`[CRAWL] Found ${queue.length} URLs`);
+
+    const createWorker = async () => {
+      const ctx = await browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      });
+      const pg = await ctx.newPage();
+
+      while (Date.now() < deadline) {
+        let url = null;
+        while (queue.length > 0) {
+          const candidate = queue.shift();
+          const normalized = normalizeUrl(candidate);
+          if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
+            visited.add(normalized);
+            url = normalized;
+            break;
+          }
+        }
+
+        if (!url) {
+          await new Promise(r => setTimeout(r, 30));
+          if (queue.length === 0) break;
+          continue;
+        }
+
+        stats.visited++;
+
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
+
+        if (result.page) {
+          // ✅ collect contacts
+          const c = result.page?.structured?.contacts;
+          if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
+          if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
+
+          pages.push(result.page);
+          stats.saved++;
+        }
+
+        result.links.forEach(l => {
+          const nl = normalizeUrl(l);
+          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+            queue.push(nl);
+          }
+        });
+      }
+
+      await pg.close();
+      await ctx.close();
+    };
+
+    await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
+
+  } finally {
+    await browser.close();
+    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
+  }
+
+  let combinedSiteMap = null;
+  if (siteMaps.length > 0 && siteId) {
+    console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
+
+    const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
+    combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
+
+    await saveSiteMapToSupabase(combinedSiteMap);
+    await sendSiteMapToWorker(combinedSiteMap);
+  }
+
+  let combinedCapabilities = [];
+  if (capabilitiesMaps.length > 0) {
+    combinedCapabilities = buildCombinedCapabilities(capabilitiesMaps, base);
+    console.log(`[CAPS] Combined: ${combinedCapabilities.length} capabilities (forms/wizards/widgets/availability)`);
+  }
+
+  const contacts = {
+    emails: Array.from(contactAgg.emails).filter(Boolean).slice(0, 20),
+    phones: Array.from(contactAgg.phones).filter(Boolean).slice(0, 20),
+  };
+
+  if (contacts.emails.length || contacts.phones.length) {
+    console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
+  }
+
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
+}
+
+// ================= HTTP SERVER =================
+http
+  .createServer((req, res) => {
+    if (req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
+        crawlInProgress,
+        crawlFinished,
+        lastCrawlUrl,
+        lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
+        resultAvailable: !!lastResult,
+        pagesCount: lastResult?.pages?.length || 0,
+        capabilitiesCount: lastResult?.capabilities?.length || 0,
+        contacts: lastResult?.contacts || null,
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
+      }));
+    }
+
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Method not allowed" }));
+    }
+
+    let body = "";
+    req.on("data", c => (body += c));
+    req.on("error", err => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "Request error" }));
     });
 
-    const pageText = norm(document.body?.innerText || "");
-    const emails = pageText.match(/[A-Z0-9._%+-
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body || "{}");
+
+        if (!parsed.url) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({
+            success: false,
+            error: "Missing 'url' parameter"
+          }));
+        }
+
+        const requestedUrl = normalizeUrl(parsed.url);
+        const siteId = parsed.site_id || null;
+        // Accept deadline from caller — scrape-website sends how many ms the crawler has
+        // before the caller's own timeout fires. We subtract 5s for safety buffer.
+        const rawDeadline = Number(parsed.deadline_ms) || 0;
+        const deadlineMs = rawDeadline > 10000 ? rawDeadline - 5000 : null;
+        const now = Date.now();
+
+        if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
+          if (now - lastCrawlTime < RESULT_TTL_MS) {
+            console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ success: true, cached: true, ...lastResult }));
+          }
+        }
+
+        if (crawlInProgress) {
+          if (lastCrawlUrl === requestedUrl) {
+            res.writeHead(202, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({
+              success: false,
+              status: "in_progress",
+              message: "Crawl in progress for this URL"
+            }));
+          } else {
+            res.writeHead(429, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({
+              success: false,
+              error: "Crawler busy with different URL"
+            }));
+          }
+        }
+
+        crawlInProgress = true;
+        crawlFinished = false;
+        lastCrawlUrl = requestedUrl;
+        visited.clear();
+
+        console.log("[CRAWL START] New crawl for:", requestedUrl);
+        if (siteId) console.log("[SITE ID]", siteId);
+        if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
+
+        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
+
+        crawlInProgress = false;
+        crawlFinished = true;
+        lastResult = result;
+        lastCrawlTime = Date.now();
+
+        console.log("[CRAWL DONE] Result ready for:", requestedUrl);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, ...result }));
+      } catch (e) {
+        crawlInProgress = false;
+        console.error("[CRAWL ERROR]", e.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    });
+  })
+  .listen(PORT, () => {
+    console.log("Crawler running on", PORT);
+    console.log(`Config: ${PARALLEL_TABS} tabs`);
+    console.log(`Worker: ${WORKER_URL}`);
+  });
