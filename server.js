@@ -187,6 +187,9 @@ function detectPageType(url = "", title = "") {
   if (/kontakti|contact/.test(s)) return "contact";
   if (/faq|vuprosi|questions/.test(s)) return "faq";
   if (/blog|news|article/.test(s)) return "blog";
+  // Product/vehicle/property detail pages — URL contains ID or product slug
+  const PRODUCT_URL_RE = /prodajba-|\/proekt\/|\/id-\d|[?&]id=\d|(\/|[-_])(car|auto|vehicle|property|imot|apartament|hotel|offer|listing|detail|product|item)(\/|-\d|$)|\d{4,}-[a-z]/i;
+  if (PRODUCT_URL_RE.test(url)) return "product_detail";
   return "general";
 }
 
@@ -2456,6 +2459,103 @@ async function discoverLinksViaButtons(page, base) {
   return Array.from(discovered);
 }
 
+// ================= PRODUCT/VEHICLE SPEC EXTRACTOR =================
+// Универсален extractor за product detail страници (коли, имоти, хотели, е-commerce).
+// Чете structured spec rows: '► Година: 2013', 'Двигател: Бензинов', 'Price: 000' и т.н.
+async function extractProductSpecsFromPage(page) {
+  try {
+    return await page.evaluate(() => {
+      const norm = (s) => (s || '').replace(/s+/g, ' ').trim();
+      const specs = [];
+      const prices = [];
+      let title = '';
+      let description = '';
+
+      // ── Заглавие на продукта ──────────────────────────────────────────────
+      const h1 = document.querySelector('h1');
+      if (h1) title = norm(h1.innerText || h1.textContent || '');
+
+      // ── Цена ─────────────────────────────────────────────────────────────
+      const priceRe = /[€$£]?s*[ds.,]+s*(лв.?|лева|BGN|EUR|€|$|лв)/i;
+      document.querySelectorAll('[class*="price"],[class*="cena"],[class*="cost"],[class*="amount"]').forEach(el => {
+        const t = norm(el.innerText || el.textContent || '');
+        if (priceRe.test(t) && t.length < 80) prices.push(t);
+      });
+
+      // ── Spec rows: dl/dt/dd, table rows, list items с ':' ────────────────
+      // Pattern 1: definition lists
+      document.querySelectorAll('dl').forEach(dl => {
+        const dts = dl.querySelectorAll('dt');
+        const dds = dl.querySelectorAll('dd');
+        dts.forEach((dt, i) => {
+          const key = norm(dt.innerText || dt.textContent || '');
+          const val = norm(dds[i]?.innerText || dds[i]?.textContent || '');
+          if (key && val) specs.push({ key, value: val });
+        });
+      });
+
+      // Pattern 2: table rows with 2 cells
+      document.querySelectorAll('table tr').forEach(tr => {
+        const cells = tr.querySelectorAll('td, th');
+        if (cells.length === 2) {
+          const key = norm(cells[0].innerText || cells[0].textContent || '');
+          const val = norm(cells[1].innerText || cells[1].textContent || '');
+          if (key && val && key.length < 60) specs.push({ key, value: val });
+        }
+      });
+
+      // Pattern 3: list items / divs with 'key: value' or '► Key: Value'
+      const specItemRe = /^[►▸•-]?s*(.{2,50}?)s*[:-–]s*(.{1,200})$/;
+      document.querySelectorAll('li, [class*="spec"] *, [class*="detail"] *, [class*="feature"] *, [class*="param"] *').forEach(el => {
+        if (el.children.length > 3) return; // skip containers
+        const t = norm(el.innerText || el.textContent || '');
+        const m = t.match(specItemRe);
+        if (m && m[1].length < 50 && m[2].length > 0) {
+          specs.push({ key: norm(m[1]), value: norm(m[2]) });
+        }
+      });
+
+      // Pattern 4: adjacent sibling pairs with label+value classes
+      const labelEls = document.querySelectorAll('[class*="label"],[class*="name"],[class*="key"],[class*="attr"]');
+      labelEls.forEach(lbl => {
+        const key = norm(lbl.innerText || lbl.textContent || '');
+        if (!key || key.length > 60) return;
+        const next = lbl.nextElementSibling;
+        if (next) {
+          const val = norm(next.innerText || next.textContent || '');
+          if (val && val.length < 200 && val !== key) specs.push({ key, value: val });
+        }
+      });
+
+      // ── Описание ─────────────────────────────────────────────────────────
+      const descEl = document.querySelector('[class*="desc"],[class*="about"],[class*="info"],[class*="summary"] p, article p, .content p');
+      if (descEl) {
+        description = norm(descEl.innerText || descEl.textContent || '').slice(0, 600);
+      }
+
+      // Dedupe specs by key
+      const seen = new Set();
+      const deduped = specs.filter(s => {
+        if (!s.key || !s.value) return false;
+        const k = s.key.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      }).slice(0, 50);
+
+      return {
+        title,
+        description,
+        specs: deduped,
+        prices: [...new Set(prices)].slice(0, 5),
+      };
+    });
+  } catch (e) {
+    console.error('[SPECS] Extract error:', e.message);
+    return { title: '', description: '', specs: [], prices: [] };
+  }
+}
+
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
@@ -2513,6 +2613,19 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[PRICING] Extract error:", e.message);
     }
 
+    // NEW: Product/vehicle spec extraction for detail pages
+    let product_specs = null;
+    if (pageType === 'product_detail') {
+      try {
+        product_specs = await extractProductSpecsFromPage(page);
+        if (product_specs.specs.length > 0 || product_specs.prices.length > 0) {
+          console.log(`[SPECS] Page: ${product_specs.specs.length} specs, prices: ${product_specs.prices.join(', ')}`);
+        }
+      } catch (e) {
+        console.error('[SPECS] Extract error:', e.message);
+      }
+    }
+
     // *** EXISTING: Extract SiteMap from this page ***
     try {
       const rawSiteMap = await extractSiteMapFromPage(page);
@@ -2535,10 +2648,22 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.error("[CAPS] Extract error:", e.message);
     }
 
-    // Format content — включва и текст от Radix/React dialogs
-    const rawAll = dialogTexts
-      ? `${data.rawContent}\n\nDIALOG_CONTENT\n${dialogTexts}`
-      : data.rawContent;
+    // Format content — включва и текст от Radix/React dialogs + product specs
+    let specsText = '';
+    if (product_specs && (product_specs.specs.length > 0 || product_specs.prices.length > 0)) {
+      const specLines = [];
+      if (product_specs.title) specLines.push(`Продукт: ${product_specs.title}`);
+      if (product_specs.prices.length) specLines.push(`Цена: ${product_specs.prices.join(' | ')}`);
+      product_specs.specs.forEach(s => specLines.push(`${s.key}: ${s.value}`));
+      if (product_specs.description) specLines.push(`Описание: ${product_specs.description}`);
+      specsText = `\n\nPRODUCT_SPECS\n${specLines.join('\n')}`;
+    }
+
+    const rawAll = [
+      data.rawContent,
+      dialogTexts ? `DIALOG_CONTENT\n${dialogTexts}` : '',
+      specsText,
+    ].filter(Boolean).join('\n\n');
     const htmlContent = normalizeNumbers(clean(rawAll));
 
     const content = htmlContent;
@@ -2573,7 +2698,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       console.log(`[DISCOVER] +${extraCount} button-discovered links (total ${allLinks.length})`);
     }
 
-    if (pageType !== "services" && totalWords < MIN_WORDS) {
+    if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
     }
 
@@ -2584,8 +2709,8 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
         title,
         pageType,
         content,
-        // ✅ structured output: pricing + contacts
-        structured: { pricing, contacts },
+        // ✅ structured output: pricing + contacts + product specs
+        structured: { pricing, contacts, product_specs },
         wordCount: totalWords,
         status: "ok",
       }
