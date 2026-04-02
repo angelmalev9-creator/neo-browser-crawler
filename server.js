@@ -26,6 +26,7 @@ const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
+const PAGE_TIMEOUT = 30000;          // ms per page.goto — increased from 10000 for slow sites
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -2239,7 +2240,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: PAGE_TIMEOUT, waitUntil: "domcontentloaded" });
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2406,7 +2407,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: PAGE_TIMEOUT, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
