@@ -2295,11 +2295,16 @@ async function discoverLinksViaButtons(page, base) {
       });
 
       // <a> с продуктов/детайл path pattern
-      const productRe = /\/(prodaj|proekt|id-|car|auto|vehicle|propert|hotel|offer|listing|detail|item|product)[-\/\d]/i;
+      // Catches: /prodajba-na-.../mercedes-benz-..., /proekt/id-123, /car/ford etc.
+      const productRe = /\/(prodaj|proekt|id-|car|auto|vehicle|propert|hotel|offer|listing|detail|item|product)/i;
+      // Also: any URL with 2+ path segments where last segment has 5+ chars with hyphens
+      const deepSlugRe = /\/[^/]+\/[a-z0-9][a-z0-9-]{5,}/i;
       document.querySelectorAll("a[href]").forEach(a => {
         try {
           const u = new URL(a.href, base);
-          if (u.origin === origin && productRe.test(u.pathname))
+          if (u.origin !== origin) return;
+          const path = u.pathname;
+          if (productRe.test(path) || deepSlugRe.test(path))
             urls.add(u.href.split("#")[0].split("?")[0]);
         } catch {}
       });
@@ -2335,11 +2340,21 @@ async function discoverLinksViaButtons(page, base) {
         '[class*="card"]','[class*="item"]','[class*="product"]',
         '[class*="listing"]','[class*="result"]','[class*="vehicle"]',
         '[class*="propert"]','[class*="hotel"]','[class*="offer"]','article',
+        '[class*="avto"]','[class*="kola"]','[class*="auto"]','[class*="catalog"]',
+        '[class*="grid"] > *','[class*="row"] > [class*="col"]',
       ];
       for (const sel of sels) {
         if (document.querySelectorAll(sel).length >= 3) return true;
       }
-      return false;
+      // Fallback: if page has many same-domain links with long slugs → likely listing
+      const origin = window.location.origin;
+      const deepLinks = Array.from(document.querySelectorAll('a[href]')).filter(a => {
+        try {
+          const u = new URL(a.href);
+          return u.origin === origin && u.pathname.split('/').length >= 3 && u.pathname.length > 20;
+        } catch { return false; }
+      });
+      return deepLinks.length >= 5;
     });
 
     if (!isListing) return Array.from(discovered);
@@ -2461,40 +2476,50 @@ async function discoverLinksViaButtons(page, base) {
 
 // ================= PRODUCT/VEHICLE SPEC EXTRACTOR =================
 // Универсален extractor за product detail страници (коли, имоти, хотели, е-commerce).
-// Чете structured spec rows: '► Година: 2013', 'Двигател: Бензинов', 'Price: 000' и т.н.
+// Чете structured spec rows: '► Година: 2013', 'Двигател: Бензинов', 'Price: 5000лв' и т.н.
 async function extractProductSpecsFromPage(page) {
   try {
     return await page.evaluate(() => {
-      const norm = (s) => (s || '').replace(/s+/g, ' ').trim();
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
       const specs = [];
       const prices = [];
       let title = '';
       let description = '';
 
-      // ── Заглавие на продукта ──────────────────────────────────────────────
+      // ── Заглавие ─────────────────────────────────────────────────────────
       const h1 = document.querySelector('h1');
       if (h1) title = norm(h1.innerText || h1.textContent || '');
 
-      // ── Цена ─────────────────────────────────────────────────────────────
-      const priceRe = /[€$£]?s*[ds.,]+s*(лв.?|лева|BGN|EUR|€|$|лв)/i;
-      document.querySelectorAll('[class*="price"],[class*="cena"],[class*="cost"],[class*="amount"]').forEach(el => {
+      // ── Цена: широко търсене по CSS класове и text walker ─────────────────
+      const priceRe = /[\d][\d\s.,]*\s*(лв\.?|лева|BGN|EUR|€|\$)/i;
+      document.querySelectorAll('[class*="price"],[class*="cena"],[class*="cost"],[class*="amount"],[class*="suma"]').forEach(el => {
         const t = norm(el.innerText || el.textContent || '');
-        if (priceRe.test(t) && t.length < 80) prices.push(t);
+        if (priceRe.test(t) && t.length < 100) prices.push(t);
       });
+      if (prices.length === 0) {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+          const t = (node.textContent || '').trim();
+          if (priceRe.test(t) && t.length < 80) {
+            prices.push(t);
+            if (prices.length >= 3) break;
+          }
+        }
+      }
 
-      // ── Spec rows: dl/dt/dd, table rows, list items с ':' ────────────────
-      // Pattern 1: definition lists
+      // ── Spec rows: dl/dt/dd ───────────────────────────────────────────────
       document.querySelectorAll('dl').forEach(dl => {
         const dts = dl.querySelectorAll('dt');
         const dds = dl.querySelectorAll('dd');
         dts.forEach((dt, i) => {
           const key = norm(dt.innerText || dt.textContent || '');
           const val = norm(dds[i]?.innerText || dds[i]?.textContent || '');
-          if (key && val) specs.push({ key, value: val });
+          if (key && val && key.length < 60) specs.push({ key, value: val });
         });
       });
 
-      // Pattern 2: table rows with 2 cells
+      // ── Spec rows: table 2 колони ─────────────────────────────────────────
       document.querySelectorAll('table tr').forEach(tr => {
         const cells = tr.querySelectorAll('td, th');
         if (cells.length === 2) {
@@ -2504,20 +2529,22 @@ async function extractProductSpecsFromPage(page) {
         }
       });
 
-      // Pattern 3: list items / divs with 'key: value' or '► Key: Value'
-      const specItemRe = /^[►▸•-]?s*(.{2,50}?)s*[:-–]s*(.{1,200})$/;
-      document.querySelectorAll('li, [class*="spec"] *, [class*="detail"] *, [class*="feature"] *, [class*="param"] *').forEach(el => {
-        if (el.children.length > 3) return; // skip containers
+      // ── Spec rows: li/div с pattern '► Key: Value' ────────────────────────
+      const specItemRe = /^[►▸•\-]?\s*(.{2,50}?)\s*[:\-–]\s*(.{1,200})$/;
+      document.querySelectorAll(
+        'li, [class*="spec"] *, [class*="detail"] *, [class*="feature"] *, [class*="param"] *, [class*="osobenost"] *'
+      ).forEach(el => {
+        if (el.children.length > 3) return;
         const t = norm(el.innerText || el.textContent || '');
+        if (!t || t.length > 200) return;
         const m = t.match(specItemRe);
-        if (m && m[1].length < 50 && m[2].length > 0) {
+        if (m && m[1].length >= 2 && m[1].length < 50 && m[2].length > 0) {
           specs.push({ key: norm(m[1]), value: norm(m[2]) });
         }
       });
 
-      // Pattern 4: adjacent sibling pairs with label+value classes
-      const labelEls = document.querySelectorAll('[class*="label"],[class*="name"],[class*="key"],[class*="attr"]');
-      labelEls.forEach(lbl => {
+      // ── Spec rows: label + next sibling ──────────────────────────────────
+      document.querySelectorAll('[class*="label"],[class*="key"],[class*="attr"],[class*="prop"]').forEach(lbl => {
         const key = norm(lbl.innerText || lbl.textContent || '');
         if (!key || key.length > 60) return;
         const next = lbl.nextElementSibling;
@@ -2527,17 +2554,36 @@ async function extractProductSpecsFromPage(page) {
         }
       });
 
-      // ── Описание ─────────────────────────────────────────────────────────
-      const descEl = document.querySelector('[class*="desc"],[class*="about"],[class*="info"],[class*="summary"] p, article p, .content p');
-      if (descEl) {
-        description = norm(descEl.innerText || descEl.textContent || '').slice(0, 600);
+      // ── Fallback text walker: 'Key: Value' lines ─────────────────────────
+      if (specs.length < 3) {
+        const lineRe = /^(.{2,40})[:\-–]\s*(.{2,100})$/;
+        const walker2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node2;
+        while ((node2 = walker2.nextNode())) {
+          const lines = (node2.textContent || '').split('\n');
+          for (const ln of lines) {
+            const t = ln.trim().replace(/^[►▸•]\s*/, '');
+            const m = t.match(lineRe);
+            if (m && m[1].length < 40 && !/^https?/i.test(m[1])) {
+              specs.push({ key: m[1].trim(), value: m[2].trim() });
+              if (specs.length >= 50) break;
+            }
+          }
+          if (specs.length >= 50) break;
+        }
       }
+
+      // ── Описание ─────────────────────────────────────────────────────────
+      const descEl = document.querySelector(
+        '[class*="desc"] p,[class*="about"] p,article p,.content p,[class*="text"] p'
+      );
+      if (descEl) description = norm(descEl.innerText || descEl.textContent || '').slice(0, 600);
 
       // Dedupe specs by key
       const seen = new Set();
       const deduped = specs.filter(s => {
         if (!s.key || !s.value) return false;
-        const k = s.key.toLowerCase();
+        const k = s.key.toLowerCase().replace(/\s+/g, ' ').trim();
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
@@ -2547,7 +2593,7 @@ async function extractProductSpecsFromPage(page) {
         title,
         description,
         specs: deduped,
-        prices: [...new Set(prices)].slice(0, 5),
+        prices: [...new Set(prices.map(p => p.trim()))].filter(Boolean).slice(0, 5),
       };
     });
   } catch (e) {
@@ -2555,6 +2601,7 @@ async function extractProductSpecsFromPage(page) {
     return { title: '', description: '', specs: [], prices: [] };
   }
 }
+
 
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
