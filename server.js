@@ -21,7 +21,7 @@ const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
-const MAX_SECONDS = 90;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
+const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
@@ -2638,7 +2638,8 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     } catch {}
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
-    const dialogTexts = await expandHiddenContent(page);
+    // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
+    const dialogTexts = (pageType !== 'product_detail') ? await expandHiddenContent(page) : '';
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     const title = clean(await page.title());
@@ -2816,13 +2817,23 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     const initialLinks = await collectAllLinks(initPage, base);
     const initButtonLinks = await discoverLinksViaButtons(initPage, base);
     const allInitialLinks = Array.from(new Set([...initialLinks, ...initButtonLinks]));
-    queue.push(normalizeUrl(initPage.url()));
+
+    // Add homepage first
+    const homeNorm = normalizeUrl(initPage.url());
+    visited.add(homeNorm);
+    queue.push(homeNorm);
+
+    // Add all discovered links, marking visited immediately to prevent duplicates
+    let initCount = 0;
     allInitialLinks.forEach(l => {
       const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+      if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
+        visited.add(nl);
         queue.push(nl);
+        initCount++;
       }
     });
+    console.log(`[INIT] Queued ${initCount} URLs from homepage (total: ${queue.length})`);
 
     await initPage.close();
     await initContext.close();
@@ -2839,13 +2850,8 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
       while (Date.now() < deadline) {
         let url = null;
         while (queue.length > 0) {
-          const candidate = queue.shift();
-          const normalized = normalizeUrl(candidate);
-          if (!visited.has(normalized) && !SKIP_URL_RE.test(normalized)) {
-            visited.add(normalized);
-            url = normalized;
-            break;
-          }
+          url = queue.shift();
+          break; // already deduplicated at push time via visited Set
         }
 
         if (!url) {
@@ -2868,12 +2874,19 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
           stats.saved++;
         }
 
+        // Push discovered links into queue immediately (deduped, no queue.includes check — use visited Set)
+        let newLinksAdded = 0;
         result.links.forEach(l => {
           const nl = normalizeUrl(l);
-          if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
+          if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
+            visited.add(nl); // reserve immediately to avoid duplicate queue entries
             queue.push(nl);
+            newLinksAdded++;
           }
         });
+        if (newLinksAdded > 0) {
+          console.log(`[QUEUE] +${newLinksAdded} new URLs → queue: ${queue.length}`);
+        }
       }
 
       await pg.close();
