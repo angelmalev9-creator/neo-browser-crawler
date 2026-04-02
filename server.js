@@ -2637,14 +2637,15 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
     } catch {}
 
+    // ── Detect page type FIRST (needed before expandHiddenContent) ──
+    const title = clean(await page.title());
+    const pageType = detectPageType(url, title);
+    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
+
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
     const dialogTexts = (pageType !== 'product_detail') ? await expandHiddenContent(page) : '';
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
-
-    const title = clean(await page.title());
-    const pageType = detectPageType(url, title);
-    stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
     // Extract structured content
     const data = await extractStructured(page);
