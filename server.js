@@ -26,7 +26,6 @@ const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
-const PAGE_TIMEOUT = 30000;          // ms per page.goto — increased from 10000 for slow sites
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -2234,13 +2233,236 @@ async function collectAllLinks(page, base) {
   } catch { return []; }
 }
 
+// ================= BUTTON-TRIGGERED LINK DISCOVERY =================
+// Универсален детектор: открива URLs зад бутони/карти на listing страници.
+// Работи за авто сайтове, имоти, хотели, е-commerce — навсякъде където
+// детайлите се зареждат след клик, а не директно от <a href>.
+//
+// Стратегия (от бързо към бавно):
+//  Фаза 1: DOM mining — data-href, data-url, onclick, card <a> (0ms overhead)
+//  Фаза 2: Mouseover на карти за lazy-set href (без navigation)
+//  Фаза 3: Само ако фазите горе дадат <5 URL — реален клик макс 8 бутона
+async function discoverLinksViaButtons(page, base) {
+  const discovered = new Set();
+
+  try {
+    // ── Фаза 0: Стандартни <a href> ──────────────────────────────────────────
+    const directLinks = await page.evaluate((base) => {
+      const urls = new Set();
+      const origin = new URL(base).origin;
+      document.querySelectorAll("a[href]").forEach(a => {
+        try {
+          const u = new URL(a.href, base);
+          if (u.origin === origin && u.pathname !== "/" && u.pathname.length > 1)
+            urls.add(u.href.split("#")[0]);
+        } catch {}
+      });
+      return Array.from(urls);
+    }, base);
+    directLinks.forEach(u => discovered.add(u));
+
+    // ── Фаза 1: DOM mining — без кликване (бързо, 0ms overhead) ─────────────
+    // Търси: data-href, data-url, onclick="location.href=...", <a> в карти
+    const minedUrls = await page.evaluate((base) => {
+      const urls = new Set();
+      const origin = new URL(base).origin;
+
+      const tryAdd = (raw) => {
+        if (!raw || raw.startsWith("javascript:") || raw.startsWith("mailto:")) return;
+        try {
+          const u = new URL(raw, base);
+          if (u.origin === origin && u.pathname.length > 2 && !u.pathname.endsWith("/"))
+            urls.add(u.href.split("#")[0].split("?")[0]);
+        } catch {}
+      };
+
+      // data-* атрибути с URL-и
+      document.querySelectorAll("[data-href],[data-url],[data-link],[data-path],[data-navigate],[data-route]")
+        .forEach(el => {
+          ["data-href","data-url","data-link","data-path","data-navigate","data-route"].forEach(attr => {
+            tryAdd(el.getAttribute(attr));
+          });
+        });
+
+      // onclick с location.href
+      document.querySelectorAll("[onclick]").forEach(el => {
+        const oc = el.getAttribute("onclick") || "";
+        const m = oc.match(/(?:location\.href|window\.location(?:\.href)?)\s*=\s*['"]([^'"]+)['"]/);
+        if (m) tryAdd(m[1]);
+      });
+
+      // <a> с продуктов/детайл path pattern
+      const productRe = /\/(prodaj|proekt|id-|car|auto|vehicle|propert|hotel|offer|listing|detail|item|product)[-\/\d]/i;
+      document.querySelectorAll("a[href]").forEach(a => {
+        try {
+          const u = new URL(a.href, base);
+          if (u.origin === origin && productRe.test(u.pathname))
+            urls.add(u.href.split("#")[0].split("?")[0]);
+        } catch {}
+      });
+
+      // <a> вътре в card/item контейнери (React/Vue router links)
+      const cardRoots = document.querySelectorAll(
+        '[class*="card"],[class*="item-wrap"],[class*="product-item"],[class*="vehicle"],[class*="listing-item"],article'
+      );
+      cardRoots.forEach(card => {
+        card.querySelectorAll("a[href]").forEach(a => {
+          try {
+            const u = new URL(a.href, base);
+            if (u.origin === origin && u.pathname.length > 2)
+              urls.add(u.href.split("#")[0].split("?")[0]);
+          } catch {}
+        });
+      });
+
+      return Array.from(urls);
+    }, base);
+
+    minedUrls.forEach(u => discovered.add(u));
+    if (minedUrls.length > 0) {
+      console.log(`[DISCOVER] DOM-mined ${minedUrls.length} detail URLs (0 clicks needed)`);
+    }
+
+    // Ако фаза 1 дава достатъчно резултати — спираме тук
+    if (minedUrls.length >= 5) return Array.from(discovered);
+
+    // ── Провери дали е listing страница изобщо ────────────────────────────────
+    const isListing = await page.evaluate(() => {
+      const sels = [
+        '[class*="card"]','[class*="item"]','[class*="product"]',
+        '[class*="listing"]','[class*="result"]','[class*="vehicle"]',
+        '[class*="propert"]','[class*="hotel"]','[class*="offer"]','article',
+      ];
+      for (const sel of sels) {
+        if (document.querySelectorAll(sel).length >= 3) return true;
+      }
+      return false;
+    });
+
+    if (!isListing) return Array.from(discovered);
+
+    // ── Фаза 2: Mouseover — lazy-set href (без navigation) ───────────────────
+    const hoverLinks = await page.evaluate((base) => {
+      const origin = new URL(base).origin;
+      const urls = new Set();
+      const cards = document.querySelectorAll(
+        '[class*="card"],[class*="item"],article,[class*="vehicle"],[class*="product"]'
+      );
+      cards.forEach(card => {
+        card.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        card.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+        card.querySelectorAll("a[href]").forEach(a => {
+          try {
+            const u = new URL(a.href, base);
+            if (u.origin === origin && u.pathname.length > 2)
+              urls.add(u.href.split("#")[0].split("?")[0]);
+          } catch {}
+        });
+      });
+      return Array.from(urls);
+    }, base);
+    hoverLinks.forEach(u => discovered.add(u));
+
+    if (discovered.size >= 5) return Array.from(discovered);
+
+    // ── Фаза 3: Реален клик — само ако горните не дадоха достатъчно ──────────
+    // Лимит: макс 8 клика на бутони с текст за детайли
+    const clickTargets = await page.evaluate(() => {
+      const isVis = (el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          return r.width > 5 && r.height > 5 &&
+            s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+        } catch { return false; }
+      };
+      const detailRe = /детайли|виж|повече|details|view|more|открий|разгледай|покажи/i;
+      const skipRe = /nav|menu|header|footer|cookie|gdpr|cart|wishlist|compare/i;
+      const targets = [];
+
+      document.querySelectorAll(
+        'button,[role="button"],a[href="#"],a[href="javascript:void(0)"],a:not([href])'
+      ).forEach(el => {
+        if (!isVis(el)) return;
+        const text = (el.textContent || el.getAttribute("aria-label") || "").trim();
+        if (!detailRe.test(text)) return;
+        const c = el.closest("[class]");
+        if (c && skipRe.test(c.className || "")) return;
+        const idx = targets.length;
+        el.setAttribute("data-discover-btn", String(idx));
+        targets.push({ idx, text: text.slice(0, 60) });
+      });
+
+      return targets.slice(0, 8);
+    });
+
+    if (clickTargets.length === 0) return Array.from(discovered);
+    console.log(`[DISCOVER] Clicking ${clickTargets.length} detail buttons`);
+
+    for (const target of clickTargets) {
+      try {
+        const beforeUrl = page.url();
+
+        await page.evaluate((idx) => {
+          const el = document.querySelector(`[data-discover-btn="${idx}"]`);
+          if (el) el.click();
+        }, target.idx);
+
+        await page.waitForTimeout(700);
+        const afterUrl = page.url();
+
+        if (afterUrl !== beforeUrl && afterUrl.startsWith(base)) {
+          // Навигирано до нов URL
+          const cu = afterUrl.split("#")[0].split("?")[0];
+          if (cu.length > base.length + 1) {
+            discovered.add(cu);
+            console.log(`[DISCOVER] Click nav → ${cu}`);
+          }
+          await page.goBack({ timeout: 6000, waitUntil: "domcontentloaded" }).catch(() => {});
+          await page.waitForTimeout(500);
+        } else {
+          // Modal/panel — извлечи нови линкове от DOM
+          const newLinks = await page.evaluate((base) => {
+            const urls = new Set();
+            const origin = new URL(base).origin;
+            document.querySelectorAll("a[href]").forEach(a => {
+              try {
+                const u = new URL(a.href, base);
+                if (u.origin === origin && u.pathname.length > 2)
+                  urls.add(u.href.split("#")[0].split("?")[0]);
+              } catch {}
+            });
+            return Array.from(urls);
+          }, base);
+          newLinks.forEach(u => discovered.add(u));
+
+          // Затвори modal
+          await page.evaluate(() => {
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+            const cb = document.querySelector(
+              '[role="dialog"] button[aria-label*="close" i],[role="dialog"] button[aria-label*="затвори" i]'
+            );
+            if (cb) cb.click();
+          });
+          await page.waitForTimeout(250);
+        }
+      } catch { /* timeout или навигационна грешка — продължи */ }
+    }
+
+  } catch (e) {
+    console.error("[DISCOVER] Error:", e.message);
+  }
+
+  return Array.from(discovered);
+}
+
 // ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: PAGE_TIMEOUT, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2342,12 +2564,21 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     const elapsed = Date.now() - startTime;
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
+    // ── Link discovery: стандартни <a> + бутон-задвижени URL-и (universal) ──
+    const standardLinks = await collectAllLinks(page, base);
+    const buttonLinks = await discoverLinksViaButtons(page, base);
+    const allLinks = Array.from(new Set([...standardLinks, ...buttonLinks]));
+    const extraCount = allLinks.length - standardLinks.length;
+    if (extraCount > 0) {
+      console.log(`[DISCOVER] +${extraCount} button-discovered links (total ${allLinks.length})`);
+    }
+
     if (pageType !== "services" && totalWords < MIN_WORDS) {
-      return { links: await collectAllLinks(page, base), page: null };
+      return { links: allLinks, page: null };
     }
 
     return {
-      links: await collectAllLinks(page, base),
+      links: allLinks,
       page: {
         url,
         title,
@@ -2407,12 +2638,14 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     });
     const initPage = await initContext.newPage();
 
-    await initPage.goto(startUrl, { timeout: PAGE_TIMEOUT, waitUntil: "domcontentloaded" });
+    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
     const initialLinks = await collectAllLinks(initPage, base);
+    const initButtonLinks = await discoverLinksViaButtons(initPage, base);
+    const allInitialLinks = Array.from(new Set([...initialLinks, ...initButtonLinks]));
     queue.push(normalizeUrl(initPage.url()));
-    initialLinks.forEach(l => {
+    allInitialLinks.forEach(l => {
       const nl = normalizeUrl(l);
       if (!visited.has(nl) && !SKIP_URL_RE.test(nl) && !queue.includes(nl)) {
         queue.push(nl);
