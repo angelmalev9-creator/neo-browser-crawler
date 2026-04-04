@@ -94,108 +94,132 @@ function normalizeDomain(u) {
 
 // ================= CONTACT EXTRACTION =================
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-// broad phone-ish: +90 532 155 86 96, (052) 123-45-67, 0888 123 456 etc.
-// FIX: Не използваме глобален regex обект с /g флаг — причинява бъг с lastIndex между извикванията
+
+// CRITICAL: НЕ дефинираме PHONE_CANDIDATE_RE като глобален /g обект.
+// Глобален regex с /g пази lastIndex между извикванията → при второ
+// извикване на extractContactsFromText started от грешна позиция и
+// пропуска ВСИЧКИ номера. Използваме фабрична функция вместо това.
 const DATE_DOT_RE = /\b\d{1,2}\.\d{1,2}\.\d{4}\b/;
 
-function extractPhoneCandidates(text) {
-  // FIX: Нов regex обект при всяко извикване — избягва проблема с lastIndex при /g флаг
-  // По-либерален pattern: хваща и номера без разделители (0888123456)
-  const PHONE_CANDIDATE_RE = /(\+?[\d][\d\s().\-\/]{5,}[\d])/g;
-  const results = [];
-  let m;
-  while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
-    results.push(m[1]);
-  }
-  return results;
+function makePhoneRE() {
+  // Хваща: +359 88 123 456, (052) 123-45-67, 0888123456, 00 359 88 ...
+  // - Разрешаваме / като разделител (някои сайтове: 0888/123456)
+  // - {4,} вместо {6,} → минимум 6 цифри total (покрива 6-цифрени местни)
+  return /(\+?[\d][\d\s().\/\-]{4,}[\d])/g;
 }
 
 function normalizePhone(raw) {
-  const s = String(raw || "").trim();
+  const s = String(raw || "")
+    .replace(/\u00A0/g, " ")   // non-breaking space → space
+    .replace(/\u2011/g, "-")   // non-breaking hyphen → hyphen
+    .trim();
   if (!s) return "";
-  if (DATE_DOT_RE.test(s)) return ""; // avoid dates like 10.12.2025
+  if (DATE_DOT_RE.test(s)) return ""; // отхвърляме дати: 10.12.2025
 
-  // keep leading +, strip other non-digits
-  const hasPlus = s.trim().startsWith("+");
+  const hasPlus = s.startsWith("+");
   const digits = s.replace(/[^\d]/g, "");
-  // FIX: Разширен диапазон — 7 до 15 цифри (покрива кратки местни и международни номера)
+
+  // 7–15 цифри: покрива кратки местни (7) до международни (15)
   if (digits.length < 7 || digits.length > 15) return "";
+
+  // Отхвърляме очевидно не-телефонни числа (години, zip codes, цени)
+  // Ако е чисто число без + и е точно 4 цифри → почти сигурно не е тел.
+  if (!hasPlus && digits.length === 4) return "";
 
   return hasPlus ? `+${digits}` : digits;
 }
 
 function extractContactsFromText(text) {
   const out = { emails: [], phones: [] };
-
   if (!text) return out;
 
+  // EMAIL_RE има /gi флаг — match() не пази state, безопасно е
   const emails = (text.match(EMAIL_RE) || [])
     .map(e => e.trim())
     .filter(Boolean);
 
-  // FIX: Използваме функция вместо глобален regex — без проблем с lastIndex
-  const phonesRaw = extractPhoneCandidates(text);
-  const phones = phonesRaw
-    .map(normalizePhone)
-    .filter(Boolean);
+  // КРИТИЧНО: Нов regex обект при всяко извикване — никакъв споделен lastIndex
+  const re = makePhoneRE();
+  const phonesRaw = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    phonesRaw.push(m[1]);
+  }
+  const phones = phonesRaw.map(normalizePhone).filter(Boolean);
 
-  // dedupe
-  out.emails = Array.from(new Set(emails)).slice(0, 12);
-  out.phones = Array.from(new Set(phones)).slice(0, 12);
-
+  out.emails = Array.from(new Set(emails)).slice(0, 20);
+  out.phones = Array.from(new Set(phones)).slice(0, 20);
   return out;
 }
 
 async function extractContactsFromPage(page) {
   try {
     const dom = await page.evaluate(() => {
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const norm = (s) => (s || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 
       const emails = new Set();
       const phones = new Set();
 
-      // mailto/tel links
+      // ── 1. mailto: и tel: линкове — най-надеждният източник ──────────────
       document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
-        const href = a.getAttribute("href") || "";
-        const v = href.replace(/^mailto:/i, "").split("?")[0];
-        if (v) emails.add(v.trim());
+        const v = (a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0];
+        if (v) emails.add(norm(v));
       });
 
       document.querySelectorAll('a[href^="tel:"]').forEach(a => {
-        const href = a.getAttribute("href") || "";
-        // FIX: Почистваме tel: prefix и нормализираме — href може да е +35988..., (02)..., 0888...
-        const raw = href.replace(/^tel:/i, "").replace(/\s/g, "");
-        if (raw) phones.add(raw.trim());
+        // tel: href може да е: tel:+35988123456, tel:0888 123 456, tel:(02)9876543
+        // Взимаме суровата стойност — нормализацията става в Node.js след това
+        const raw = (a.getAttribute("href") || "").replace(/^tel:/i, "").trim();
+        if (raw) phones.add(raw);
+        // Взимаме и видимия текст на линка — може да е форматиран по-четимо
+        const visible = norm(a.innerText || a.textContent || "");
+        if (visible && /[\d]/.test(visible)) phones.add(visible);
       });
 
-      // visible text hints near footer/contact areas
-      // FIX: Добавени повече селектори — English + Bulgarian class/id имена
+      // ── 2. Текстово съдържание от контактни зони ─────────────────────────
+      // Широки селектори: хваща footer, contact секции, sidebar, header
       const candidates = [];
-      const footer = document.querySelector("footer");
-      if (footer) candidates.push(footer.innerText || "");
-
       const contactSelectors = [
+        "footer",
+        "header",
         "[id*='contact'],[class*='contact']",
-        "[id*='kontakti'],[class*='kontakti']",
-        "[id*='contacts'],[class*='contacts']",
-        "[id*='tel'],[class*='tel']",
+        "[id*='kontakt'],[class*='kontakt']",
         "[id*='phone'],[class*='phone']",
+        "[id*='tel'],[class*='tel']",
         "[id*='sidebar'],[class*='sidebar']",
-        "[id*='header'],[class*='header']",
+        "[id*='info'],[class*='info']",
+        "[id*='reach'],[class*='reach']",
+        ".widget",
+        "[itemtype*='LocalBusiness']",
+        "[itemtype*='Organization']",
       ];
+
+      const seen = new Set();
       for (const sel of contactSelectors) {
         try {
           document.querySelectorAll(sel).forEach(el => {
-            const t = el.innerText || "";
+            if (seen.has(el)) return;
+            seen.add(el);
+            const t = norm(el.innerText || el.textContent || "");
             if (t) candidates.push(t);
           });
         } catch {}
       }
 
+      // ── 3. Schema.org telephone / email ──────────────────────────────────
+      document.querySelectorAll('[itemprop="telephone"]').forEach(el => {
+        const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
+        if (t) phones.add(t);
+      });
+      document.querySelectorAll('[itemprop="email"]').forEach(el => {
+        const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
+        if (t) emails.add(t);
+      });
+
       return {
-        emails: Array.from(emails).map(norm).filter(Boolean).slice(0, 12),
-        phones: Array.from(phones).map(norm).filter(Boolean).slice(0, 12),
-        textHints: candidates.map(norm).filter(Boolean).join("\n"),
+        emails: Array.from(emails).filter(Boolean).slice(0, 20),
+        phones: Array.from(phones).filter(Boolean).slice(0, 20),
+        textHints: candidates.filter(Boolean).join("\n"),
       };
     });
 
@@ -2739,30 +2763,38 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       dialogTexts ? `DIALOG_CONTENT\n${dialogTexts}` : '',
       specsText,
     ].filter(Boolean).join('\n\n');
-    const htmlContent = normalizeNumbers(clean(rawAll));
 
-    const content = htmlContent;
-
-    // ✅ NEW: contacts extraction (DOM + combined text)
+    // КРИТИЧНО: Извличаме контакти от СУРОВИЯ текст — ПРЕДИ normalizeNumbers
+    // normalizeNumbers може да конвертира цифри в думи и да унищожи номерата
     const domContacts = await extractContactsFromPage(page);
-    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
 
-    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
-    // FIX: tel: href може да съдържа форматирани номера (+359..., 0...) — нормализираме всички
-    const allPhones = [
-      ...(domContacts.phones || []).map(p => normalizePhone(p.replace(/[^\d+]/g, ""))).filter(Boolean),
-      ...(textContacts.phones || []),
-    ];
-    const mergedPhones = Array.from(new Set(allPhones)).slice(0, 12);
+    // Подаваме RAW текст + textHints от DOM (footer, contact секции и т.н.)
+    const rawForContacts = `${rawAll}\n\n${domContacts.textHints || ""}`;
+    const textContacts = extractContactsFromText(rawForContacts);
 
-    const contacts = {
-      emails: mergedEmails,
-      phones: mergedPhones,
-    };
+    // tel: href стойностите от DOM се нормализират тук в Node.js
+    // (в browser evaluate не можем да викаме normalizePhone)
+    const domPhones = (domContacts.phones || [])
+      .map(p => normalizePhone(p))
+      .filter(Boolean);
+
+    const mergedEmails = Array.from(
+      new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])
+    ).slice(0, 20);
+
+    const mergedPhones = Array.from(
+      new Set([...domPhones, ...(textContacts.phones || [])])
+    ).slice(0, 20);
+
+    const contacts = { emails: mergedEmails, phones: mergedPhones };
 
     if (contacts.emails.length || contacts.phones.length) {
       console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
     }
+
+    // Нормализираме числата СЛЕД като сме извлекли контактите
+    const htmlContent = normalizeNumbers(clean(rawAll));
+    const content = htmlContent;
 
     const totalWords = countWordsExact(htmlContent);
 
