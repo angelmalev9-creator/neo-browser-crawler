@@ -95,8 +95,20 @@ function normalizeDomain(u) {
 // ================= CONTACT EXTRACTION =================
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
 // broad phone-ish: +90 532 155 86 96, (052) 123-45-67, 0888 123 456 etc.
-const PHONE_CANDIDATE_RE = /(\+?\d[\d\s().-]{6,}\d)/g;
+// FIX: Не използваме глобален regex обект с /g флаг — причинява бъг с lastIndex между извикванията
 const DATE_DOT_RE = /\b\d{1,2}\.\d{1,2}\.\d{4}\b/;
+
+function extractPhoneCandidates(text) {
+  // FIX: Нов regex обект при всяко извикване — избягва проблема с lastIndex при /g флаг
+  // По-либерален pattern: хваща и номера без разделители (0888123456)
+  const PHONE_CANDIDATE_RE = /(\+?[\d][\d\s().\-\/]{5,}[\d])/g;
+  const results = [];
+  let m;
+  while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
+    results.push(m[1]);
+  }
+  return results;
+}
 
 function normalizePhone(raw) {
   const s = String(raw || "").trim();
@@ -106,8 +118,8 @@ function normalizePhone(raw) {
   // keep leading +, strip other non-digits
   const hasPlus = s.trim().startsWith("+");
   const digits = s.replace(/[^\d]/g, "");
-  // typical phone length guard (tolerant)
-  if (digits.length < 8 || digits.length > 15) return "";
+  // FIX: Разширен диапазон — 7 до 15 цифри (покрива кратки местни и международни номера)
+  if (digits.length < 7 || digits.length > 15) return "";
 
   return hasPlus ? `+${digits}` : digits;
 }
@@ -121,11 +133,8 @@ function extractContactsFromText(text) {
     .map(e => e.trim())
     .filter(Boolean);
 
-  const phonesRaw = [];
-  let m;
-  while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
-    phonesRaw.push(m[1]);
-  }
+  // FIX: Използваме функция вместо глобален regex — без проблем с lastIndex
+  const phonesRaw = extractPhoneCandidates(text);
   const phones = phonesRaw
     .map(normalizePhone)
     .filter(Boolean);
@@ -154,17 +163,34 @@ async function extractContactsFromPage(page) {
 
       document.querySelectorAll('a[href^="tel:"]').forEach(a => {
         const href = a.getAttribute("href") || "";
-        const v = href.replace(/^tel:/i, "");
-        if (v) phones.add(v.trim());
+        // FIX: Почистваме tel: prefix и нормализираме — href може да е +35988..., (02)..., 0888...
+        const raw = href.replace(/^tel:/i, "").replace(/\s/g, "");
+        if (raw) phones.add(raw.trim());
       });
 
       // visible text hints near footer/contact areas
+      // FIX: Добавени повече селектори — English + Bulgarian class/id имена
       const candidates = [];
       const footer = document.querySelector("footer");
       if (footer) candidates.push(footer.innerText || "");
-      const contactSection =
-        document.querySelector("[id*='contact'],[class*='contact'],[id*='kontakti'],[class*='kontakti']");
-      if (contactSection) candidates.push(contactSection.innerText || "");
+
+      const contactSelectors = [
+        "[id*='contact'],[class*='contact']",
+        "[id*='kontakti'],[class*='kontakti']",
+        "[id*='contacts'],[class*='contacts']",
+        "[id*='tel'],[class*='tel']",
+        "[id*='phone'],[class*='phone']",
+        "[id*='sidebar'],[class*='sidebar']",
+        "[id*='header'],[class*='header']",
+      ];
+      for (const sel of contactSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(el => {
+            const t = el.innerText || "";
+            if (t) candidates.push(t);
+          });
+        } catch {}
+      }
 
       return {
         emails: Array.from(emails).map(norm).filter(Boolean).slice(0, 12),
@@ -2722,7 +2748,12 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
 
     const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
-    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
+    // FIX: tel: href може да съдържа форматирани номера (+359..., 0...) — нормализираме всички
+    const allPhones = [
+      ...(domContacts.phones || []).map(p => normalizePhone(p.replace(/[^\d+]/g, ""))).filter(Boolean),
+      ...(textContacts.phones || []),
+    ];
+    const mergedPhones = Array.from(new Set(allPhones)).slice(0, 12);
 
     const contacts = {
       emails: mergedEmails,
