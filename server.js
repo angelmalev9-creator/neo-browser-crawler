@@ -1,6 +1,11 @@
 import http from "http";
 import crypto from "crypto";
-import { chromium } from "playwright";
+import { chromium as chromiumBase } from "playwright";
+import { default as PlaywrightExtra } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+PlaywrightExtra.use(StealthPlugin());
+const chromium = PlaywrightExtra;
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -156,44 +161,35 @@ async function extractContactsFromPage(page) {
   try {
     const dom = await page.evaluate(() => {
       const norm = (s) => (s || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
-
       const emails = new Set();
       const phones = new Set();
 
-      // ── 1. mailto: и tel: линкове — най-надеждният източник ──────────────
+      // 1. mailto: / tel: линкове
       document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
         const v = (a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0];
         if (v) emails.add(norm(v));
       });
-
       document.querySelectorAll('a[href^="tel:"]').forEach(a => {
-        // tel: href може да е: tel:+35988123456, tel:0888 123 456, tel:(02)9876543
-        // Взимаме суровата стойност — нормализацията става в Node.js след това
         const raw = (a.getAttribute("href") || "").replace(/^tel:/i, "").trim();
         if (raw) phones.add(raw);
-        // Взимаме и видимия текст на линка — може да е форматиран по-четимо
         const visible = norm(a.innerText || a.textContent || "");
         if (visible && /[\d]/.test(visible)) phones.add(visible);
       });
 
-      // ── 2. Текстово съдържание от контактни зони ─────────────────────────
-      // Широки селектори: хваща footer, contact секции, sidebar, header
+      // 2. Контактни зони в DOM
       const candidates = [];
       const contactSelectors = [
-        "footer",
-        "header",
+        "footer", "header",
         "[id*='contact'],[class*='contact']",
         "[id*='kontakt'],[class*='kontakt']",
         "[id*='phone'],[class*='phone']",
         "[id*='tel'],[class*='tel']",
         "[id*='sidebar'],[class*='sidebar']",
         "[id*='info'],[class*='info']",
-        "[id*='reach'],[class*='reach']",
         ".widget",
         "[itemtype*='LocalBusiness']",
         "[itemtype*='Organization']",
       ];
-
       const seen = new Set();
       for (const sel of contactSelectors) {
         try {
@@ -206,7 +202,7 @@ async function extractContactsFromPage(page) {
         } catch {}
       }
 
-      // ── 3. Schema.org telephone / email ──────────────────────────────────
+      // 3. Schema.org
       document.querySelectorAll('[itemprop="telephone"]').forEach(el => {
         const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
         if (t) phones.add(t);
@@ -222,7 +218,6 @@ async function extractContactsFromPage(page) {
         textHints: candidates.filter(Boolean).join("\n"),
       };
     });
-
     return dom || { emails: [], phones: [], textHints: "" };
   } catch {
     return { emails: [], phones: [], textHints: "" };
@@ -2659,7 +2654,11 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
+    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+
+    // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
+    const passedCf = await waitForRealContent(page, url);
+    if (!passedCf) return { links: [], page: null };
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2835,6 +2834,65 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 }
 
 // ================= PARALLEL CRAWLER =================
+// ================= STEALTH + CLOUDFLARE BYPASS =================
+const STEALTH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+async function makeStealthContext(browser) {
+  return browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    userAgent: STEALTH_UA,
+    locale: 'bg-BG',
+    timezoneId: 'Europe/Sofia',
+    extraHTTPHeaders: {
+      'Accept-Language': 'bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+    },
+  });
+}
+
+async function applyStealthScripts(page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['bg-BG', 'bg', 'en-US', 'en'] });
+    if (!window.chrome) window.chrome = { runtime: {} };
+    delete window.__playwright;
+    delete window.__pw_manual;
+  });
+}
+
+async function waitForRealContent(page, url) {
+  const cfSignals = ['just a moment','checking your browser','performing security','please wait','enable javascript and cookies','ray id'];
+  const isCfPage = async () => {
+    try {
+      const title = (await page.title()).toLowerCase();
+      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 600));
+      return cfSignals.some(s => title.includes(s) || body.includes(s));
+    } catch { return false; }
+  };
+  if (!(await isCfPage())) return true;
+  console.log('[CF] Cloudflare detected — waiting up to 15s for ' + url);
+  for (let i = 0; i < 15; i++) {
+    await page.waitForTimeout(1000);
+    if (!(await isCfPage())) {
+      console.log('[CF] Passed after ' + (i + 1) + 's');
+      await page.waitForTimeout(500);
+      return true;
+    }
+  }
+  console.log('[CF] Still blocked after 15s — skipping ' + url);
+  return false;
+}
+
 async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   // If caller passed a deadline (e.g. scrape-website knows its own timeout),
   // use that minus a 5s buffer for JSON serialization + response.
@@ -2849,7 +2907,18 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-extensions",
+      "--lang=bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
+    ],
   });
 
   const stats = {
@@ -2869,11 +2938,9 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
-    const initContext = await browser.newContext({
-      viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    });
+    const initContext = await makeStealthContext(browser);
     const initPage = await initContext.newPage();
+    await applyStealthScripts(initPage);
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
@@ -2905,11 +2972,9 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`[CRAWL] Found ${queue.length} URLs`);
 
     const createWorker = async () => {
-      const ctx = await browser.newContext({
-        viewport: { width: 1920, height: 1080 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      });
+      const ctx = await makeStealthContext(browser);
       const pg = await ctx.newPage();
+      await applyStealthScripts(pg);
 
       while (Date.now() < deadline) {
         let url = null;
