@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y \
 COPY package.json ./
 RUN npm install
 
-# 🔥 ВАЖНОТО
+# Install Chromium browser
 RUN npx playwright install chromium
 
 COPY . .
