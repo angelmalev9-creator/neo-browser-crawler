@@ -213,6 +213,12 @@ async function extractContactsFromPage(page) {
         if (t) emails.add(t);
       });
 
+      // 4. Body full text — хваща номера навсякъде на страницата
+      try {
+        const bt = (document.body && document.body.innerText || '').replace(/[\s]+/g, ' ').trim();
+        if (bt) candidates.push(bt);
+      } catch {}
+
       return {
         emails: Array.from(emails).filter(Boolean).slice(0, 20),
         phones: Array.from(phones).filter(Boolean).slice(0, 20),
@@ -2872,11 +2878,20 @@ async function applyStealthScripts(page) {
 }
 
 async function waitForRealContent(page, url) {
-  const cfSignals = ['just a moment','checking your browser','performing security','please wait','enable javascript and cookies','ray id'];
+  // Никога не scrape-ваме Cloudflare challenge URL-и директно
+  if (/cdn-cgi|challenge-platform|.cloudflare.com/i.test(url)) return false;
+
+  const cfSignals = [
+    'just a moment', 'един момент', 'checking your browser',
+    'performing security', 'изпълнение на проверка',
+    'please wait', 'изчакване', 'enable javascript and cookies',
+    'ray id', 'challenge-platform', 'cf-browser-verification',
+    'проверка на сигурността', 'проверява, че не сте бот',
+  ];
   const isCfPage = async () => {
     try {
       const title = (await page.title()).toLowerCase();
-      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 600));
+      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 800));
       return cfSignals.some(s => title.includes(s) || body.includes(s));
     } catch { return false; }
   };
