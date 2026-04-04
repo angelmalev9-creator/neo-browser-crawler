@@ -1,11 +1,12 @@
 import http from "http";
 import crypto from "crypto";
-import { chromium as chromiumBase } from "playwright";
-import { default as PlaywrightExtra } from "playwright-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import { createRequire } from "module";
 
-PlaywrightExtra.use(StealthPlugin());
-const chromium = PlaywrightExtra;
+// playwright-extra не е ESM-native — зареждаме го чрез createRequire
+const require = createRequire(import.meta.url);
+const { chromium } = require("playwright-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+chromium.use(StealthPlugin());
 
 const PORT = Number(process.env.PORT || 10000);
 
