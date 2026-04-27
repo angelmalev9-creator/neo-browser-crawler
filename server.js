@@ -23,7 +23,7 @@ let crawlFinished = false;
 let lastResult = null;
 let lastCrawlUrl = null;
 let lastCrawlTime = 0;
-const RESULT_TTL_MS = 5 * 60 * 1000;
+const RESULT_TTL_MS = 30 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
@@ -3017,7 +3017,7 @@ rawAll
 )
 );
 
-    const totalWords = countWordsExact(htmlContent);
+    const totalWords = countWordsExact(content);
 
     const elapsed = Date.now() - startTime;
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
