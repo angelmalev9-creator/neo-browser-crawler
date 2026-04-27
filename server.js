@@ -1,5 +1,6 @@
 import http from "http";
 import crypto from "crypto";
+import { gzipSync } from "zlib";
 import { createRequire } from "module";
 
 // playwright-extra не е ESM-native — зареждаме го чрез createRequire
@@ -23,7 +24,7 @@ let crawlFinished = false;
 let lastResult = null;
 let lastCrawlUrl = null;
 let lastCrawlTime = 0;
-const RESULT_TTL_MS = 30 * 1000;
+const RESULT_TTL_MS = 120 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
@@ -3374,18 +3375,16 @@ http
 
         console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
-        res.writeHead(200, { "Content-Type": "application/json" });
-        import zlib from "zlib";
-const gz = zlib.gzipSync(
-JSON.stringify({ success: true, ...result })
-);
+               const gz = gzipSync(
+          JSON.stringify({ success: true, ...result })
+        );
 
-res.writeHead(200,{
-"Content-Type":"application/json",
-"Content-Encoding":"gzip"
-});
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip"
+        });
 
-res.end(gz);
+        res.end(gz);
       } catch (e) {
         crawlInProgress = false;
         console.error("[CRAWL ERROR]", e.message);
