@@ -28,10 +28,10 @@ const visited = new Set();
 
 // ================= LIMITS =================
 const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
-const MIN_WORDS = 20;
+const MIN_WORDS = 5;
 const PARALLEL_TABS = 8;          // ↑ was 5
-const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 18;          // NEW: cap scroll depth
+const SCROLL_STEP_MS = 180;           // ↓ was 100ms per scroll step
+const MAX_SCROLL_STEPS = 50;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -668,7 +668,70 @@ async function sendSiteMapToWorker(siteMap) {
 // ═══════════════════════════════════════════════════════════════════════════
 // NEW: PRICING/PACKAGES STRUCTURED EXTRACTION
 // ═══════════════════════════════════════════════════════════════════════════
+async function extractSemanticBlocksFromPage(page){
+return await page.evaluate(()=>{
 
+ const norm=s=>(s||'').replace(/\s+/g,' ').trim();
+
+ const blocks=[];
+ const seen=new Set();
+
+ const candidates=document.querySelectorAll(
+`
+section,
+article,
+div,
+li,
+[class*="card"],
+[class*="plan"],
+[class*="pricing"],
+[class*="package"],
+[class*="feature"],
+[class*="service"]
+`
+);
+
+ candidates.forEach(el=>{
+
+   const txt=norm(el.innerText||el.textContent||'');
+
+   if(
+      txt.length<40 ||
+      txt.length>5000
+   ) return;
+
+   if(
+      !el.querySelector("h1,h2,h3,h4,li,button,strong,b") &&
+      txt.length<120
+   ) return;
+
+   const key=txt.slice(0,500);
+
+   if(seen.has(key)) return;
+   seen.add(key);
+
+   blocks.push({
+      text:txt,
+      tag:(el.tagName||'').toLowerCase(),
+      title:
+        (
+         el.querySelector("h1,h2,h3,h4,strong,b,[class*=title]")?.innerText||
+         ""
+        ).trim(),
+
+      has_price:/€|\$|лв|eur/i.test(txt),
+
+      features:Array.from(
+       el.querySelectorAll("li")
+      ).map(x=>norm(x.innerText)).filter(Boolean).slice(0,12)
+   });
+
+ });
+
+ return blocks.slice(0,150);
+
+});
+}
 async function extractPricingFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
@@ -2137,7 +2200,7 @@ style.visibility !== "hidden";
     console.error('[DIALOG] Error:', e.message);
   }
 
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(7000);
   return dialogTexts;
 }
 
@@ -2224,7 +2287,9 @@ async function extractStructured(page) {
       let current = null;
       const processedElements = new Set();
 
-      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
+      document.querySelectorAll(
+"h1,h2,h3,h4,h5,h6,p,li,span,div,strong,b,td,th"
+).forEach(el => {
         if (processedElements.has(el)) return;
         if (el.closest("details.wp-block-details, details")) return;
         let parent = el.parentElement;
@@ -2731,8 +2796,8 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, {
-  timeout: 30000,
+await page.goto(url, {
+  timeout: 60000,
   waitUntil: "networkidle"
 });
 
@@ -2741,7 +2806,7 @@ const passedCf = await waitForRealContent(page, url);
 if (!passedCf) return { links: [], page: null };
 
 // LOVABLE / React hydration fix
-await page.waitForTimeout(3000);
+await page.waitForTimeout(6000);
 
 await page.evaluate(async()=>{
   window.scrollTo(0,document.body.scrollHeight);
@@ -2765,7 +2830,7 @@ await page.evaluate(async()=>{
   });
 });
 
-await page.waitForTimeout(2500);
+await page.waitForTimeout(6000);
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2787,7 +2852,7 @@ await page.waitForTimeout(2500);
       });
     }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
 
-    await page.waitForTimeout(2500); // ↓ was 500ms
+    await page.waitForTimeout(7000);
 
     try {
       await page.waitForLoadState('networkidle', { timeout: 7000 }); // ↓ was 3000ms
@@ -2808,6 +2873,7 @@ await page.waitForTimeout(2500);
 
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
+let semantic_blocks = [];
     try {
       pricing = await extractPricingFromPage(page);
 
