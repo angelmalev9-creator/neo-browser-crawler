@@ -858,7 +858,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,7}(?:[\s.,]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv|м2|m2)?(?:\s*\/?\s*(месец|month|mo|mес))?(?:\s*(?:без ддс|с ддс|turnkey|до ключ))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -904,15 +904,20 @@ async function extractPricingFromPage(page) {
       for (let i = 0; i < 8 && el; i++) {
         const cls = (el.className && typeof el.className === "string") ? el.className : "";
         const tag = (el.tagName || "").toLowerCase();
-        const looksCard =
-          /card|pricing|package|plan|tier|column/i.test(cls) ||
-          ["article","section"].includes(tag);
+       const looksCard =
+/card|pricing|package|plan|tier|column|offer|box|pricing-table|bundle/i.test(cls) ||
+["article","section","div","li"].includes(tag);
 
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
+        if(
+(looksCard||moneyRe.test(txt)) &&
+(hasTitle||hasFeatures||moneyRe.test(txt)) &&
+txt.length>=20 &&
+txt.length<=4000
+) return el;
         el = el.parentElement;
       }
       return null;
@@ -942,7 +947,32 @@ features:[]
 });
 }catch{}
 });
+document.querySelectorAll(
+'[class*="pricing"],[class*="package"],[class*="plan"],[class*="card"],.elementor-widget-container'
+).forEach(root=>{
 
+if(!isVisible(root)) return;
+
+const txt=getText(root);
+
+if(
+!/лв|€|eur|price|цени|пакет/i.test(txt)
+) return;
+
+const title=pickTitle(root);
+const mm=txt.match(moneyRe);
+
+if(!mm) return;
+
+cards.push({
+title:title||'Package',
+price_text:mm[0],
+period:pickPeriod(root),
+badge:pickBadge(root),
+features:pickFeatures(root)
+});
+
+});
     const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
@@ -2922,7 +2952,7 @@ await forceRenderEverything(page);
 
 let shadowText = "";
 
-if (/pricing|ceni|service|product/i.test(url)) {
+if (/pricing|ceni|service|product|paketi|paket/i.test(url)) {
  shadowText = await extractShadowAndPortalText(page);
 }
 
