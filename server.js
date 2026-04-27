@@ -29,9 +29,9 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
 const MIN_WORDS = 5;
-const PARALLEL_TABS = 8;          // ↑ was 5
-const SCROLL_STEP_MS = 180;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 50;          // NEW: cap scroll depth
+const PARALLEL_TABS = 12;          // ↑ was 5
+const SCROLL_STEP_MS = 50;           // ↓ was 100ms per scroll step
+const MAX_SCROLL_STEPS = 20;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -2200,7 +2200,7 @@ style.visibility !== "hidden";
     console.error('[DIALOG] Error:', e.message);
   }
 
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(2500);
   return dialogTexts;
 }
 
@@ -2287,9 +2287,18 @@ async function extractStructured(page) {
       let current = null;
       const processedElements = new Set();
 
-      document.querySelectorAll(
-"h1,h2,h3,h4,h5,h6,p,li,span,div,strong,b,td,th"
-).forEach(el => {
+     document.querySelectorAll(`
+h1,h2,h3,h4,h5,h6,
+p,li,span,div,strong,b,
+td,th,
+article,
+section,
+main,
+aside,
+blockquote,
+figcaption,
+label
+`).forEach(el => {
         if (processedElements.has(el)) return;
         if (el.closest("details.wp-block-details, details")) return;
         let parent = el.parentElement;
@@ -2390,7 +2399,12 @@ async function extractStructured(page) {
           topControlTexts.push(parts);
         });
       } catch {}
-
+let bodyDump = "";
+try{
+ bodyDump = (
+   document.body?.innerText || ""
+ ).replace(/\s+/g," ").trim();
+}catch{}
       return {
         rawContent: [
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
@@ -2399,6 +2413,7 @@ async function extractStructured(page) {
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
           topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
+bodyDump ? `BODY_DUMP\n${bodyDump}` : "",
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -2830,7 +2845,7 @@ await page.evaluate(async()=>{
   });
 });
 
-await page.waitForTimeout(6000);
+await page.waitForTimeout(1500);
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2852,7 +2867,7 @@ await page.waitForTimeout(6000);
       });
     }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
 
-    await page.waitForTimeout(7000);
+    await page.waitForTimeout(2500);
 
     try {
       await page.waitForLoadState('networkidle', { timeout: 7000 }); // ↓ was 3000ms
