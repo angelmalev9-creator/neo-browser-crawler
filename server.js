@@ -3375,7 +3375,17 @@ http
         console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, ...result }));
+        import zlib from "zlib";
+const gz = zlib.gzipSync(
+JSON.stringify({ success: true, ...result })
+);
+
+res.writeHead(200,{
+"Content-Type":"application/json",
+"Content-Encoding":"gzip"
+});
+
+res.end(gz);
       } catch (e) {
         crawlInProgress = false;
         console.error("[CRAWL ERROR]", e.message);
