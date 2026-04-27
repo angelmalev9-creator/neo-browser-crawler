@@ -29,7 +29,7 @@ const visited = new Set();
 // ================= LIMITS =================
 const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 7;          // ↑ was 5
+const PARALLEL_TABS = 5;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 12;
 const HYDRATION_WAIT_MS = 4000;
