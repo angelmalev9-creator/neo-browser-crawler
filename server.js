@@ -32,7 +32,7 @@ const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-websi
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 12;
+const MAX_SCROLL_STEPS = 5;
 const HYDRATION_WAIT_MS = 1800;
 const MUTATION_IDLE_MS = 2200;          // NEW: cap scroll depth
 
@@ -2920,8 +2920,11 @@ await forceRenderEverything(page);
     // Extract structured content
     const data = await extractStructured(page);
 
-const shadowText =
-await extractShadowAndPortalText(page);
+let shadowText = "";
+
+if (/pricing|ceni|service|product/i.test(url)) {
+ shadowText = await extractShadowAndPortalText(page);
+}
 
 const apiPayloads =
 getNetworkPayloads();
@@ -3049,14 +3052,26 @@ rawAll
     const elapsed = Date.now() - startTime;
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
-    // ── Link discovery: стандартни <a> + бутон-задвижени URL-и (universal) ──
-    const standardLinks = await collectAllLinks(page, base);
-    const buttonLinks = await discoverLinksViaButtons(page, base);
-    const allLinks = Array.from(new Set([...standardLinks, ...buttonLinks]));
-    const extraCount = allLinks.length - standardLinks.length;
-    if (extraCount > 0) {
-      console.log(`[DISCOVER] +${extraCount} button-discovered links (total ${allLinks.length})`);
-    }
+    // ── Link discovery: run expensive button discovery ONLY on listing/general pages ──
+const standardLinks = await collectAllLinks(page, base);
+
+let buttonLinks = [];
+
+if (pageType === "general") {
+  buttonLinks = await discoverLinksViaButtons(page, base);
+
+  const extraCount = buttonLinks.length;
+  if (extraCount > 0) {
+    console.log(`[DISCOVER] +${extraCount} button-discovered links`);
+  }
+}
+
+const allLinks = Array.from(
+  new Set([
+    ...standardLinks,
+    ...buttonLinks
+  ])
+);
 
     if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
