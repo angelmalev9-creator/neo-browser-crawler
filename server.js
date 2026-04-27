@@ -2029,9 +2029,18 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
       // Same form on 15 pages → single fingerprint → single capability
       const normalized = { kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
-      const key = `${kind}|${fp}`;
-      if (seen.has(key)) return;
-      seen.add(key);
+     // TEMPLATE FINGERPRINTING (ignore cosmetic field names / repeated wrappers)
+const schemaStr = stableStringify(schema)
+  .replace(/#\w+/g, "#ID")
+  .replace(/:nth-of-type\(\d+\)/g, ":nth-of-type(N)")
+  .replace(/\b(field|input)_\d+\b/g, "$1_N")
+  .replace(/"selector_candidates":\[[^\]]*\]/g, '"selector_candidates":["GENERIC"]');
+
+const templateFp = sha256Hex(kind + "|" + schemaStr);
+
+const key = `${kind}|${templateFp}`;
+if (seen.has(key)) return;
+seen.add(key);
 
       combined.push({
         url,
@@ -2948,7 +2957,8 @@ getNetworkPayloads();
       specsText = `\n\nPRODUCT_SPECS\n${specLines.join('\n')}`;
     }
 
-   const rawAll=[
+   // SINGLE-PASS EXTRACTION PIPELINE (merge everything once, no second parsing passes)
+const rawAll=[
 
 data.rawContent,
 
@@ -2997,8 +3007,15 @@ specsText
     }
 
     // Нормализираме числата СЛЕД като сме извлекли контактите
-    const htmlContent = normalizeNumbers(clean(rawAll));
-    const content = htmlContent;
+const content = normalizeNumbers(
+clean(
+rawAll
+.split(/\n+/)
+.filter(Boolean)
+.filter((v,i,a)=>a.indexOf(v)===i) // single-pass dedupe
+.join("\n")
+)
+);
 
     const totalWords = countWordsExact(htmlContent);
 
