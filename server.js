@@ -681,18 +681,55 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
+    const moneyRe =
+/(\d{1,4}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)
+\s*
+(лв\.?|лева|BGN|EUR|€|\$|eur)
+(?:\s*\/?\s*(кв\.?м\.?|sqm|m2|м2))?/ix;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
-    const pickTitle = (root) => {
-      const h = root.querySelector(
-"h1,h2,h3,h4,[class*='title'],[class*='plan'],[class*='package'],strong,b"
-);
-      const t = getText(h);
-      if (t && t.length <= 80) return t;
-      const lines = getText(root).split("\n").map(norm).filter(Boolean);
-      return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
-    };
+const pickTitle = (root) => {
+
+  const candidates = [];
+
+  root.querySelectorAll(`
+    h1,h2,h3,h4,strong,b,
+    [class*='title'],
+    [class*='heading'],
+    [class*='plan'],
+    [class*='package'],
+    [class*='tier'],
+    [class*='font-bold']
+  `).forEach(el=>{
+     const t=getText(el);
+     if(
+       t &&
+       t.length>=3 &&
+       t.length<=60 &&
+       !/€|\$|лв|eur/i.test(t)
+     ){
+       candidates.push(t);
+     }
+  });
+
+  if(candidates.length){
+    candidates.sort((a,b)=>a.length-b.length);
+    return candidates[0];
+  }
+
+  const lines=getText(root)
+   .split("\n")
+   .map(norm)
+   .filter(Boolean);
+
+  return (
+    lines.find(l=>
+      l.length>=3 &&
+      l.length<=50 &&
+      !/\d/.test(l)
+    ) || ""
+  );
+};
 
     const pickBadge = (root) => {
       const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
@@ -706,16 +743,43 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-    const pickFeatures = (root) => {
-      const items = [];
-      root.querySelectorAll("li").forEach(li => {
-        const t = getText(li);
-        if (!t) return;
-        if (t.length < 3 || t.length > 140) return;
-        items.push(t);
-      });
-      return Array.from(new Set(items)).slice(0, 30);
-    };
+const pickFeatures = (root) => {
+
+ const items=[];
+
+ const pushFeature=(t)=>{
+   t=norm(t);
+   if(!t) return;
+   if(t.length<2 || t.length>90) return;
+
+   if(
+      /€|\$|лв|изберете|купи|buy|view details|pricing/i.test(t)
+   ) return;
+
+   items.push(t);
+ };
+
+ // li lists
+ root.querySelectorAll("li").forEach(el=>{
+   pushFeature(getText(el));
+ });
+
+ // generic div feature rows (svg+text patterns)
+ root.querySelectorAll("div").forEach(el=>{
+   const txt=getText(el);
+
+   const hasSignal=
+      el.querySelector("svg") ||
+      el.querySelector("[class*=check]") ||
+      el.querySelector("[class*=icon]");
+
+   if(hasSignal){
+      pushFeature(txt);
+   }
+ });
+
+ return Array.from(new Set(items)).slice(0,20);
+};
 
     const pickPeriod = (root) => {
       const t = getText(root);
@@ -728,16 +792,26 @@ async function extractPricingFromPage(page) {
       let el = startEl;
       for (let i = 0; i < 8 && el; i++) {
         const cls = (el.className && typeof el.className === "string") ? el.className : "";
-        const tag = (el.tagName || "").toLowerCase();
-        const looksCard =
-          /card|pricing|package|plan|tier|column/i.test(cls) ||
-          ["article","section","div"].includes(tag);
-
+        const tag = (el.tagName || "").toLowerCase();const looksCard =
+ /card|pricing|package|plan|tier|column|grid|shadow|rounded|border/i.test(cls)
+ ||
+ (
+   ["article","section","div"].includes(tag)
+   &&
+   (
+      el.querySelector("button") ||
+      el.querySelector("svg") ||
+      el.querySelector("[class*=font-bold]")
+   )
+ );
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
-        const hasFeatures =
-  el.querySelectorAll("li").length >= 2 ||
-  el.querySelectorAll('svg,[class*="check"],[class*="feature"],[class*="benefit"]').length >= 2;
+       const hasFeatures =
+ el.querySelectorAll("li").length >=2 ||
+ el.querySelectorAll(
+ 'svg,[class*="check"],[class*="feature"],[class*="benefit"],button'
+ ).length >=2 ||
+ el.querySelectorAll("button").length>=2;
 
         if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
         el = el.parentElement;
