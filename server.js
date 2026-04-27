@@ -34,7 +34,7 @@ const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
 const MAX_SCROLL_STEPS = 12;
 const HYDRATION_WAIT_MS = 1800;
-const MUTATION_IDLE_MS = 900;          // NEW: cap scroll depth
+const MUTATION_IDLE_MS = 2200;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -93,7 +93,7 @@ const seen=new Set();
 
 function push(v){
 v=(v||'').replace(/\s+/g,' ').trim();
-if(!v || v.length<3) return;
+if(!v || v.length<2) return;
 if(seen.has(v)) return;
 seen.add(v);
 out.push(v);
@@ -164,10 +164,10 @@ ct.includes("graphql")
 const txt=await res.text();
 
 if(
-/price|pricing|package|plan|amount|cost|лв|€|eur/i.test(txt)
+/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
 ){
 payloads.push(
-txt.slice(0,20000)
+txt.slice(0,100000)
 );
 }
 
@@ -186,7 +186,7 @@ async function forceRenderEverything(page){
 
 await page.evaluate(async()=>{
 
-for(let i=0;i<4;i++){
+for(let i=0;i<8;i++){
 
 window.scrollTo(
 0,
@@ -200,7 +200,7 @@ document.querySelectorAll(
 const t=(el.innerText||'').toLowerCase();
 
 if(
-/цени|pricing|packages|plans|details/i.test(t)
+/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
 ){
 try{el.click()}catch{}
 }
@@ -858,7 +858,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -912,13 +912,37 @@ async function extractPricingFromPage(page) {
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
+        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
         el = el.parentElement;
       }
       return null;
     };
 
-    const cards = [];
+    const cards=[];
+
+document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
+try{
+const j=JSON.parse(s.textContent||'{}');
+const arr=Array.isArray(j)?j:[j];
+arr.forEach(item=>{
+const offers=item.offers||item.hasOfferCatalog?.itemListElement;
+if(!offers) return;
+const list=Array.isArray(offers)?offers:[offers];
+list.forEach(o=>{
+const p=o.price||o.offers?.price;
+if(!p) return;
+cards.push({
+title:item.name||o.name||'Package',
+price_text:String(p),
+period:null,
+badge:'',
+features:[]
+});
+});
+});
+}catch{}
+});
+
     const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
@@ -2035,7 +2059,9 @@ const schemaStr = stableStringify(schema)
   .replace(/#\w+/g, "#ID")
   .replace(/:nth-of-type\(\d+\)/g, ":nth-of-type(N)")
   .replace(/\b(field|input)_\d+\b/g, "$1_N")
-  .replace(/"selector_candidates":\[[^\]]*\]/g, '"selector_candidates":["GENERIC"]');
+  .replace(/"selector_candidates":\[[^\]]*\]/g,'"selector_candidates":["GENERIC"]')
+.replace(/"price_text":"[^"]*"/g,'"price_text":"PRICE"')
+
 
 const templateFp = sha256Hex(kind + "|" + schemaStr);
 
@@ -2888,7 +2914,7 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    const dialogTexts = (pageType !== 'product_detail') ? await expandHiddenContent(page) : '';
+    const dialogTexts = await expandHiddenContent(page);
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
@@ -3153,6 +3179,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const pages = [];
   const queue = [];
+const lowPriorityQueue = []; // footer fallback
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
   let base = "";
@@ -3179,14 +3206,24 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     // Add all discovered links, marking visited immediately to prevent duplicates
     let initCount = 0;
-    allInitialLinks.forEach(l => {
-      const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
-        visited.add(nl);
-        queue.push(nl);
-        initCount++;
-      }
-    });
+   allInitialLinks.forEach(l => {
+  const nl = normalizeUrl(l);
+  if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
+
+  visited.add(nl);
+
+  // header/nav important pages first
+  if (
+    /about|service|pricing|price|ceni|contact|faq|product|proekt|rooms|booking/i.test(nl)
+  ) {
+    queue.push(nl);
+  } else {
+    // footer/blog/legal/etc later
+    lowPriorityQueue.push(nl);
+  }
+
+  initCount++;
+});
     console.log(`[INIT] Queued ${initCount} URLs from homepage (total: ${queue.length})`);
 
     await initPage.close();
@@ -3201,10 +3238,16 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
       while (Date.now() < deadline) {
         let url = null;
-        while (queue.length > 0) {
-          url = queue.shift();
-          break; // already deduplicated at push time via visited Set
-        }
+        while (queue.length || lowPriorityQueue.length) {
+
+  if (queue.length) {
+    url = queue.shift(); // header priority first
+  } else {
+    url = lowPriorityQueue.shift(); // then footer pages
+  }
+
+  break;
+}
 
         if (!url) {
           await new Promise(r => setTimeout(r, 30));
