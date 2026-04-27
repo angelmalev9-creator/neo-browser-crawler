@@ -31,7 +31,7 @@ const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-websi
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
+const MAX_SCROLL_STEPS = 18;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -212,12 +212,6 @@ async function extractContactsFromPage(page) {
         const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
         if (t) emails.add(t);
       });
-
-      // 4. Body full text — хваща номера навсякъде на страницата
-      try {
-        const bt = (document.body && document.body.innerText || '').replace(/[\s]+/g, ' ').trim();
-        if (bt) candidates.push(bt);
-      } catch {}
 
       return {
         emails: Array.from(emails).filter(Boolean).slice(0, 20),
@@ -691,7 +685,9 @@ async function extractPricingFromPage(page) {
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
-      const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
+      const h = root.querySelector(
+"h1,h2,h3,h4,[class*='title'],[class*='plan'],[class*='package'],strong,b"
+);
       const t = getText(h);
       if (t && t.length <= 80) return t;
       const lines = getText(root).split("\n").map(norm).filter(Boolean);
@@ -735,7 +731,7 @@ async function extractPricingFromPage(page) {
         const tag = (el.tagName || "").toLowerCase();
         const looksCard =
           /card|pricing|package|plan|tier|column/i.test(cls) ||
-          ["article","section"].includes(tag);
+          ["article","section","div"].includes(tag);
 
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
@@ -1522,7 +1518,7 @@ async function extractCapabilitiesFromPage(page) {
 
       const hasBookingIframe = bookingIframes.length > 0;
       const containerSelectors = selectorCandidates(container);
-      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main|header|div\.elementor)/i.test(sel));
+      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|mai|heade|div\.elemento)/i.test(sel));
       if (hasBookingIframe && genericWrapper && !String(raw || '').match(/пристигане|напускане|възрастни|guests|check-?in|check-?out/i)) return null;
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
 
@@ -1990,8 +1986,9 @@ async function expandHiddenContent(page) {
         try {
           const rect = el.getBoundingClientRect();
           const style = window.getComputedStyle(el);
-          return rect.width > 0 && rect.height > 0 &&
-            style.display !== "none" && style.visibility !== "hidden";
+          return rect.width >= 0 &&
+rect.height >= 0 &&
+style.visibility !== "hidden";
         } catch { return false; }
       };
 
@@ -2067,7 +2064,7 @@ async function expandHiddenContent(page) {
     console.error('[DIALOG] Error:', e.message);
   }
 
-  await page.waitForTimeout(150);
+  await page.waitForTimeout(2500);
   return dialogTexts;
 }
 
@@ -2661,11 +2658,41 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+    await page.goto(url, {
+  timeout: 30000,
+  waitUntil: "networkidle"
+});
 
-    // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
-    const passedCf = await waitForRealContent(page, url);
-    if (!passedCf) return { links: [], page: null };
+// Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
+const passedCf = await waitForRealContent(page, url);
+if (!passedCf) return { links: [], page: null };
+
+// LOVABLE / React hydration fix
+await page.waitForTimeout(3000);
+
+await page.evaluate(async()=>{
+  window.scrollTo(0,document.body.scrollHeight);
+  await new Promise(r=>setTimeout(r,1500));
+
+  document.querySelectorAll(
+   'button,[role="button"],summary'
+  ).forEach(b=>{
+    const t=(b.textContent||"").toLowerCase();
+
+    if(
+      t.includes("пакет") ||
+      t.includes("виж повече") ||
+      t.includes("детайли") ||
+      t.includes("разгъни") ||
+      t.includes("plans") ||
+      t.includes("pricing")
+    ){
+      try{ b.click(); }catch{}
+    }
+  });
+});
+
+await page.waitForTimeout(2500);
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2687,10 +2714,10 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
       });
     }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
 
-    await page.waitForTimeout(150); // ↓ was 500ms
+    await page.waitForTimeout(2500); // ↓ was 500ms
 
     try {
-      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
+      await page.waitForLoadState('networkidle', { timeout: 7000 }); // ↓ was 3000ms
     } catch {}
 
     // ── Detect page type FIRST (needed before expandHiddenContent) ──
@@ -2878,20 +2905,11 @@ async function applyStealthScripts(page) {
 }
 
 async function waitForRealContent(page, url) {
-  // Никога не scrape-ваме Cloudflare challenge URL-и директно
-  if (/cdn-cgi|challenge-platform|.cloudflare.com/i.test(url)) return false;
-
-  const cfSignals = [
-    'just a moment', 'един момент', 'checking your browser',
-    'performing security', 'изпълнение на проверка',
-    'please wait', 'изчакване', 'enable javascript and cookies',
-    'ray id', 'challenge-platform', 'cf-browser-verification',
-    'проверка на сигурността', 'проверява, че не сте бот',
-  ];
+  const cfSignals = ['just a moment','checking your browser','performing security','please wait','enable javascript and cookies','ray id'];
   const isCfPage = async () => {
     try {
       const title = (await page.title()).toLowerCase();
-      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 800));
+      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 600));
       return cfSignals.some(s => title.includes(s) || body.includes(s));
     } catch { return false; }
   };
