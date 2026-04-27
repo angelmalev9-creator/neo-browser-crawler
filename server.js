@@ -682,10 +682,7 @@ async function extractPricingFromPage(page) {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
     const moneyRe =
-/(\d{1,4}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)
-\s*
-(лв\.?|лева|BGN|EUR|€|\$|eur)
-(?:\s*\/?\s*(кв\.?м\.?|sqm|m2|м2))?/ix;
+/(\d{1,4}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)(?:\s*\/?\s*(кв\.?м\.?|sqm|m2|м2))?/i
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
 const pickTitle = (root) => {
