@@ -1,5 +1,6 @@
 import http from "http";
 import crypto from "crypto";
+import { gzipSync } from "zlib";
 import { createRequire } from "module";
 
 // playwright-extra не е ESM-native — зареждаме го чрез createRequire
@@ -23,7 +24,7 @@ let crawlFinished = false;
 let lastResult = null;
 let lastCrawlUrl = null;
 let lastCrawlTime = 0;
-const RESULT_TTL_MS = 5 * 60 * 1000;
+const RESULT_TTL_MS = 120 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
@@ -31,9 +32,9 @@ const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-websi
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 16;
-const HYDRATION_WAIT_MS = 4000;
-const MUTATION_IDLE_MS = 900;          // NEW: cap scroll depth
+const MAX_SCROLL_STEPS = 5;
+const HYDRATION_WAIT_MS = 1800;
+const MUTATION_IDLE_MS = 2200;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -92,7 +93,7 @@ const seen=new Set();
 
 function push(v){
 v=(v||'').replace(/\s+/g,' ').trim();
-if(!v || v.length<3) return;
+if(!v || v.length<2) return;
 if(seen.has(v)) return;
 seen.add(v);
 out.push(v);
@@ -163,10 +164,10 @@ ct.includes("graphql")
 const txt=await res.text();
 
 if(
-/price|pricing|package|plan|amount|cost|лв|€|eur/i.test(txt)
+/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
 ){
 payloads.push(
-txt.slice(0,20000)
+txt.slice(0,100000)
 );
 }
 
@@ -199,7 +200,7 @@ document.querySelectorAll(
 const t=(el.innerText||'').toLowerCase();
 
 if(
-/цени|pricing|packages|plans|details/i.test(t)
+/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
 ){
 try{el.click()}catch{}
 }
@@ -857,7 +858,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -911,13 +912,37 @@ async function extractPricingFromPage(page) {
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
+        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
         el = el.parentElement;
       }
       return null;
     };
 
-    const cards = [];
+    const cards=[];
+
+document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
+try{
+const j=JSON.parse(s.textContent||'{}');
+const arr=Array.isArray(j)?j:[j];
+arr.forEach(item=>{
+const offers=item.offers||item.hasOfferCatalog?.itemListElement;
+if(!offers) return;
+const list=Array.isArray(offers)?offers:[offers];
+list.forEach(o=>{
+const p=o.price||o.offers?.price;
+if(!p) return;
+cards.push({
+title:item.name||o.name||'Package',
+price_text:String(p),
+period:null,
+badge:'',
+features:[]
+});
+});
+});
+}catch{}
+});
+
     const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
@@ -2029,9 +2054,20 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
       // Same form on 15 pages → single fingerprint → single capability
       const normalized = { kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
-      const key = `${kind}|${fp}`;
-      if (seen.has(key)) return;
-      seen.add(key);
+     // TEMPLATE FINGERPRINTING (ignore cosmetic field names / repeated wrappers)
+const schemaStr = stableStringify(schema)
+  .replace(/#\w+/g, "#ID")
+  .replace(/:nth-of-type\(\d+\)/g, ":nth-of-type(N)")
+  .replace(/\b(field|input)_\d+\b/g, "$1_N")
+  .replace(/"selector_candidates":\[[^\]]*\]/g,'"selector_candidates":["GENERIC"]')
+.replace(/"price_text":"[^"]*"/g,'"price_text":"PRICE"')
+
+
+const templateFp = sha256Hex(kind + "|" + schemaStr);
+
+const key = `${kind}|${templateFp}`;
+if (seen.has(key)) return;
+seen.add(key);
 
       combined.push({
         url,
@@ -2835,7 +2871,9 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 const getNetworkPayloads =
 await attachNetworkMining(page);
 
-await waitForHydrationSettled(page);
+if(!/\/proekt\/|\/id-/i.test(url)){
+ await waitForHydrationSettled(page);
+}
 
 await forceRenderEverything(page);
 
@@ -2876,14 +2914,17 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    const dialogTexts = (pageType !== 'product_detail') ? await expandHiddenContent(page) : '';
+    const dialogTexts = await expandHiddenContent(page);
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
     const data = await extractStructured(page);
 
-const shadowText =
-await extractShadowAndPortalText(page);
+let shadowText = "";
+
+if (/pricing|ceni|service|product/i.test(url)) {
+ shadowText = await extractShadowAndPortalText(page);
+}
 
 const apiPayloads =
 getNetworkPayloads();
@@ -2946,7 +2987,8 @@ getNetworkPayloads();
       specsText = `\n\nPRODUCT_SPECS\n${specLines.join('\n')}`;
     }
 
-   const rawAll=[
+   // SINGLE-PASS EXTRACTION PIPELINE (merge everything once, no second parsing passes)
+const rawAll=[
 
 data.rawContent,
 
@@ -2995,22 +3037,41 @@ specsText
     }
 
     // Нормализираме числата СЛЕД като сме извлекли контактите
-    const htmlContent = normalizeNumbers(clean(rawAll));
-    const content = htmlContent;
+const content = normalizeNumbers(
+clean(
+rawAll
+.split(/\n+/)
+.filter(Boolean)
+.filter((v,i,a)=>a.indexOf(v)===i) // single-pass dedupe
+.join("\n")
+)
+);
 
-    const totalWords = countWordsExact(htmlContent);
+    const totalWords = countWordsExact(content);
 
     const elapsed = Date.now() - startTime;
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
-    // ── Link discovery: стандартни <a> + бутон-задвижени URL-и (universal) ──
-    const standardLinks = await collectAllLinks(page, base);
-    const buttonLinks = await discoverLinksViaButtons(page, base);
-    const allLinks = Array.from(new Set([...standardLinks, ...buttonLinks]));
-    const extraCount = allLinks.length - standardLinks.length;
-    if (extraCount > 0) {
-      console.log(`[DISCOVER] +${extraCount} button-discovered links (total ${allLinks.length})`);
-    }
+    // ── Link discovery: run expensive button discovery ONLY on listing/general pages ──
+const standardLinks = await collectAllLinks(page, base);
+
+let buttonLinks = [];
+
+if (pageType === "general") {
+  buttonLinks = await discoverLinksViaButtons(page, base);
+
+  const extraCount = buttonLinks.length;
+  if (extraCount > 0) {
+    console.log(`[DISCOVER] +${extraCount} button-discovered links`);
+  }
+}
+
+const allLinks = Array.from(
+  new Set([
+    ...standardLinks,
+    ...buttonLinks
+  ])
+);
 
     if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
@@ -3133,6 +3194,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const pages = [];
   const queue = [];
+const lowPriorityQueue = []; // footer fallback
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
   let base = "";
@@ -3159,14 +3221,24 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     // Add all discovered links, marking visited immediately to prevent duplicates
     let initCount = 0;
-    allInitialLinks.forEach(l => {
-      const nl = normalizeUrl(l);
-      if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
-        visited.add(nl);
-        queue.push(nl);
-        initCount++;
-      }
-    });
+   allInitialLinks.forEach(l => {
+  const nl = normalizeUrl(l);
+  if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
+
+  visited.add(nl);
+
+  // header/nav important pages first
+  if (
+    /about|service|pricing|price|ceni|contact|faq|product|proekt|rooms|booking/i.test(nl)
+  ) {
+    queue.push(nl);
+  } else {
+    // footer/blog/legal/etc later
+    lowPriorityQueue.push(nl);
+  }
+
+  initCount++;
+});
     console.log(`[INIT] Queued ${initCount} URLs from homepage (total: ${queue.length})`);
 
     await initPage.close();
@@ -3181,10 +3253,16 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
       while (Date.now() < deadline) {
         let url = null;
-        while (queue.length > 0) {
-          url = queue.shift();
-          break; // already deduplicated at push time via visited Set
-        }
+        while (queue.length || lowPriorityQueue.length) {
+
+  if (queue.length) {
+    url = queue.shift(); // header priority first
+  } else {
+    url = lowPriorityQueue.shift(); // then footer pages
+  }
+
+  break;
+}
 
         if (!url) {
           await new Promise(r => setTimeout(r, 30));
@@ -3355,8 +3433,16 @@ http
 
         console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, ...result }));
+               const gz = gzipSync(
+          JSON.stringify({ success: true, ...result })
+        );
+
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Content-Encoding": "gzip"
+        });
+
+        res.end(gz);
       } catch (e) {
         crawlInProgress = false;
         console.error("[CRAWL ERROR]", e.message);
@@ -3373,3 +3459,8 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
+
+
+
+
+
