@@ -858,7 +858,8 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/(?:(?:€|\$|eur|usd|лв\.?|лева|bgn)\s*)?(\d{2,6}(?:[.,]\d{1,2})?)(?:\s*(?:€|\$|eur|usd|лв\.?|лева|bgn))?(?:\s*\/?\s*(?:месец|month|mo))?/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,7}(?:[\s.,]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv|м2|m2)?(?:\s*\/?\s*(месец|month|mo|mес))?(?:\s*(?:без ддс|с ддс|turnkey|до ключ))?/i;
+
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
       const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
@@ -947,31 +948,12 @@ features:[]
 }catch{}
 });
 document.querySelectorAll(
-[
-'[class*="pricing"]',
-'[class*="package"]',
-'[class*="plan"]',
-'[class*="card"]',
-'[class*="tier"]',
-'[class*="offer"]',
-'[class*="pricing-card"]',
-'[class*="package-card"]',
-'[data-package]',
-'[data-plan]',
-'.elementor-widget-container',
-'section',
-'article'
-].join(',')
+'[class*="pricing"],[class*="package"],[class*="plan"],[class*="card"],.elementor-widget-container'
 ).forEach(root=>{
 
 if(!isVisible(root)) return;
 
-const txt=
-getText(root)+
-' '+
-(root.innerText||'')+
-' '+
-(root.textContent||'');
+const txt=getText(root);
 
 if(
 !/лв|€|eur|price|цени|пакет/i.test(txt)
@@ -981,14 +963,6 @@ const title=pickTitle(root);
 const mm=txt.match(moneyRe);
 
 if(!mm) return;
-
-const priceVal=mm[0];
-
-if(
-/^(20\d\d)$/.test(priceVal) ||
-/^\d{1,2}$/.test(priceVal) ||
-/088|087|089/.test(priceVal)
-) return;
 
 cards.push({
 title:title||'Package',
