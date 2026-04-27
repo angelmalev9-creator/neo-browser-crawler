@@ -28,10 +28,12 @@ const visited = new Set();
 
 // ================= LIMITS =================
 const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
-const MIN_WORDS = 5;
-const PARALLEL_TABS = 12;          // ↑ was 5
-const SCROLL_STEP_MS = 50;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 20;          // NEW: cap scroll depth
+const MIN_WORDS = 20;
+const PARALLEL_TABS = 8;          // ↑ was 5
+const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
+const MAX_SCROLL_STEPS = 16;
+const HYDRATION_WAIT_MS = 4000;
+const MUTATION_IDLE_MS = 900;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -41,6 +43,181 @@ const clean = (t = "") =>
   t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
+const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
+
+
+async function waitForHydrationSettled(page){
+try{
+
+await page.evaluate(
+(idleMs)=>new Promise(resolve=>{
+
+let timer;
+
+const finish=()=>{
+obs.disconnect();
+resolve();
+};
+
+const reset=()=>{
+clearTimeout(timer);
+timer=setTimeout(finish,idleMs);
+};
+
+const obs=new MutationObserver(reset);
+
+obs.observe(document,{
+subtree:true,
+childList:true,
+attributes:true,
+characterData:true
+});
+
+reset();
+
+}),
+MUTATION_IDLE_MS
+);
+
+}catch{}
+}
+
+
+
+async function extractShadowAndPortalText(page){
+
+return await page.evaluate(()=>{
+
+const out=[];
+const seen=new Set();
+
+function push(v){
+v=(v||'').replace(/\s+/g,' ').trim();
+if(!v || v.length<3) return;
+if(seen.has(v)) return;
+seen.add(v);
+out.push(v);
+}
+
+function walk(root){
+
+if(!root) return;
+
+const walker=document.createTreeWalker(
+root,
+NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT
+);
+
+let n;
+
+while(n=walker.nextNode()){
+
+if(n.nodeType===3){
+push(n.textContent);
+continue;
+}
+
+try{
+if(n.shadowRoot){
+walk(n.shadowRoot);
+}
+
+push(
+n.innerText||n.textContent
+);
+
+}catch{}
+}
+}
+
+walk(document);
+
+document.querySelectorAll(
+'[role="dialog"],[data-radix-portal],body > div'
+).forEach(el=>{
+push(el.innerText||el.textContent);
+});
+
+return out.join('\n');
+
+});
+
+}
+
+
+
+async function attachNetworkMining(page){
+
+const payloads=[];
+
+page.on("response",async(res)=>{
+
+try{
+
+const ct=(res.headers()["content-type"]||"").toLowerCase();
+
+if(
+ct.includes("json") ||
+ct.includes("graphql")
+){
+
+const txt=await res.text();
+
+if(
+/price|pricing|package|plan|amount|cost|лв|€|eur/i.test(txt)
+){
+payloads.push(
+txt.slice(0,20000)
+);
+}
+
+}
+
+}catch{}
+
+});
+
+return ()=>payloads.join("\n");
+}
+
+
+
+async function forceRenderEverything(page){
+
+await page.evaluate(async()=>{
+
+for(let i=0;i<8;i++){
+
+window.scrollTo(
+0,
+document.body.scrollHeight
+);
+
+document.querySelectorAll(
+'button,[role=tab],summary,[aria-expanded="false"]'
+).forEach(el=>{
+
+const t=(el.innerText||'').toLowerCase();
+
+if(
+/цени|pricing|packages|plans|details/i.test(t)
+){
+try{el.click()}catch{}
+}
+
+});
+
+await new Promise(
+r=>setTimeout(r,180)
+);
+
+}
+
+window.scrollTo(0,0);
+
+});
+
+}
 
 // ================= BG NUMBER NORMALIZER =================
 // IMPORTANT FIX: do NOT convert money amounts to words.
@@ -668,70 +845,7 @@ async function sendSiteMapToWorker(siteMap) {
 // ═══════════════════════════════════════════════════════════════════════════
 // NEW: PRICING/PACKAGES STRUCTURED EXTRACTION
 // ═══════════════════════════════════════════════════════════════════════════
-async function extractSemanticBlocksFromPage(page){
-return await page.evaluate(()=>{
 
- const norm=s=>(s||'').replace(/\s+/g,' ').trim();
-
- const blocks=[];
- const seen=new Set();
-
- const candidates=document.querySelectorAll(
-`
-section,
-article,
-div,
-li,
-[class*="card"],
-[class*="plan"],
-[class*="pricing"],
-[class*="package"],
-[class*="feature"],
-[class*="service"]
-`
-);
-
- candidates.forEach(el=>{
-
-   const txt=norm(el.innerText||el.textContent||'');
-
-   if(
-      txt.length<40 ||
-      txt.length>5000
-   ) return;
-
-   if(
-      !el.querySelector("h1,h2,h3,h4,li,button,strong,b") &&
-      txt.length<120
-   ) return;
-
-   const key=txt.slice(0,500);
-
-   if(seen.has(key)) return;
-   seen.add(key);
-
-   blocks.push({
-      text:txt,
-      tag:(el.tagName||'').toLowerCase(),
-      title:
-        (
-         el.querySelector("h1,h2,h3,h4,strong,b,[class*=title]")?.innerText||
-         ""
-        ).trim(),
-
-      has_price:/€|\$|лв|eur/i.test(txt),
-
-      features:Array.from(
-       el.querySelectorAll("li")
-      ).map(x=>norm(x.innerText)).filter(Boolean).slice(0,12)
-   });
-
- });
-
- return blocks.slice(0,150);
-
-});
-}
 async function extractPricingFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
@@ -744,52 +858,16 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe =
-/(\d{1,4}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)(?:\s*\/?\s*(кв\.?м\.?|sqm|m2|м2))?/i
+    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
-const pickTitle = (root) => {
-
-  const candidates = [];
-
-  root.querySelectorAll(`
-    h1,h2,h3,h4,strong,b,
-    [class*='title'],
-    [class*='heading'],
-    [class*='plan'],
-    [class*='package'],
-    [class*='tier'],
-    [class*='font-bold']
-  `).forEach(el=>{
-     const t=getText(el);
-     if(
-       t &&
-       t.length>=3 &&
-       t.length<=60 &&
-       !/€|\$|лв|eur/i.test(t)
-     ){
-       candidates.push(t);
-     }
-  });
-
-  if(candidates.length){
-    candidates.sort((a,b)=>a.length-b.length);
-    return candidates[0];
-  }
-
-  const lines=getText(root)
-   .split("\n")
-   .map(norm)
-   .filter(Boolean);
-
-  return (
-    lines.find(l=>
-      l.length>=3 &&
-      l.length<=50 &&
-      !/\d/.test(l)
-    ) || ""
-  );
-};
+    const pickTitle = (root) => {
+      const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
+      const t = getText(h);
+      if (t && t.length <= 80) return t;
+      const lines = getText(root).split("\n").map(norm).filter(Boolean);
+      return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
+    };
 
     const pickBadge = (root) => {
       const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
@@ -803,43 +881,16 @@ const pickTitle = (root) => {
       return "";
     };
 
-const pickFeatures = (root) => {
-
- const items=[];
-
- const pushFeature=(t)=>{
-   t=norm(t);
-   if(!t) return;
-   if(t.length<2 || t.length>90) return;
-
-   if(
-      /€|\$|лв|изберете|купи|buy|view details|pricing/i.test(t)
-   ) return;
-
-   items.push(t);
- };
-
- // li lists
- root.querySelectorAll("li").forEach(el=>{
-   pushFeature(getText(el));
- });
-
- // generic div feature rows (svg+text patterns)
- root.querySelectorAll("div").forEach(el=>{
-   const txt=getText(el);
-
-   const hasSignal=
-      el.querySelector("svg") ||
-      el.querySelector("[class*=check]") ||
-      el.querySelector("[class*=icon]");
-
-   if(hasSignal){
-      pushFeature(txt);
-   }
- });
-
- return Array.from(new Set(items)).slice(0,20);
-};
+    const pickFeatures = (root) => {
+      const items = [];
+      root.querySelectorAll("li").forEach(li => {
+        const t = getText(li);
+        if (!t) return;
+        if (t.length < 3 || t.length > 140) return;
+        items.push(t);
+      });
+      return Array.from(new Set(items)).slice(0, 30);
+    };
 
     const pickPeriod = (root) => {
       const t = getText(root);
@@ -852,26 +903,14 @@ const pickFeatures = (root) => {
       let el = startEl;
       for (let i = 0; i < 8 && el; i++) {
         const cls = (el.className && typeof el.className === "string") ? el.className : "";
-        const tag = (el.tagName || "").toLowerCase();const looksCard =
- /card|pricing|package|plan|tier|column|grid|shadow|rounded|border/i.test(cls)
- ||
- (
-   ["article","section","div"].includes(tag)
-   &&
-   (
-      el.querySelector("button") ||
-      el.querySelector("svg") ||
-      el.querySelector("[class*=font-bold]")
-   )
- );
+        const tag = (el.tagName || "").toLowerCase();
+        const looksCard =
+          /card|pricing|package|plan|tier|column/i.test(cls) ||
+          ["article","section"].includes(tag);
+
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
-       const hasFeatures =
- el.querySelectorAll("li").length >=2 ||
- el.querySelectorAll(
- 'svg,[class*="check"],[class*="feature"],[class*="benefit"],button'
- ).length >=2 ||
- el.querySelectorAll("button").length>=2;
+        const hasFeatures = el.querySelectorAll("li").length >= 3;
 
         if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
         el = el.parentElement;
@@ -2122,9 +2161,8 @@ async function expandHiddenContent(page) {
         try {
           const rect = el.getBoundingClientRect();
           const style = window.getComputedStyle(el);
-          return rect.width >= 0 &&
-rect.height >= 0 &&
-style.visibility !== "hidden";
+          return rect.width > 0 && rect.height > 0 &&
+            style.display !== "none" && style.visibility !== "hidden";
         } catch { return false; }
       };
 
@@ -2200,7 +2238,7 @@ style.visibility !== "hidden";
     console.error('[DIALOG] Error:', e.message);
   }
 
-  await page.waitForTimeout(2500);
+  await page.waitForTimeout(150);
   return dialogTexts;
 }
 
@@ -2287,18 +2325,7 @@ async function extractStructured(page) {
       let current = null;
       const processedElements = new Set();
 
-     document.querySelectorAll(`
-h1,h2,h3,h4,h5,h6,
-p,li,span,div,strong,b,
-td,th,
-article,
-section,
-main,
-aside,
-blockquote,
-figcaption,
-label
-`).forEach(el => {
+      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
         if (el.closest("details.wp-block-details, details")) return;
         let parent = el.parentElement;
@@ -2399,12 +2426,7 @@ label
           topControlTexts.push(parts);
         });
       } catch {}
-let bodyDump = "";
-try{
- bodyDump = (
-   document.body?.innerText || ""
- ).replace(/\s+/g," ").trim();
-}catch{}
+
       return {
         rawContent: [
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
@@ -2413,7 +2435,6 @@ try{
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
           topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
-bodyDump ? `BODY_DUMP\n${bodyDump}` : "",
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -2811,41 +2832,17 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-await page.goto(url, {
-  timeout: 60000,
-  waitUntil: "networkidle"
-});
+    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+const getNetworkPayloads =
+await attachNetworkMining(page);
 
-// Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
-const passedCf = await waitForRealContent(page, url);
-if (!passedCf) return { links: [], page: null };
+await waitForHydrationSettled(page);
 
-// LOVABLE / React hydration fix
-await page.waitForTimeout(6000);
+await forceRenderEverything(page);
 
-await page.evaluate(async()=>{
-  window.scrollTo(0,document.body.scrollHeight);
-  await new Promise(r=>setTimeout(r,1500));
-
-  document.querySelectorAll(
-   'button,[role="button"],summary'
-  ).forEach(b=>{
-    const t=(b.textContent||"").toLowerCase();
-
-    if(
-      t.includes("пакет") ||
-      t.includes("виж повече") ||
-      t.includes("детайли") ||
-      t.includes("разгъни") ||
-      t.includes("plans") ||
-      t.includes("pricing")
-    ){
-      try{ b.click(); }catch{}
-    }
-  });
-});
-
-await page.waitForTimeout(1500);
+    // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
+    const passedCf = await waitForRealContent(page, url);
+    if (!passedCf) return { links: [], page: null };
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2867,10 +2864,10 @@ await page.waitForTimeout(1500);
       });
     }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
 
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(150); // ↓ was 500ms
 
     try {
-      await page.waitForLoadState('networkidle', { timeout: 7000 }); // ↓ was 3000ms
+      await page.waitForLoadState('networkidle', { timeout: 1500 }); // ↓ was 3000ms
     } catch {}
 
     // ── Detect page type FIRST (needed before expandHiddenContent) ──
@@ -2886,9 +2883,14 @@ await page.waitForTimeout(1500);
     // Extract structured content
     const data = await extractStructured(page);
 
+const shadowText =
+await extractShadowAndPortalText(page);
+
+const apiPayloads =
+getNetworkPayloads();
+
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
-let semantic_blocks = [];
     try {
       pricing = await extractPricingFromPage(page);
 
@@ -2945,11 +2947,25 @@ let semantic_blocks = [];
       specsText = `\n\nPRODUCT_SPECS\n${specLines.join('\n')}`;
     }
 
-    const rawAll = [
-      data.rawContent,
-      dialogTexts ? `DIALOG_CONTENT\n${dialogTexts}` : '',
-      specsText,
-    ].filter(Boolean).join('\n\n');
+   const rawAll=[
+
+data.rawContent,
+
+shadowText
+? `SHADOW_CONTENT\n${shadowText}`
+:'',
+
+apiPayloads
+? `API_PAYLOADS\n${apiPayloads}`
+:'',
+
+dialogTexts
+? `DIALOG_CONTENT\n${dialogTexts}`
+:'',
+
+specsText
+
+].filter(Boolean).join('\n\n');
 
     // КРИТИЧНО: Извличаме контакти от СУРОВИЯ текст — ПРЕДИ normalizeNumbers
     // normalizeNumbers може да конвертира цифри в думи и да унищожи номерата
