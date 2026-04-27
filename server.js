@@ -43,7 +43,6 @@ const clean = (t = "") =>
   t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
-const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
 
 async function waitForHydrationSettled(page){
