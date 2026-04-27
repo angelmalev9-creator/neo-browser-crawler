@@ -735,7 +735,9 @@ async function extractPricingFromPage(page) {
 
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
-        const hasFeatures = el.querySelectorAll("li").length >= 3;
+        const hasFeatures =
+  el.querySelectorAll("li").length >= 2 ||
+  el.querySelectorAll('svg,[class*="check"],[class*="feature"],[class*="benefit"]').length >= 2;
 
         if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
         el = el.parentElement;
