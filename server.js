@@ -650,51 +650,42 @@ async function extractSiteMapFromPage(page) {
       }
     });
 
-    // EXTRACT PRICES (legacy, context-light)
-    const prices = [];
-    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
+    // VISUAL PRICE EXTRACTION (works like user copy-paste)
+const prices = [];
+const seenPrices = new Set();
 
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
-      null
-    );
+// 1. Scan rendered text blocks (like selecting with cursor)
+document.querySelectorAll(
+'h1,h2,h3,h4,h5,h6,p,span,div,strong,b,li'
+).forEach(el => {
 
-    let node;
-    while (node = walker.nextNode()) {
-      const text = node.textContent || "";
-      const matches = [...text.matchAll(priceRegex)];
+  const txt = (el.innerText || "").replace(/\s+/g,' ').trim();
 
-      matches.forEach(match => {
-        const parent = node.parentElement;
-        let context = "";
+  if(!txt) return;
 
-        if (parent) {
-          const container = parent.closest("div, article, section, li, tr");
-          if (container) {
-            const heading = container.querySelector("h1, h2, h3, h4, h5, h6, strong, b, .title");
-            if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
-          }
-        }
+  // catches €350 , 350€ , 350 лв , 350 / кв.м
+  const matches = txt.match(
+/(?:€\s?\d+|\d+\s?€|\d+\s?(?:лв|BGN|EUR)|\d+\s?\/\s?кв\.?м\.?)/gi
+  );
 
-        if (!prices.some(p => p.text === match[0] && p.context === context)) {
-          prices.push({
-            text: match[0],
-            context,
-          });
-        }
-      });
-    }
+  if(matches){
+    matches.forEach(price=>{
+      if(!seenPrices.has(price)){
+        seenPrices.add(price);
 
-    return {
-      url: window.location.href,
-      title: document.title,
-      buttons: buttons.slice(0, 30),
-      forms: forms.slice(0, 10),
-      prices: prices.slice(0, 20),
-    };
-  });
-}
+        prices.push({
+          text: price,
+          context: (
+             el.closest('section,article,div')
+               ?.querySelector('h1,h2,h3,h4')
+               ?.innerText || ''
+          ).trim()
+        });
+      }
+    });
+  }
+
+});
 
 // Enrich raw SiteMap with keywords (runs in Node.js)
 function enrichSiteMap(raw, siteId, siteUrl) {
