@@ -85,6 +85,179 @@ MUTATION_IDLE_MS
 
 
 async function extractShadowAndPortalText(page){
+  async function extractHumanSelectionCopy(page){
+
+return await page.evaluate(async()=>{
+
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+
+/*
+simulate real human:
+select all text
+copy visible rendered text
+expand cards
+click detail buttons
+read computed text
+*/
+
+for(let i=0;i<6;i++){
+
+window.scrollTo(
+0,
+(document.body.scrollHeight/5)*i
+);
+
+document.querySelectorAll(
+'button,[role=button],summary,[aria-expanded="false"]'
+).forEach(el=>{
+
+const t=(el.innerText||'').toLowerCase();
+
+if(
+/виж|детайли|повече|package|pricing|basic|standart|standard|premium|пакет|цени/i.test(t)
+){
+try{el.click()}catch{}
+}
+
+});
+
+await sleep(300);
+}
+
+
+// force text selection like user drag select
+function copySelectionFrom(el){
+
+try{
+
+const range=document.createRange();
+range.selectNodeContents(el);
+
+const sel=window.getSelection();
+sel.removeAllRanges();
+sel.addRange(range);
+
+const txt=sel.toString();
+
+sel.removeAllRanges();
+
+return txt;
+
+}catch{
+return '';
+}
+
+}
+
+
+const chunks=[];
+const seen=new Set();
+
+function push(t){
+
+t=(t||'')
+.replace(/\s+/g,' ')
+.trim();
+
+if(!t || t.length<2) return;
+
+if(seen.has(t)) return;
+
+seen.add(t);
+
+chunks.push(t);
+}
+
+
+
+// 1 FULL PAGE COPY
+push(
+copySelectionFrom(document.body)
+);
+
+
+// 2 COPY EACH CARD BLOCK SEPARATELY
+document.querySelectorAll(
+'div,section,article'
+).forEach(el=>{
+
+try{
+
+const txt=
+(el.innerText||'')
+replace(/\s+/g,' ')
+.trim();
+
+if(
+/€\d+|\d+\s?лв|basic|standart|standard|premium/i.test(txt)
+){
+push(
+copySelectionFrom(el)
+);
+}
+
+}catch{}
+
+});
+
+
+// 3 EXACT VISUAL TEXT FROM ALL NODES
+document.querySelectorAll('*').forEach(el=>{
+
+try{
+
+if(
+el.children.length===0
+){
+
+push(
+el.innerText||
+el.textContent
+);
+
+}
+
+}catch{}
+
+});
+
+
+// 4 include pseudo generated css text
+document.querySelectorAll('*').forEach(el=>{
+
+try{
+
+const b=
+getComputedStyle(el,'::before').content;
+
+const a=
+getComputedStyle(el,'::after').content;
+
+if(b&&b!=='none')
+push(b.replace(/"/g,''));
+
+if(a&&a!=='none')
+push(a.replace(/"/g,''));
+
+}catch{}
+
+});
+
+
+// 5 include dialogs / portals
+document.querySelectorAll(
+'[role=dialog],[data-radix-portal],body>div'
+).forEach(el=>{
+push(
+copySelectionFrom(el)
+);
+});
+
+
+return chunks.join('\n');
+
+});
+}
 
 return await page.evaluate(()=>{
 
@@ -3218,6 +3391,11 @@ if(!/\/proekt\/|\/id-/i.test(url)){
 
 await forceRenderEverything(page);
 
+// mimic human mouse behavior
+await page.mouse.move(400,300);
+await page.mouse.wheel(0,900);
+await page.mouse.wheel(0,-500);
+
     // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
     const passedCf = await waitForRealContent(page, url);
     if (!passedCf) return { links: [], page: null };
@@ -3261,11 +3439,10 @@ await forceRenderEverything(page);
     // Extract structured content
     const data = await extractStructured(page);
 
-let shadowText = "";
+const shadowText = await extractShadowAndPortalText(page);
 
-if (/pricing|ceni|service|product/i.test(url)) {
- shadowText = await extractShadowAndPortalText(page);
-}
+// HUMAN COPY MODE (critical)
+const humanCopiedText = await extractHumanSelectionCopy(page);
 
 const apiPayloads =
 getNetworkPayloads();
@@ -3363,6 +3540,10 @@ getNetworkPayloads();
 const rawAll=[
 
 data.rawContent,
+
+humanCopiedText
+? `HUMAN_COPY\n${humanCopiedText}`
+:'',
 
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
