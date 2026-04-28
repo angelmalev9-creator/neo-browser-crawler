@@ -122,17 +122,9 @@ if(n.shadowRoot){
 walk(n.shadowRoot);
 }
 
-const txt=(n.innerText||n.textContent||'').trim();
-
-if(
-txt &&
-!txt.startsWith(':where(') &&
-!txt.startsWith('@media') &&
-!/--[a-z0-9-]+\s*:/.test(txt) &&
-txt.length<4000
-){
- push(txt);
-}
+push(
+n.innerText||n.textContent
+);
 
 }catch{}
 }
@@ -202,7 +194,7 @@ document.body.scrollHeight
 );
 
 document.querySelectorAll(
-'button,[role=tab],[role=button],summary,[aria-expanded="false"],[data-state],[aria-controls]'
+'button,[role=tab],summary,[aria-expanded="false"]'
 ).forEach(el=>{
 
 const t=(el.innerText||'').toLowerCase();
@@ -216,7 +208,7 @@ try{el.click()}catch{}
 });
 
 await new Promise(
-r=>setTimeout(r,500)
+r=>setTimeout(r,180)
 );
 
 }
@@ -415,8 +407,7 @@ function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
   if (/za-nas|about/.test(s)) return "about";
   if (/uslugi|services|pricing|price|ceni|tseni/.test(s)) return "services";
-  if (/ceni|pricing|price|tseni/.test(s)) return "services";
-if (/kontakti|contact/.test(s)) return "contact";
+  if (/kontakti|contact/.test(s)) return "contact";
   if (/faq|vuprosi|questions/.test(s)) return "faq";
   if (/blog|news|article/.test(s)) return "blog";
   // Product/vehicle/property detail pages — URL contains ID or product slug
@@ -867,7 +858,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от)?\s*\d{1,7}(?:[\s.,]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv|м2|m2)?(?:\s*\/?\s*(месец|month|mo|mес))?(?:\s*(?:без ддс|с ддс|turnkey|до ключ))?/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -913,20 +904,15 @@ async function extractPricingFromPage(page) {
       for (let i = 0; i < 8 && el; i++) {
         const cls = (el.className && typeof el.className === "string") ? el.className : "";
         const tag = (el.tagName || "").toLowerCase();
-       const looksCard =
-/card|pricing|package|plan|tier|column|offer|box|pricing-table|bundle/i.test(cls) ||
-["article","section","div","li"].includes(tag);
+        const looksCard =
+          /card|pricing|package|plan|tier|column/i.test(cls) ||
+          ["article","section"].includes(tag);
 
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        if(
-(looksCard||moneyRe.test(txt)) &&
-(hasTitle||hasFeatures||moneyRe.test(txt)) &&
-txt.length>=20 &&
-txt.length<=4000
-) return el;
+        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
         el = el.parentElement;
       }
       return null;
@@ -956,32 +942,7 @@ features:[]
 });
 }catch{}
 });
-document.querySelectorAll(
-'[class*="pricing"],[class*="package"],[class*="plan"],[class*="card"],.elementor-widget-container'
-).forEach(root=>{
 
-if(!isVisible(root)) return;
-
-const txt=getText(root);
-
-if(
-!/лв|€|eur|price|цени|пакет/i.test(txt)
-) return;
-
-const title=pickTitle(root);
-const mm=txt.match(moneyRe);
-
-if(!mm) return;
-
-cards.push({
-title:title||'Package',
-price_text:mm[0],
-period:pickPeriod(root),
-badge:pickBadge(root),
-features:pickFeatures(root)
-});
-
-});
     const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
@@ -2961,7 +2922,7 @@ await forceRenderEverything(page);
 
 let shadowText = "";
 
-if (/pricing|ceni|service|product|paketi|paket/i.test(url)) {
+if (/pricing|ceni|service|product/i.test(url)) {
  shadowText = await extractShadowAndPortalText(page);
 }
 
@@ -3498,3 +3459,8 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
+
+
+
+
+
