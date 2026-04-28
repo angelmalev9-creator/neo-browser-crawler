@@ -186,7 +186,7 @@ async function forceRenderEverything(page){
 
 await page.evaluate(async()=>{
 
-for(let i=0;i<8;i++){
+for(let i=0;i<10;i++){
 
 window.scrollTo(
 0,
@@ -194,17 +194,28 @@ document.body.scrollHeight
 );
 
 document.querySelectorAll(
-'button,[role=tab],summary,[aria-expanded="false"]'
+'button,[role=tab],summary,[aria-expanded="false"],[class*="accordion"],[class*="collapse"]'
 ).forEach(el=>{
 
 const t=(el.innerText||'').toLowerCase();
 
 if(
-/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
+/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers|пакет|basic|standard|premium|pro|enterprise|starter|цена|detayli|подробно|покажи/i.test(t)
 ){
 try{el.click()}catch{}
 }
 
+});
+
+// Also expand any collapsed pricing sections
+document.querySelectorAll('[class*="pricing"],[class*="package"],[class*="plan"],[class*="пакет"],[class*="цен"]').forEach(el=>{
+try{
+const style=window.getComputedStyle(el);
+if(style.display==='none' || style.visibility==='hidden'){
+el.style.display='block';
+el.style.visibility='visible';
+}
+}catch{}
 });
 
 await new Promise(
@@ -849,124 +860,259 @@ async function sendSiteMapToWorker(siteMap) {
 async function extractPricingFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden";
+      try {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.opacity !== "0";
+      } catch { return false; }
     };
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
+    // ─── EXPANDED moneyRe: catches €350, 350 лв, €350/кв.м., от €350, £350, etc. ───
+    const moneyRe = /((?:от|from|starting)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv|£)(?:\s*[\/\s]\s*(кв\.?м\.?|м²|sqm|месец|month|mo|yr|год(?:ина)?|year|нощ|нощувка|night))?/i;
+
+    // Also catches price-only text like "€350 / кв.м." more aggressively
+    const priceOnlyRe = /[€\$£]\s*\d{1,6}|\d{1,6}\s*(?:лв\.?|лева|bgn|eur|€)/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
+
     const pickTitle = (root) => {
-      const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
-      const t = getText(h);
-      if (t && t.length <= 80) return t;
-      const lines = getText(root).split("\n").map(norm).filter(Boolean);
-      return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
+      // Priority: heading elements, then class-based title, then strong/b
+      for (const sel of ["h1","h2","h3","h4","h5","[class*='title'],[class*='name'],[class*='heading']","strong","b"]) {
+        const h = root.querySelector(sel);
+        if (!h) continue;
+        const t = norm(h.innerText || h.textContent || "");
+        if (t && t.length >= 2 && t.length <= 100) return t;
+      }
+      // Fallback: first non-price short line
+      const lines = getText(root).split(/[\n|]+/).map(norm).filter(Boolean);
+      return lines.find(l => l.length >= 2 && l.length <= 80 && !priceOnlyRe.test(l)) || "";
     };
 
     const pickBadge = (root) => {
-      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
+      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag'],[class*='popular'],[class*='recommended'],[class*='best']");
       const t = getText(b);
-      if (t && t.length <= 40) return t;
+      if (t && t.length <= 50) return t;
       const all = getText(root);
-      if (/популярен|най-популярен|special|оферта/i.test(all)) {
-        const m = all.match(/(популярен|най-популярен|специална оферта)/i);
-        return m ? m[0] : "";
-      }
-      return "";
+      const m = all.match(/(популярен|най-популярен|специална оферта|препоръчан|най-предпочитан|best value|most popular)/i);
+      return m ? m[0] : "";
     };
 
+    // ─── pickFeatures: catches <li>, <p>, <div> with checkmark/bullet/feature text ───
     const pickFeatures = (root) => {
       const items = [];
-      root.querySelectorAll("li").forEach(li => {
-        const t = getText(li);
-        if (!t) return;
-        if (t.length < 3 || t.length > 140) return;
+      const seen = new Set();
+
+      const addText = (t) => {
+        t = norm(t);
+        if (!t || t.length < 2 || t.length > 160) return;
+        if (priceOnlyRe.test(t) && t.length < 30) return; // skip pure price lines
+        if (seen.has(t.toLowerCase())) return;
+        seen.add(t.toLowerCase());
         items.push(t);
+      };
+
+      // li items
+      root.querySelectorAll("li").forEach(li => {
+        if (li.querySelectorAll("li").length > 0) return; // skip nested lists
+        addText(getText(li));
       });
-      return Array.from(new Set(items)).slice(0, 30);
+
+      // If no <li> found, try <p> tags (common in custom-built pricing blocks)
+      if (items.length === 0) {
+        root.querySelectorAll("p").forEach(p => {
+          if (p.querySelectorAll("p").length > 0) return;
+          const t = getText(p);
+          // Only add if it looks like a feature (not a price, not too long)
+          if (t && !priceOnlyRe.test(t) && t.length < 120) addText(t);
+        });
+      }
+
+      // Also try divs/spans with checkmark emoji or icons (✓ ✔ ✅ •)
+      if (items.length === 0) {
+        root.querySelectorAll("div,span").forEach(el => {
+          if (el.children.length > 3) return;
+          const t = getText(el);
+          if (/^[✓✔✅•\-►▸→]/.test(t) || /включва|включен|вкл\.|included/i.test(t)) {
+            addText(t.replace(/^[✓✔✅•\-►▸→]\s*/, ""));
+          }
+        });
+      }
+
+      return items.slice(0, 30);
     };
 
     const pickPeriod = (root) => {
       const t = getText(root);
-      if (/\/\s*месец|на месец|месец/i.test(t)) return "monthly";
+      if (/\/\s*месец|на\s+месец|\bмесец\b|monthly|\/\s*mo\b/i.test(t)) return "monthly";
       if (/еднократно|one[-\s]?time|еднократ/i.test(t)) return "one_time";
+      if (/\/\s*год(?:ина)?|annual|yearly/i.test(t)) return "yearly";
+      if (/\/\s*нощ|\/\s*нощувка|per\s*night/i.test(t)) return "per_night";
+      if (/\/\s*кв\.?м|\/\s*м²|per\s*sqm/i.test(t)) return "per_sqm";
       return null;
     };
 
-    const findCardRoot = (startEl) => {
+    // ─── IMPROVED findCardRoot: detects more card-like containers ───
+    const findCardRoot = (startEl, moneyReTest) => {
       let el = startEl;
-      for (let i = 0; i < 8 && el; i++) {
-        const cls = (el.className && typeof el.className === "string") ? el.className : "";
+      for (let i = 0; i < 10 && el && el !== document.body; i++) {
+        const cls = (el.className && typeof el.className === "string") ? el.className.toLowerCase() : "";
         const tag = (el.tagName || "").toLowerCase();
+        const id = (el.id || "").toLowerCase();
+
+        // Explicit pricing/card class names
         const looksCard =
-          /card|pricing|package|plan|tier|column/i.test(cls) ||
-          ["article","section"].includes(tag);
+          /card|pricing|package|plan|tier|column|pack|offer|pric|цен|пакет|тариф/i.test(cls) ||
+          /card|pricing|package|plan|tier|column|pack|offer|pric/i.test(id) ||
+          ["article", "section"].includes(tag);
 
         const txt = getText(el);
-        const hasTitle = !!pickTitle(el);
-        const hasFeatures = el.querySelectorAll("li").length >= 3;
+        const txtLen = txt.length;
+        if (txtLen < 5 || txtLen > 3000) { el = el.parentElement; continue; }
 
-        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
+        const hasMoneyInBlock = moneyReTest(txt);
+        const hasTitle = !!pickTitle(el);
+        const liCount = el.querySelectorAll("li").length;
+        const pCount = el.querySelectorAll("p").length;
+        const hasFeatureItems = liCount >= 2 || pCount >= 2;
+
+        // Score: must have money AND (title OR features OR looks like card)
+        if (hasMoneyInBlock && (hasTitle || hasFeatureItems || looksCard) && txtLen >= 10) {
+          return el;
+        }
+
+        // Also accept: price + title in a reasonable container (even without features)
+        if (hasMoneyInBlock && hasTitle && txtLen >= 10 && txtLen <= 800) {
+          return el;
+        }
+
         el = el.parentElement;
       }
       return null;
     };
 
-    const cards=[];
-
-document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
-try{
-const j=JSON.parse(s.textContent||'{}');
-const arr=Array.isArray(j)?j:[j];
-arr.forEach(item=>{
-const offers=item.offers||item.hasOfferCatalog?.itemListElement;
-if(!offers) return;
-const list=Array.isArray(offers)?offers:[offers];
-list.forEach(o=>{
-const p=o.price||o.offers?.price;
-if(!p) return;
-cards.push({
-title:item.name||o.name||'Package',
-price_text:String(p),
-period:null,
-badge:'',
-features:[]
-});
-});
-});
-}catch{}
-});
-
+    const cards = [];
     const seen = new Set();
+
+    // ─── 1. JSON-LD structured data ───
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+      try {
+        const j = JSON.parse(s.textContent || '{}');
+        const arr = Array.isArray(j) ? j : [j];
+        arr.forEach(item => {
+          const offers = item.offers || item.hasOfferCatalog?.itemListElement;
+          if (!offers) return;
+          const list = Array.isArray(offers) ? offers : [offers];
+          list.forEach(o => {
+            const p = o.price || o.offers?.price;
+            if (!p) return;
+            const key = `${item.name||o.name||''}|${p}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            cards.push({
+              title: item.name || o.name || 'Package',
+              price_text: String(p),
+              period: null,
+              badge: '',
+              features: [],
+            });
+          });
+        });
+      } catch {}
+    });
+
+    // ─── 2. GRID/FLEX PRICING CONTAINER DETECTION ───
+    // Detect containers that hold multiple sibling pricing cards (common pattern)
+    const gridContainerSelectors = [
+      "[class*='pricing']",
+      "[class*='packages']",
+      "[class*='plans']",
+      "[class*='pric']",
+      "[class*='пакет']",
+      "[class*='цен']",
+      "[class*='tarif']",
+      "[class*='offer']",
+    ];
+
+    const tryExtractFromSiblingCards = (container) => {
+      if (!isVisible(container)) return;
+      const children = Array.from(container.children).filter(c => isVisible(c));
+      if (children.length < 2) return;
+
+      // Check if children look like pricing cards (each has price + title)
+      const cardChildren = children.filter(child => {
+        const txt = getText(child);
+        return txt.length >= 10 && txt.length <= 2000 && (priceOnlyRe.test(txt) || moneyRe.test(txt));
+      });
+
+      if (cardChildren.length < 2) return;
+
+      cardChildren.forEach(child => {
+        const rootText = getText(child);
+        const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
+        if (!moneyMatch) return;
+
+        const title = pickTitle(child);
+        if (!title) return;
+
+        const price_text = moneyMatch ? norm(moneyMatch[0]) : "";
+        const period = pickPeriod(child);
+        const badge = pickBadge(child);
+        const features = pickFeatures(child);
+
+        const key = `${title}|${price_text}|${period || ""}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        cards.push({ title, price_text, period, badge, features });
+      });
+    };
+
+    gridContainerSelectors.forEach(sel => {
+      try {
+        document.querySelectorAll(sel).forEach(container => tryExtractFromSiblingCards(container));
+      } catch {}
+    });
+
+    // Also try any flex/grid container with 2+ children that each have prices
+    document.querySelectorAll("div,section,ul").forEach(container => {
+      if (!isVisible(container)) return;
+      try {
+        const style = window.getComputedStyle(container);
+        const isFlex = style.display === "flex" || style.display === "grid" || style.display === "inline-flex";
+        if (!isFlex) return;
+        tryExtractFromSiblingCards(container);
+      } catch {}
+    });
+
+    // ─── 3. TEXT WALKER: find individual price mentions ───
+    const moneyReTest = (txt) => moneyRe.test(txt) || priceOnlyRe.test(txt);
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
-    while (node = walker.nextNode()) {
+    while ((node = walker.nextNode())) {
       const txt = norm(node.textContent || "");
       if (!txt) continue;
-      if (!moneyRe.test(txt) && !/по договаряне/i.test(txt)) continue;
+      if (!moneyReTest(txt) && !/по договаряне/i.test(txt)) continue;
 
       const parent = node.parentElement;
       if (!parent || !isVisible(parent)) continue;
 
-      const root = findCardRoot(parent);
+      const root = findCardRoot(parent, moneyReTest);
       if (!root || !isVisible(root)) continue;
 
       const title = pickTitle(root);
       if (!title) continue;
 
       const rootText = getText(root);
-      const moneyMatch = rootText.match(moneyRe);
+      const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
       const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
 
       const period = pickPeriod(root);
-
       const badge = pickBadge(root);
       const features = pickFeatures(root);
 
@@ -974,16 +1120,41 @@ features:[]
       if (seen.has(key)) continue;
       seen.add(key);
 
-      cards.push({
-        title,
-        price_text,
-        period,
-        badge,
-        features,
-      });
+      cards.push({ title, price_text, period, badge, features });
     }
 
-    const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
+    // ─── 4. FALLBACK: look for elements with explicit price CSS classes ───
+    document.querySelectorAll("[class*='price'],[class*='cena'],[class*='amount'],[class*='cost'],[class*='tarif']").forEach(el => {
+      if (!isVisible(el)) return;
+      const txt = getText(el);
+      if (!moneyReTest(txt)) return;
+
+      const root = findCardRoot(el, moneyReTest) || el.parentElement;
+      if (!root || !isVisible(root)) return;
+
+      const title = pickTitle(root);
+      if (!title) return;
+
+      const rootText = getText(root);
+      const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
+      if (!moneyMatch) return;
+
+      const price_text = norm(moneyMatch[0]);
+      const period = pickPeriod(root);
+      const badge = pickBadge(root);
+      const features = pickFeatures(root);
+
+      const key = `${title}|${price_text}|${period || ""}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      cards.push({ title, price_text, period, badge, features });
+    });
+
+    const installment_plans = cards.filter(c =>
+      c.period === "monthly" ||
+      /месец/i.test((c.title || "") + " " + (c.price_text || ""))
+    );
     const pricing_cards = cards.filter(c => !installment_plans.includes(c));
 
     installment_plans.forEach(p => {
@@ -991,8 +1162,8 @@ features:[]
     });
 
     return {
-      pricing_cards: pricing_cards.slice(0, 12),
-      installment_plans: installment_plans.slice(0, 12),
+      pricing_cards: pricing_cards.slice(0, 20),
+      installment_plans: installment_plans.slice(0, 20),
     };
   });
 }
@@ -3459,8 +3630,3 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
-
-
-
-
-
