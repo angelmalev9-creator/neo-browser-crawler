@@ -156,15 +156,18 @@ try{
 
 const ct=(res.headers()["content-type"]||"").toLowerCase();
 
+// Capture JSON, GraphQL AND Next.js RSC payloads (text/x-component)
 if(
 ct.includes("json") ||
-ct.includes("graphql")
+ct.includes("graphql") ||
+ct.includes("x-component") ||
+ct.includes("text/plain")
 ){
 
 const txt=await res.text();
 
 if(
-/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
+/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages|basic|standart|premium|350|650|850/i.test(txt)
 ){
 payloads.push(
 txt.slice(0,100000)
@@ -3048,6 +3051,9 @@ function extractPricingFromText(text = "") {
   // Познати имена на ценови пакети (general + BG specific)
   const PACKAGE_NAMES = /\b(basic|standard|standart|premium|pro|enterprise|starter|lite|free|business|gold|silver|platinum|light|advanced|ultimate|базов|стандарт|стандартен|премиум|бизнес|икономичен|луксоз\w*)\b/i;
 
+  // Редове, които ИЗГЛЕЖДАТ като заглавие на пакет, но не са
+  const FALSE_POSITIVE_RE = /избран|selected|план:|пакет:|package:|plan:|choose|choose your|изберете|вашият/i;
+
   // Разбиваме текста на блокове по нови редове
   const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
 
@@ -3057,7 +3063,7 @@ function extractPricingFromText(text = "") {
 
     // Проверяваме дали редът изглежда като заглавие на пакет
     const titleMatch = line.match(PACKAGE_NAMES);
-    if (titleMatch && line.length <= 60 && !/[.!?]$/.test(line)) {
+    if (titleMatch && line.length <= 60 && !/[.!?]$/.test(line) && !FALSE_POSITIVE_RE.test(line)) {
       // Търсим цена в следващите 8 реда
       let price_text = "";
       let features = [];
@@ -3092,7 +3098,7 @@ function extractPricingFromText(text = "") {
         }
       }
 
-      if (price_text || features.length > 0) {
+      if (price_text) {
         // Определяме period
         let period = null;
         if (/месец|monthly|\/mo/i.test(price_text)) period = "monthly";
@@ -3209,11 +3215,6 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 const getNetworkPayloads =
 await attachNetworkMining(page);
 
-// For pricing pages: wait longer for React/Next.js to render price cards
-if (/ceni|pricing|price|пакет|tarif/i.test(url)) {
-  try { await page.waitForTimeout(1500); } catch {}
-}
-
 if(!/\/proekt\/|\/id-/i.test(url)){
  await waitForHydrationSettled(page);
 }
@@ -3290,7 +3291,7 @@ getNetworkPayloads();
     let nextDataText = "";
     if (/ceni|pricing|price|пакет|tarif/i.test(url)) {
       try {
-        // 1. Try __NEXT_DATA__ / __NUXT_DATA__ inline JSON
+        // Try __NEXT_DATA__ / __NUXT_DATA__ inline JSON (fast, no network)
         const inlineJson = await page.evaluate(() => {
           const nextEl = document.getElementById("__NEXT_DATA__");
           if (nextEl?.textContent) return nextEl.textContent;
@@ -3310,43 +3311,8 @@ getNetworkPayloads();
             }
           } catch {}
         }
-
-        // 2. Mine JS chunks for hardcoded price strings (Next.js App Router)
-        // App Router вгражда данните директно в JS bundle-и като string literals
-        if (!pricing?.pricing_cards?.length) {
-          const chunkPricing = await page.evaluate(async () => {
-            // Намираме всички заредени JS chunk URLs
-            const scripts = Array.from(document.querySelectorAll("script[src]"))
-              .map(s => s.src)
-              .filter(s => s.includes("/_next/static/chunks/") || s.includes("/_nuxt/"));
-
-            const PACKAGE_RE = /\b(BASIC|STANDART|STANDARD|PREMIUM|PRO)\b/;
-            const MONEY_RE = /€\s*\d{3,}|\d{3,}\s*(?:лв|bgn|eur)/i;
-
-            for (const src of scripts.slice(0, 20)) {
-              try {
-                const res = await fetch(src);
-                const text = await res.text();
-                // Only process chunks that mention both package names AND money
-                if (!PACKAGE_RE.test(text) || !MONEY_RE.test(text)) continue;
-                return text.slice(0, 500000); // Return first matching chunk
-              } catch {}
-            }
-            return "";
-          });
-
-          if (chunkPricing) {
-            // Parse the JS chunk text for pricing
-            const extracted = extractPricingFromText(chunkPricing);
-            if (extracted.pricing_cards.length > 0) {
-              pricing = extracted;
-              console.log(`[PRICING] JS chunk: ${pricing.pricing_cards.length} cards`);
-            }
-            nextDataText = chunkPricing.slice(0, 50000); // Add to rawAll for text fallback
-          }
-        }
       } catch (e) {
-        console.error("[PRICING] Next/chunk mining error:", e.message);
+        console.error("[PRICING] Next data mining error:", e.message);
       }
     }
 
@@ -3491,10 +3457,11 @@ const allLinks = Array.from(
     }
 
     // ── TEXT-LEVEL PRICING FALLBACK ──
-    // Ако DOM extraction не е намерила цени, опитваме text parser
+    // Ать DOM extraction не е намерила цени, опитваме text parser върху RAW текст
+    // (преди normalizeNumbers, защото тя може да конвертира €350 в думи)
     if ((!pricing?.pricing_cards?.length && !pricing?.installment_plans?.length)) {
       try {
-        const textPricing = extractPricingFromText(content);
+        const textPricing = extractPricingFromText(rawAll);
         if ((textPricing.pricing_cards.length || 0) > 0 || (textPricing.installment_plans.length || 0) > 0) {
           pricing = textPricing;
           console.log(`[PRICING] Text fallback: ${pricing.pricing_cards.length} cards, ${pricing.installment_plans.length} installment`);
