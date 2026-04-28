@@ -650,42 +650,48 @@ async function extractSiteMapFromPage(page) {
       }
     });
 
-    // VISUAL PRICE EXTRACTION (works like user copy-paste)
+    // VISUAL PRICE EXTRACTION (works like copy-paste)
 const prices = [];
 const seenPrices = new Set();
 
-// 1. Scan rendered text blocks (like selecting with cursor)
-document.querySelectorAll(
+for (const el of document.querySelectorAll(
 'h1,h2,h3,h4,h5,h6,p,span,div,strong,b,li'
-).forEach(el => {
+)) {
 
-  const txt = (el.innerText || "").replace(/\s+/g,' ').trim();
+  const txt=(el.innerText||'').replace(/\s+/g,' ').trim();
+  if(!txt) continue;
 
-  if(!txt) return;
-
-  // catches €350 , 350€ , 350 лв , 350 / кв.м
-  const matches = txt.match(
+  const matches=txt.match(
 /(?:€\s?\d+|\d+\s?€|\d+\s?(?:лв|BGN|EUR)|\d+\s?\/\s?кв\.?м\.?)/gi
   );
 
-  if(matches){
-    matches.forEach(price=>{
-      if(!seenPrices.has(price)){
-        seenPrices.add(price);
+  if(!matches) continue;
 
-        prices.push({
-          text: price,
-          context: (
-             el.closest('section,article,div')
-               ?.querySelector('h1,h2,h3,h4')
-               ?.innerText || ''
-          ).trim()
-        });
-      }
+  for(const price of matches){
+
+    if(seenPrices.has(price)) continue;
+    seenPrices.add(price);
+
+    prices.push({
+      text: price,
+      context: (
+        el.closest('section,article,div')
+          ?.querySelector('h1,h2,h3,h4')
+          ?.innerText || ''
+      ).trim()
     });
+
   }
+}
+
+return {
+  buttons,
+  forms,
+  prices: prices.slice(0,30)
+};
 
 });
+}
 
 // Enrich raw SiteMap with keywords (runs in Node.js)
 function enrichSiteMap(raw, siteId, siteUrl) {
