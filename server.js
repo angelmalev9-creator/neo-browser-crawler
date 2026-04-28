@@ -85,179 +85,6 @@ MUTATION_IDLE_MS
 
 
 async function extractShadowAndPortalText(page){
-  async function extractHumanSelectionCopy(page){
-
-return await page.evaluate(async()=>{
-
-const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
-
-/*
-simulate real human:
-select all text
-copy visible rendered text
-expand cards
-click detail buttons
-read computed text
-*/
-
-for(let i=0;i<6;i++){
-
-window.scrollTo(
-0,
-(document.body.scrollHeight/5)*i
-);
-
-document.querySelectorAll(
-'button,[role=button],summary,[aria-expanded="false"]'
-).forEach(el=>{
-
-const t=(el.innerText||'').toLowerCase();
-
-if(
-/виж|детайли|повече|package|pricing|basic|standart|standard|premium|пакет|цени/i.test(t)
-){
-try{el.click()}catch{}
-}
-
-});
-
-await sleep(300);
-}
-
-
-// force text selection like user drag select
-function copySelectionFrom(el){
-
-try{
-
-const range=document.createRange();
-range.selectNodeContents(el);
-
-const sel=window.getSelection();
-sel.removeAllRanges();
-sel.addRange(range);
-
-const txt=sel.toString();
-
-sel.removeAllRanges();
-
-return txt;
-
-}catch{
-return '';
-}
-
-}
-
-
-const chunks=[];
-const seen=new Set();
-
-function push(t){
-
-t=(t||'')
-.replace(/\s+/g,' ')
-.trim();
-
-if(!t || t.length<2) return;
-
-if(seen.has(t)) return;
-
-seen.add(t);
-
-chunks.push(t);
-}
-
-
-
-// 1 FULL PAGE COPY
-push(
-copySelectionFrom(document.body)
-);
-
-
-// 2 COPY EACH CARD BLOCK SEPARATELY
-document.querySelectorAll(
-'div,section,article'
-).forEach(el=>{
-
-try{
-
-const txt=
-(el.innerText||'')
-replace(/\s+/g,' ')
-.trim();
-
-if(
-/€\d+|\d+\s?лв|basic|standart|standard|premium/i.test(txt)
-){
-push(
-copySelectionFrom(el)
-);
-}
-
-}catch{}
-
-});
-
-
-// 3 EXACT VISUAL TEXT FROM ALL NODES
-document.querySelectorAll('*').forEach(el=>{
-
-try{
-
-if(
-el.children.length===0
-){
-
-push(
-el.innerText||
-el.textContent
-);
-
-}
-
-}catch{}
-
-});
-
-
-// 4 include pseudo generated css text
-document.querySelectorAll('*').forEach(el=>{
-
-try{
-
-const b=
-getComputedStyle(el,'::before').content;
-
-const a=
-getComputedStyle(el,'::after').content;
-
-if(b&&b!=='none')
-push(b.replace(/"/g,''));
-
-if(a&&a!=='none')
-push(a.replace(/"/g,''));
-
-}catch{}
-
-});
-
-
-// 5 include dialogs / portals
-document.querySelectorAll(
-'[role=dialog],[data-radix-portal],body>div'
-).forEach(el=>{
-push(
-copySelectionFrom(el)
-);
-});
-
-
-return chunks.join('\n');
-
-});
-}
 
 return await page.evaluate(()=>{
 
@@ -329,18 +156,15 @@ try{
 
 const ct=(res.headers()["content-type"]||"").toLowerCase();
 
-// Capture JSON, GraphQL AND Next.js RSC payloads (text/x-component)
 if(
 ct.includes("json") ||
-ct.includes("graphql") ||
-ct.includes("x-component") ||
-ct.includes("text/plain")
+ct.includes("graphql")
 ){
 
 const txt=await res.text();
 
 if(
-/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages|basic|standart|premium|350|650|850/i.test(txt)
+/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
 ){
 payloads.push(
 txt.slice(0,100000)
@@ -362,7 +186,7 @@ async function forceRenderEverything(page){
 
 await page.evaluate(async()=>{
 
-for(let i=0;i<10;i++){
+for(let i=0;i<8;i++){
 
 window.scrollTo(
 0,
@@ -370,28 +194,17 @@ document.body.scrollHeight
 );
 
 document.querySelectorAll(
-'button,[role=tab],summary,[aria-expanded="false"],[class*="accordion"],[class*="collapse"]'
+'button,[role=tab],summary,[aria-expanded="false"]'
 ).forEach(el=>{
 
 const t=(el.innerText||'').toLowerCase();
 
 if(
-/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers|пакет|basic|standard|premium|pro|enterprise|starter|цена|detayli|подробно|покажи/i.test(t)
+/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
 ){
 try{el.click()}catch{}
 }
 
-});
-
-// Also expand any collapsed pricing sections
-document.querySelectorAll('[class*="pricing"],[class*="package"],[class*="plan"],[class*="пакет"],[class*="цен"]').forEach(el=>{
-try{
-const style=window.getComputedStyle(el);
-if(style.display==='none' || style.visibility==='hidden'){
-el.style.display='block';
-el.style.visibility='visible';
-}
-}catch{}
 });
 
 await new Promise(
@@ -823,47 +636,50 @@ async function extractSiteMapFromPage(page) {
       }
     });
 
-    // VISUAL PRICE EXTRACTION (works like copy-paste)
-const prices = [];
-const seenPrices = new Set();
+    // EXTRACT PRICES (legacy, context-light)
+    const prices = [];
+    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
 
-for (const el of document.querySelectorAll(
-'h1,h2,h3,h4,h5,h6,p,span,div,strong,b,li'
-)) {
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      null
+    );
 
-  const txt=(el.innerText||'').replace(/\s+/g,' ').trim();
-  if(!txt) continue;
+    let node;
+    while (node = walker.nextNode()) {
+      const text = node.textContent || "";
+      const matches = [...text.matchAll(priceRegex)];
 
-  const matches=txt.match(
-/(?:€\s?\d+|\d+\s?€|\d+\s?(?:лв|BGN|EUR)|\d+\s?\/\s?кв\.?м\.?)/gi
-  );
+      matches.forEach(match => {
+        const parent = node.parentElement;
+        let context = "";
 
-  if(!matches) continue;
+        if (parent) {
+          const container = parent.closest("div, article, section, li, tr");
+          if (container) {
+            const heading = container.querySelector("h1, h2, h3, h4, h5, h6, strong, b, .title");
+            if (heading) context = heading.textContent?.trim().slice(0, 50) || "";
+          }
+        }
 
-  for(const price of matches){
+        if (!prices.some(p => p.text === match[0] && p.context === context)) {
+          prices.push({
+            text: match[0],
+            context,
+          });
+        }
+      });
+    }
 
-    if(seenPrices.has(price)) continue;
-    seenPrices.add(price);
-
-    prices.push({
-      text: price,
-      context: (
-        el.closest('section,article,div')
-          ?.querySelector('h1,h2,h3,h4')
-          ?.innerText || ''
-      ).trim()
-    });
-
-  }
-}
-
-return {
-  buttons,
-  forms,
-  prices: prices.slice(0,30)
-};
-
-});
+    return {
+      url: window.location.href,
+      title: document.title,
+      buttons: buttons.slice(0, 30),
+      forms: forms.slice(0, 10),
+      prices: prices.slice(0, 20),
+    };
+  });
 }
 
 // Enrich raw SiteMap with keywords (runs in Node.js)
@@ -1033,259 +849,124 @@ async function sendSiteMapToWorker(siteMap) {
 async function extractPricingFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
-      try {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 &&
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          style.opacity !== "0";
-      } catch { return false; }
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden";
     };
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    // ─── EXPANDED moneyRe: catches €350, 350 лв, €350/кв.м., от €350, £350, etc. ───
-    const moneyRe = /((?:от|from|starting)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv|£)(?:\s*[\/\s]\s*(кв\.?м\.?|м²|sqm|месец|month|mo|yr|год(?:ина)?|year|нощ|нощувка|night))?/i;
-
-    // Also catches price-only text like "€350 / кв.м." more aggressively
-    const priceOnlyRe = /[€\$£]\s*\d{1,6}|\d{1,6}\s*(?:лв\.?|лева|bgn|eur|€)/i;
+    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
-
     const pickTitle = (root) => {
-      // Priority: heading elements, then class-based title, then strong/b
-      for (const sel of ["h1","h2","h3","h4","h5","[class*='title'],[class*='name'],[class*='heading']","strong","b"]) {
-        const h = root.querySelector(sel);
-        if (!h) continue;
-        const t = norm(h.innerText || h.textContent || "");
-        if (t && t.length >= 2 && t.length <= 100) return t;
-      }
-      // Fallback: first non-price short line
-      const lines = getText(root).split(/[\n|]+/).map(norm).filter(Boolean);
-      return lines.find(l => l.length >= 2 && l.length <= 80 && !priceOnlyRe.test(l)) || "";
+      const h = root.querySelector("h1,h2,h3,h4,[class*='title'],strong,b");
+      const t = getText(h);
+      if (t && t.length <= 80) return t;
+      const lines = getText(root).split("\n").map(norm).filter(Boolean);
+      return (lines.find(l => l.length >= 3 && l.length <= 80) || "");
     };
 
     const pickBadge = (root) => {
-      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag'],[class*='popular'],[class*='recommended'],[class*='best']");
+      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
       const t = getText(b);
-      if (t && t.length <= 50) return t;
+      if (t && t.length <= 40) return t;
       const all = getText(root);
-      const m = all.match(/(популярен|най-популярен|специална оферта|препоръчан|най-предпочитан|best value|most popular)/i);
-      return m ? m[0] : "";
+      if (/популярен|най-популярен|special|оферта/i.test(all)) {
+        const m = all.match(/(популярен|най-популярен|специална оферта)/i);
+        return m ? m[0] : "";
+      }
+      return "";
     };
 
-    // ─── pickFeatures: catches <li>, <p>, <div> with checkmark/bullet/feature text ───
     const pickFeatures = (root) => {
       const items = [];
-      const seen = new Set();
-
-      const addText = (t) => {
-        t = norm(t);
-        if (!t || t.length < 2 || t.length > 160) return;
-        if (priceOnlyRe.test(t) && t.length < 30) return; // skip pure price lines
-        if (seen.has(t.toLowerCase())) return;
-        seen.add(t.toLowerCase());
-        items.push(t);
-      };
-
-      // li items
       root.querySelectorAll("li").forEach(li => {
-        if (li.querySelectorAll("li").length > 0) return; // skip nested lists
-        addText(getText(li));
+        const t = getText(li);
+        if (!t) return;
+        if (t.length < 3 || t.length > 140) return;
+        items.push(t);
       });
-
-      // If no <li> found, try <p> tags (common in custom-built pricing blocks)
-      if (items.length === 0) {
-        root.querySelectorAll("p").forEach(p => {
-          if (p.querySelectorAll("p").length > 0) return;
-          const t = getText(p);
-          // Only add if it looks like a feature (not a price, not too long)
-          if (t && !priceOnlyRe.test(t) && t.length < 120) addText(t);
-        });
-      }
-
-      // Also try divs/spans with checkmark emoji or icons (✓ ✔ ✅ •)
-      if (items.length === 0) {
-        root.querySelectorAll("div,span").forEach(el => {
-          if (el.children.length > 3) return;
-          const t = getText(el);
-          if (/^[✓✔✅•\-►▸→]/.test(t) || /включва|включен|вкл\.|included/i.test(t)) {
-            addText(t.replace(/^[✓✔✅•\-►▸→]\s*/, ""));
-          }
-        });
-      }
-
-      return items.slice(0, 30);
+      return Array.from(new Set(items)).slice(0, 30);
     };
 
     const pickPeriod = (root) => {
       const t = getText(root);
-      if (/\/\s*месец|на\s+месец|\bмесец\b|monthly|\/\s*mo\b/i.test(t)) return "monthly";
+      if (/\/\s*месец|на месец|месец/i.test(t)) return "monthly";
       if (/еднократно|one[-\s]?time|еднократ/i.test(t)) return "one_time";
-      if (/\/\s*год(?:ина)?|annual|yearly/i.test(t)) return "yearly";
-      if (/\/\s*нощ|\/\s*нощувка|per\s*night/i.test(t)) return "per_night";
-      if (/\/\s*кв\.?м|\/\s*м²|per\s*sqm/i.test(t)) return "per_sqm";
       return null;
     };
 
-    // ─── IMPROVED findCardRoot: detects more card-like containers ───
-    const findCardRoot = (startEl, moneyReTest) => {
+    const findCardRoot = (startEl) => {
       let el = startEl;
-      for (let i = 0; i < 10 && el && el !== document.body; i++) {
-        const cls = (el.className && typeof el.className === "string") ? el.className.toLowerCase() : "";
+      for (let i = 0; i < 8 && el; i++) {
+        const cls = (el.className && typeof el.className === "string") ? el.className : "";
         const tag = (el.tagName || "").toLowerCase();
-        const id = (el.id || "").toLowerCase();
-
-        // Explicit pricing/card class names
         const looksCard =
-          /card|pricing|package|plan|tier|column|pack|offer|pric|цен|пакет|тариф/i.test(cls) ||
-          /card|pricing|package|plan|tier|column|pack|offer|pric/i.test(id) ||
-          ["article", "section"].includes(tag);
+          /card|pricing|package|plan|tier|column/i.test(cls) ||
+          ["article","section"].includes(tag);
 
         const txt = getText(el);
-        const txtLen = txt.length;
-        if (txtLen < 5 || txtLen > 3000) { el = el.parentElement; continue; }
-
-        const hasMoneyInBlock = moneyReTest(txt);
         const hasTitle = !!pickTitle(el);
-        const liCount = el.querySelectorAll("li").length;
-        const pCount = el.querySelectorAll("p").length;
-        const hasFeatureItems = liCount >= 2 || pCount >= 2;
+        const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        // Score: must have money AND (title OR features OR looks like card)
-        if (hasMoneyInBlock && (hasTitle || hasFeatureItems || looksCard) && txtLen >= 10) {
-          return el;
-        }
-
-        // Also accept: price + title in a reasonable container (even without features)
-        if (hasMoneyInBlock && hasTitle && txtLen >= 10 && txtLen <= 800) {
-          return el;
-        }
-
+        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
         el = el.parentElement;
       }
       return null;
     };
 
-    const cards = [];
+    const cards=[];
+
+document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
+try{
+const j=JSON.parse(s.textContent||'{}');
+const arr=Array.isArray(j)?j:[j];
+arr.forEach(item=>{
+const offers=item.offers||item.hasOfferCatalog?.itemListElement;
+if(!offers) return;
+const list=Array.isArray(offers)?offers:[offers];
+list.forEach(o=>{
+const p=o.price||o.offers?.price;
+if(!p) return;
+cards.push({
+title:item.name||o.name||'Package',
+price_text:String(p),
+period:null,
+badge:'',
+features:[]
+});
+});
+});
+}catch{}
+});
+
     const seen = new Set();
-
-    // ─── 1. JSON-LD structured data ───
-    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
-      try {
-        const j = JSON.parse(s.textContent || '{}');
-        const arr = Array.isArray(j) ? j : [j];
-        arr.forEach(item => {
-          const offers = item.offers || item.hasOfferCatalog?.itemListElement;
-          if (!offers) return;
-          const list = Array.isArray(offers) ? offers : [offers];
-          list.forEach(o => {
-            const p = o.price || o.offers?.price;
-            if (!p) return;
-            const key = `${item.name||o.name||''}|${p}`;
-            if (seen.has(key)) return;
-            seen.add(key);
-            cards.push({
-              title: item.name || o.name || 'Package',
-              price_text: String(p),
-              period: null,
-              badge: '',
-              features: [],
-            });
-          });
-        });
-      } catch {}
-    });
-
-    // ─── 2. GRID/FLEX PRICING CONTAINER DETECTION ───
-    // Detect containers that hold multiple sibling pricing cards (common pattern)
-    const gridContainerSelectors = [
-      "[class*='pricing']",
-      "[class*='packages']",
-      "[class*='plans']",
-      "[class*='pric']",
-      "[class*='пакет']",
-      "[class*='цен']",
-      "[class*='tarif']",
-      "[class*='offer']",
-    ];
-
-    const tryExtractFromSiblingCards = (container) => {
-      if (!isVisible(container)) return;
-      const children = Array.from(container.children).filter(c => isVisible(c));
-      if (children.length < 2) return;
-
-      // Check if children look like pricing cards (each has price + title)
-      const cardChildren = children.filter(child => {
-        const txt = getText(child);
-        return txt.length >= 10 && txt.length <= 2000 && (priceOnlyRe.test(txt) || moneyRe.test(txt));
-      });
-
-      if (cardChildren.length < 2) return;
-
-      cardChildren.forEach(child => {
-        const rootText = getText(child);
-        const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
-        if (!moneyMatch) return;
-
-        const title = pickTitle(child);
-        if (!title) return;
-
-        const price_text = moneyMatch ? norm(moneyMatch[0]) : "";
-        const period = pickPeriod(child);
-        const badge = pickBadge(child);
-        const features = pickFeatures(child);
-
-        const key = `${title}|${price_text}|${period || ""}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-
-        cards.push({ title, price_text, period, badge, features });
-      });
-    };
-
-    gridContainerSelectors.forEach(sel => {
-      try {
-        document.querySelectorAll(sel).forEach(container => tryExtractFromSiblingCards(container));
-      } catch {}
-    });
-
-    // Also try any flex/grid container with 2+ children that each have prices
-    document.querySelectorAll("div,section,ul").forEach(container => {
-      if (!isVisible(container)) return;
-      try {
-        const style = window.getComputedStyle(container);
-        const isFlex = style.display === "flex" || style.display === "grid" || style.display === "inline-flex";
-        if (!isFlex) return;
-        tryExtractFromSiblingCards(container);
-      } catch {}
-    });
-
-    // ─── 3. TEXT WALKER: find individual price mentions ───
-    const moneyReTest = (txt) => moneyRe.test(txt) || priceOnlyRe.test(txt);
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
-    while ((node = walker.nextNode())) {
+    while (node = walker.nextNode()) {
       const txt = norm(node.textContent || "");
       if (!txt) continue;
-      if (!moneyReTest(txt) && !/по договаряне/i.test(txt)) continue;
+      if (!moneyRe.test(txt) && !/по договаряне/i.test(txt)) continue;
 
       const parent = node.parentElement;
       if (!parent || !isVisible(parent)) continue;
 
-      const root = findCardRoot(parent, moneyReTest);
+      const root = findCardRoot(parent);
       if (!root || !isVisible(root)) continue;
 
       const title = pickTitle(root);
       if (!title) continue;
 
       const rootText = getText(root);
-      const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
+      const moneyMatch = rootText.match(moneyRe);
       const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
 
       const period = pickPeriod(root);
+
       const badge = pickBadge(root);
       const features = pickFeatures(root);
 
@@ -1293,41 +974,16 @@ async function extractPricingFromPage(page) {
       if (seen.has(key)) continue;
       seen.add(key);
 
-      cards.push({ title, price_text, period, badge, features });
+      cards.push({
+        title,
+        price_text,
+        period,
+        badge,
+        features,
+      });
     }
 
-    // ─── 4. FALLBACK: look for elements with explicit price CSS classes ───
-    document.querySelectorAll("[class*='price'],[class*='cena'],[class*='amount'],[class*='cost'],[class*='tarif']").forEach(el => {
-      if (!isVisible(el)) return;
-      const txt = getText(el);
-      if (!moneyReTest(txt)) return;
-
-      const root = findCardRoot(el, moneyReTest) || el.parentElement;
-      if (!root || !isVisible(root)) return;
-
-      const title = pickTitle(root);
-      if (!title) return;
-
-      const rootText = getText(root);
-      const moneyMatch = rootText.match(moneyRe) || rootText.match(priceOnlyRe);
-      if (!moneyMatch) return;
-
-      const price_text = norm(moneyMatch[0]);
-      const period = pickPeriod(root);
-      const badge = pickBadge(root);
-      const features = pickFeatures(root);
-
-      const key = `${title}|${price_text}|${period || ""}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-
-      cards.push({ title, price_text, period, badge, features });
-    });
-
-    const installment_plans = cards.filter(c =>
-      c.period === "monthly" ||
-      /месец/i.test((c.title || "") + " " + (c.price_text || ""))
-    );
+    const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
     const pricing_cards = cards.filter(c => !installment_plans.includes(c));
 
     installment_plans.forEach(p => {
@@ -1335,8 +991,8 @@ async function extractPricingFromPage(page) {
     });
 
     return {
-      pricing_cards: pricing_cards.slice(0, 20),
-      installment_plans: installment_plans.slice(0, 20),
+      pricing_cards: pricing_cards.slice(0, 12),
+      installment_plans: installment_plans.slice(0, 12),
     };
   });
 }
@@ -3205,177 +2861,7 @@ async function extractProductSpecsFromPage(page) {
 }
 
 
-// ================= TEXT-LEVEL PRICING FALLBACK PARSER =================
-// Извлича ценови пакети директно от raw text когато DOM extraction е неуспешна.
-// Хваща паттерни като:
-//   "BASIC\n€350 / кв.м.\nКонструкция\nКачествени материали"
-//   "СТАНДАРТ 650 лв/кв.м. ..."
-//   "PREMIUM €850/кв.м. Луксозно изпълнение"
-function extractPricingFromText(text = "") {
-  const cards = [];
-  if (!text) return { pricing_cards: [], installment_plans: [] };
-
-  // Regex за цена с валута — хваща и €350 (символ пред числото) и 350 лв. (след)
-  const moneyRe = /(?:€|\$|£)\s*\d{1,6}(?:[.,]\d{1,3})*|\d{1,6}(?:[.,]\d{1,3})*\s*(?:лв\.?|лева|bgn|eur|€|\$|£)/gi;
-
-  // Познати имена на ценови пакети (general + BG specific)
-  const PACKAGE_NAMES = /\b(basic|standard|standart|premium|pro|enterprise|starter|lite|free|business|gold|silver|platinum|light|advanced|ultimate|базов|стандарт|стандартен|премиум|бизнес|икономичен|луксоз\w*)\b/i;
-
-  // Редове, които ИЗГЛЕЖДАТ като заглавие на пакет, но не са
-  const FALSE_POSITIVE_RE = /избран|selected|план:|пакет:|package:|plan:|choose|choose your|изберете|вашият/i;
-
-  // Разбиваме текста на блокове по нови редове
-  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // Проверяваме дали редът изглежда като заглавие на пакет
-    const titleMatch = line.match(PACKAGE_NAMES);
-    if (titleMatch && line.length <= 60 && !/[.!?]$/.test(line) && !FALSE_POSITIVE_RE.test(line)) {
-      // Търсим цена в следващите 8 реда
-      let price_text = "";
-      let features = [];
-      let badge = "";
-
-      for (let j = i + 1; j < Math.min(i + 12, lines.length); j++) {
-        const nextLine = lines[j];
-
-        // Проверяваме дали следващото заглавие е нов пакет (спираме)
-        if (nextLine.match(PACKAGE_NAMES) && nextLine.length <= 60 && j > i + 1) break;
-
-        // Намираме цената
-        if (!price_text) {
-          const priceMatch = nextLine.match(moneyRe);
-          if (priceMatch) {
-            price_text = priceMatch[0].trim();
-            // Добавяме единицата (кв.м.) ако е на същия ред
-            if (/кв\.?м|sqm|м²/i.test(nextLine)) price_text += " / кв.м.";
-          }
-        }
-
-        // Събираме features (кратки редове, не цена, не заглавие)
-        if (nextLine.length >= 3 && nextLine.length <= 100 && !nextLine.match(moneyRe)) {
-          if (/конструкц|материал|изпълнен|включ|гаранц|проект|услуг|support|включва|feature/i.test(nextLine)) {
-            features.push(nextLine);
-          }
-        }
-
-        // Badge (най-предпочитан, popular и т.н.)
-        if (/най-предпочитан|popular|препоръч|best value/i.test(nextLine) && nextLine.length < 40) {
-          badge = nextLine;
-        }
-      }
-
-      if (price_text) {
-        // Определяме period
-        let period = null;
-        if (/месец|monthly|\/mo/i.test(price_text)) period = "monthly";
-        else if (/кв\.?м|sqm/i.test(price_text)) period = "per_sqm";
-
-        cards.push({
-          title: line,
-          price_text,
-          period,
-          badge,
-          features,
-        });
-      }
-    }
-
-    i++;
-  }
-
-  // Допълнителен pass: търсим "BASIC €350 / кв.м." на един ред
-  const inlineRe = /\b(basic|standard|standart|premium|pro|lite|базов|стандарт|премиум)\b[^\n]{0,30}?(\d{1,6}(?:[.,]\d{1,3})*)\s*(лв\.?|лева|bgn|eur|€|\$|£)(?:[^\n]{0,20})?/gi;
-  let m;
-  while ((m = inlineRe.exec(text)) !== null) {
-    const title = m[1];
-    const price_text = m[0].trim();
-    const already = cards.find(c => c.title.toLowerCase() === title.toLowerCase());
-    if (!already) {
-      cards.push({ title, price_text, period: /кв\.?м/i.test(price_text) ? "per_sqm" : null, badge: "", features: [] });
-    }
-  }
-
-  const seen = new Set();
-  const unique = cards.filter(c => {
-    const k = `${c.title.toLowerCase()}|${c.price_text}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  const installment_plans = unique.filter(c => c.period === "monthly");
-  const pricing_cards = unique.filter(c => c.period !== "monthly");
-
-  return {
-    pricing_cards: pricing_cards.slice(0, 20),
-    installment_plans: installment_plans.slice(0, 20),
-  };
-}
-
-
-// ================= NEXT.JS DATA PRICING EXTRACTOR =================
-// Обхожда рекурсивно JSON от __NEXT_DATA__ и търси pricing обекти.
-function extractPricingFromNextData(obj) {
-  const cards = [];
-  if (!obj) return { pricing_cards: [], installment_plans: [] };
-
-  const PACKAGE_RE = /^(basic|standart|standard|premium|pro|базов|стандарт|премиум|lite|starter)$/i;
-  const MONEY_RE = /(?:€|\$|£)\s*\d{1,6}|\d{1,6}\s*(?:лв\.?|лева|eur|bgn)/i;
-
-  function walk(node, depth) {
-    if (!node || typeof node !== "object" || depth > 15) return;
-
-    if (Array.isArray(node)) {
-      // Check if this looks like an array of pricing packages
-      const hasPricingLike = node.some(item =>
-        item && typeof item === "object" &&
-        Object.values(item).some(v => typeof v === "string" && PACKAGE_RE.test(v.trim()))
-      );
-      if (hasPricingLike) {
-        for (const item of node) {
-          if (!item || typeof item !== "object") continue;
-          const vals = Object.values(item).filter(v => typeof v === "string");
-          const title = vals.find(v => PACKAGE_RE.test(v.trim()));
-          const priceStr = vals.find(v => MONEY_RE.test(v));
-          const features = vals.filter(v => v !== title && v !== priceStr && v.length > 3 && v.length < 120);
-          if (title) {
-            let period = null;
-            if (/месец|monthly/i.test(priceStr || "")) period = "monthly";
-            else if (/кв\.?м|sqm/i.test(priceStr || "")) period = "per_sqm";
-            cards.push({ title, price_text: priceStr || "", period, badge: "", features });
-          }
-        }
-        if (cards.length > 0) return;
-      }
-      node.forEach(n => walk(n, depth + 1));
-      return;
-    }
-
-    for (const val of Object.values(node)) {
-      if (val && typeof val === "object") walk(val, depth + 1);
-    }
-  }
-
-  walk(obj, 0);
-
-  const seen = new Set();
-  const unique = cards.filter(c => {
-    const k = c.title.toLowerCase();
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  return {
-    pricing_cards: unique.filter(c => c.period !== "monthly").slice(0, 20),
-    installment_plans: unique.filter(c => c.period === "monthly").slice(0, 20),
-  };
-}
-
+// ================= PROCESS SINGLE PAGE =================
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
@@ -3390,11 +2876,6 @@ if(!/\/proekt\/|\/id-/i.test(url)){
 }
 
 await forceRenderEverything(page);
-
-// mimic human mouse behavior
-await page.mouse.move(400,300);
-await page.mouse.wheel(0,900);
-await page.mouse.wheel(0,-500);
 
     // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
     const passedCf = await waitForRealContent(page, url);
@@ -3439,10 +2920,11 @@ await page.mouse.wheel(0,-500);
     // Extract structured content
     const data = await extractStructured(page);
 
-const shadowText = await extractShadowAndPortalText(page);
+let shadowText = "";
 
-// HUMAN COPY MODE (critical)
-const humanCopiedText = await extractHumanSelectionCopy(page);
+if (/pricing|ceni|service|product/i.test(url)) {
+ shadowText = await extractShadowAndPortalText(page);
+}
 
 const apiPayloads =
 getNetworkPayloads();
@@ -3453,41 +2935,10 @@ getNetworkPayloads();
       pricing = await extractPricingFromPage(page);
 
       if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] DOM: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
       }
     } catch (e) {
       console.error("[PRICING] Extract error:", e.message);
-    }
-
-    // ── NEXT_DATA / Nuxt / inline JSON mining (pricing pages) ──────────────
-    // Next.js/Nuxt вграждат page props в <script id="__NEXT_DATA__"> преди
-    // React хидратация — там са цените дори ако DOM компонентът е lazy.
-    let nextDataText = "";
-    if (/ceni|pricing|price|пакет|tarif/i.test(url)) {
-      try {
-        // Try __NEXT_DATA__ / __NUXT_DATA__ inline JSON (fast, no network)
-        const inlineJson = await page.evaluate(() => {
-          const nextEl = document.getElementById("__NEXT_DATA__");
-          if (nextEl?.textContent) return nextEl.textContent;
-          const nuxtEl = document.getElementById("__NUXT_DATA__");
-          if (nuxtEl?.textContent) return nuxtEl.textContent;
-          return "";
-        });
-
-        if (inlineJson) {
-          nextDataText = inlineJson;
-          try {
-            const parsed = JSON.parse(inlineJson);
-            const extracted = extractPricingFromNextData(parsed);
-            if (extracted.pricing_cards.length > 0 && !pricing?.pricing_cards?.length) {
-              pricing = extracted;
-              console.log(`[PRICING] __NEXT_DATA__: ${pricing.pricing_cards.length} cards`);
-            }
-          } catch {}
-        }
-      } catch (e) {
-        console.error("[PRICING] Next data mining error:", e.message);
-      }
     }
 
     // NEW: Product/vehicle spec extraction for detail pages
@@ -3541,10 +2992,6 @@ const rawAll=[
 
 data.rawContent,
 
-humanCopiedText
-? `HUMAN_COPY\n${humanCopiedText}`
-:'',
-
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
 :'',
@@ -3555,10 +3002,6 @@ apiPayloads
 
 dialogTexts
 ? `DIALOG_CONTENT\n${dialogTexts}`
-:'',
-
-nextDataText
-? `NEXT_DATA\n${nextDataText}`
 :'',
 
 specsText
@@ -3632,21 +3075,6 @@ const allLinks = Array.from(
 
     if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
-    }
-
-    // ── TEXT-LEVEL PRICING FALLBACK ──
-    // Ать DOM extraction не е намерила цени, опитваме text parser върху RAW текст
-    // (преди normalizeNumbers, защото тя може да конвертира €350 в думи)
-    if ((!pricing?.pricing_cards?.length && !pricing?.installment_plans?.length)) {
-      try {
-        const textPricing = extractPricingFromText(rawAll);
-        if ((textPricing.pricing_cards.length || 0) > 0 || (textPricing.installment_plans.length || 0) > 0) {
-          pricing = textPricing;
-          console.log(`[PRICING] Text fallback: ${pricing.pricing_cards.length} cards, ${pricing.installment_plans.length} installment`);
-        }
-      } catch (e) {
-        console.error("[PRICING] Text fallback error:", e.message);
-      }
     }
 
     return {
@@ -4031,3 +3459,8 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
+
+
+
+
+
