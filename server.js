@@ -2299,6 +2299,21 @@ async function extractStructured(page) {
 
       const norm = (s = "") => s.replace(/\s+/g, " ").trim();
 
+      // ═══════════════════════════════════════════════════════════
+      // GLOBAL INNERTEXT — "Ctrl+A Copy" approach
+      // Гарантирано хваща ВСИЧКИ видими текстове от страницата,
+      // включително текст в div, span, и всякакви custom елементи.
+      // Това е основният източник на съдържание.
+      // ═══════════════════════════════════════════════════════════
+      let globalText = "";
+      try {
+        globalText = norm(document.body.innerText || "");
+      } catch {}
+
+      // ═══════════════════════════════════════════════════════════
+      // DETAILS/ACCORDION — force-open and extract (still needed
+      // because closed <details> content is NOT in innerText)
+      // ═══════════════════════════════════════════════════════════
       const extractTableText = (table) => {
         const rows = [];
         table.querySelectorAll("tr").forEach((tr) => {
@@ -2356,54 +2371,9 @@ async function extractStructured(page) {
         });
       } catch {}
 
-      const sections = [];
-      let current = null;
-      const processedElements = new Set();
-
-      document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
-        if (processedElements.has(el)) return;
-        if (el.closest("details.wp-block-details, details")) return;
-        let parent = el.parentElement;
-        while (parent) {
-          if (processedElements.has(parent)) return;
-          parent = parent.parentElement;
-        }
-        const text = el.innerText?.trim();
-        if (!text) return;
-        const uniqueText = addUniqueText(text, 5);
-        if (!uniqueText) return;
-        if (el.tagName.startsWith("H")) {
-          current = { heading: uniqueText, text: "" };
-          sections.push(current);
-        } else if (current) {
-          current.text += " " + uniqueText;
-        }
-        processedElements.add(el);
-      });
-
-      const overlaySelectors = [
-        '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
-        '[class*="tooltip"]', '[class*="banner"]', '[class*="notification"]',
-        '[class*="alert"]', '[style*="position: fixed"]',
-        '[style*="position: absolute"]', '[role="dialog"]', '[role="alertdialog"]',
-      ];
-
-      const overlayTexts = [];
-      overlaySelectors.forEach(selector => {
-        try {
-          document.querySelectorAll(selector).forEach(el => {
-            if (processedElements.has(el)) return;
-            const text = el.innerText?.trim();
-            if (!text) return;
-            const uniqueText = addUniqueText(text);
-            if (uniqueText) {
-              overlayTexts.push(uniqueText);
-              processedElements.add(el);
-            }
-          });
-        } catch {}
-      });
-
+      // ═══════════════════════════════════════════════════════════
+      // PSEUDO-ELEMENTS — ::before / ::after content (not in innerText)
+      // ═══════════════════════════════════════════════════════════
       const pseudoTexts = [];
       try {
         document.querySelectorAll("*").forEach(el => {
@@ -2422,13 +2392,9 @@ async function extractStructured(page) {
         });
       } catch {}
 
-      let mainContent = "";
-      const mainEl = document.querySelector("main") || document.querySelector("article");
-      if (mainEl && !processedElements.has(mainEl)) {
-        const text = mainEl.innerText?.trim();
-        if (text) mainContent = addUniqueText(text) || "";
-      }
-
+      // ═══════════════════════════════════════════════════════════
+      // TOP CONTROLS — interactive element texts (buttons, inputs)
+      // ═══════════════════════════════════════════════════════════
       const isVisible = (el) => {
         try {
           const rect = el.getBoundingClientRect();
@@ -2464,11 +2430,13 @@ async function extractStructured(page) {
 
       return {
         rawContent: [
+          // PRIMARY: Global innerText — catches ALL visible text (divs, spans, etc.)
+          globalText,
+          // SUPPLEMENTARY: Details content (closed details are not in innerText)
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
-          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
-          mainContent,
-          overlayTexts.join("\n"),
-          pseudoTexts.join(" "),
+          // SUPPLEMENTARY: Pseudo-element texts (::before/::after not in innerText)
+          pseudoTexts.length ? pseudoTexts.join(" ") : "",
+          // SUPPLEMENTARY: Interactive control texts (aria-label, placeholder, etc.)
           topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
         ].filter(Boolean).join("\n\n"),
       };
@@ -3459,8 +3427,3 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
-
-
-
-
-
