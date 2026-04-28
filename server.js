@@ -3141,6 +3141,65 @@ function extractPricingFromText(text = "") {
 }
 
 
+// ================= NEXT.JS DATA PRICING EXTRACTOR =================
+// Обхожда рекурсивно JSON от __NEXT_DATA__ и търси pricing обекти.
+function extractPricingFromNextData(obj) {
+  const cards = [];
+  if (!obj) return { pricing_cards: [], installment_plans: [] };
+
+  const PACKAGE_RE = /^(basic|standart|standard|premium|pro|базов|стандарт|премиум|lite|starter)$/i;
+  const MONEY_RE = /(?:€|\$|£)\s*\d{1,6}|\d{1,6}\s*(?:лв\.?|лева|eur|bgn)/i;
+
+  function walk(node, depth) {
+    if (!node || typeof node !== "object" || depth > 15) return;
+
+    if (Array.isArray(node)) {
+      // Check if this looks like an array of pricing packages
+      const hasPricingLike = node.some(item =>
+        item && typeof item === "object" &&
+        Object.values(item).some(v => typeof v === "string" && PACKAGE_RE.test(v.trim()))
+      );
+      if (hasPricingLike) {
+        for (const item of node) {
+          if (!item || typeof item !== "object") continue;
+          const vals = Object.values(item).filter(v => typeof v === "string");
+          const title = vals.find(v => PACKAGE_RE.test(v.trim()));
+          const priceStr = vals.find(v => MONEY_RE.test(v));
+          const features = vals.filter(v => v !== title && v !== priceStr && v.length > 3 && v.length < 120);
+          if (title) {
+            let period = null;
+            if (/месец|monthly/i.test(priceStr || "")) period = "monthly";
+            else if (/кв\.?м|sqm/i.test(priceStr || "")) period = "per_sqm";
+            cards.push({ title, price_text: priceStr || "", period, badge: "", features });
+          }
+        }
+        if (cards.length > 0) return;
+      }
+      node.forEach(n => walk(n, depth + 1));
+      return;
+    }
+
+    for (const val of Object.values(node)) {
+      if (val && typeof val === "object") walk(val, depth + 1);
+    }
+  }
+
+  walk(obj, 0);
+
+  const seen = new Set();
+  const unique = cards.filter(c => {
+    const k = c.title.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  return {
+    pricing_cards: unique.filter(c => c.period !== "monthly").slice(0, 20),
+    installment_plans: unique.filter(c => c.period === "monthly").slice(0, 20),
+  };
+}
+
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
@@ -3225,6 +3284,72 @@ getNetworkPayloads();
       console.error("[PRICING] Extract error:", e.message);
     }
 
+    // ── NEXT_DATA / Nuxt / inline JSON mining (pricing pages) ──────────────
+    // Next.js/Nuxt вграждат page props в <script id="__NEXT_DATA__"> преди
+    // React хидратация — там са цените дори ако DOM компонентът е lazy.
+    let nextDataText = "";
+    if (/ceni|pricing|price|пакет|tarif/i.test(url)) {
+      try {
+        // 1. Try __NEXT_DATA__ / __NUXT_DATA__ inline JSON
+        const inlineJson = await page.evaluate(() => {
+          const nextEl = document.getElementById("__NEXT_DATA__");
+          if (nextEl?.textContent) return nextEl.textContent;
+          const nuxtEl = document.getElementById("__NUXT_DATA__");
+          if (nuxtEl?.textContent) return nuxtEl.textContent;
+          return "";
+        });
+
+        if (inlineJson) {
+          nextDataText = inlineJson;
+          try {
+            const parsed = JSON.parse(inlineJson);
+            const extracted = extractPricingFromNextData(parsed);
+            if (extracted.pricing_cards.length > 0 && !pricing?.pricing_cards?.length) {
+              pricing = extracted;
+              console.log(`[PRICING] __NEXT_DATA__: ${pricing.pricing_cards.length} cards`);
+            }
+          } catch {}
+        }
+
+        // 2. Mine JS chunks for hardcoded price strings (Next.js App Router)
+        // App Router вгражда данните директно в JS bundle-и като string literals
+        if (!pricing?.pricing_cards?.length) {
+          const chunkPricing = await page.evaluate(async () => {
+            // Намираме всички заредени JS chunk URLs
+            const scripts = Array.from(document.querySelectorAll("script[src]"))
+              .map(s => s.src)
+              .filter(s => s.includes("/_next/static/chunks/") || s.includes("/_nuxt/"));
+
+            const PACKAGE_RE = /\b(BASIC|STANDART|STANDARD|PREMIUM|PRO)\b/;
+            const MONEY_RE = /€\s*\d{3,}|\d{3,}\s*(?:лв|bgn|eur)/i;
+
+            for (const src of scripts.slice(0, 20)) {
+              try {
+                const res = await fetch(src);
+                const text = await res.text();
+                // Only process chunks that mention both package names AND money
+                if (!PACKAGE_RE.test(text) || !MONEY_RE.test(text)) continue;
+                return text.slice(0, 500000); // Return first matching chunk
+              } catch {}
+            }
+            return "";
+          });
+
+          if (chunkPricing) {
+            // Parse the JS chunk text for pricing
+            const extracted = extractPricingFromText(chunkPricing);
+            if (extracted.pricing_cards.length > 0) {
+              pricing = extracted;
+              console.log(`[PRICING] JS chunk: ${pricing.pricing_cards.length} cards`);
+            }
+            nextDataText = chunkPricing.slice(0, 50000); // Add to rawAll for text fallback
+          }
+        }
+      } catch (e) {
+        console.error("[PRICING] Next/chunk mining error:", e.message);
+      }
+    }
+
     // NEW: Product/vehicle spec extraction for detail pages
     let product_specs = null;
     if (pageType === 'product_detail') {
@@ -3286,6 +3411,10 @@ apiPayloads
 
 dialogTexts
 ? `DIALOG_CONTENT\n${dialogTexts}`
+:'',
+
+nextDataText
+? `NEXT_DATA\n${nextDataText}`
 :'',
 
 specsText
