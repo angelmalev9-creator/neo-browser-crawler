@@ -3032,7 +3032,115 @@ async function extractProductSpecsFromPage(page) {
 }
 
 
-// ================= PROCESS SINGLE PAGE =================
+// ================= TEXT-LEVEL PRICING FALLBACK PARSER =================
+// Извлича ценови пакети директно от raw text когато DOM extraction е неуспешна.
+// Хваща паттерни като:
+//   "BASIC\n€350 / кв.м.\nКонструкция\nКачествени материали"
+//   "СТАНДАРТ 650 лв/кв.м. ..."
+//   "PREMIUM €850/кв.м. Луксозно изпълнение"
+function extractPricingFromText(text = "") {
+  const cards = [];
+  if (!text) return { pricing_cards: [], installment_plans: [] };
+
+  // Regex за цена с валута — хваща и €350 (символ пред числото) и 350 лв. (след)
+  const moneyRe = /(?:€|\$|£)\s*\d{1,6}(?:[.,]\d{1,3})*|\d{1,6}(?:[.,]\d{1,3})*\s*(?:лв\.?|лева|bgn|eur|€|\$|£)/gi;
+
+  // Познати имена на ценови пакети (general + BG specific)
+  const PACKAGE_NAMES = /\b(basic|standard|standart|premium|pro|enterprise|starter|lite|free|business|gold|silver|platinum|light|advanced|ultimate|базов|стандарт|стандартен|премиум|бизнес|икономичен|луксоз\w*)\b/i;
+
+  // Разбиваме текста на блокове по нови редове
+  const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Проверяваме дали редът изглежда като заглавие на пакет
+    const titleMatch = line.match(PACKAGE_NAMES);
+    if (titleMatch && line.length <= 60 && !/[.!?]$/.test(line)) {
+      // Търсим цена в следващите 8 реда
+      let price_text = "";
+      let features = [];
+      let badge = "";
+
+      for (let j = i + 1; j < Math.min(i + 12, lines.length); j++) {
+        const nextLine = lines[j];
+
+        // Проверяваме дали следващото заглавие е нов пакет (спираме)
+        if (nextLine.match(PACKAGE_NAMES) && nextLine.length <= 60 && j > i + 1) break;
+
+        // Намираме цената
+        if (!price_text) {
+          const priceMatch = nextLine.match(moneyRe);
+          if (priceMatch) {
+            price_text = priceMatch[0].trim();
+            // Добавяме единицата (кв.м.) ако е на същия ред
+            if (/кв\.?м|sqm|м²/i.test(nextLine)) price_text += " / кв.м.";
+          }
+        }
+
+        // Събираме features (кратки редове, не цена, не заглавие)
+        if (nextLine.length >= 3 && nextLine.length <= 100 && !nextLine.match(moneyRe)) {
+          if (/конструкц|материал|изпълнен|включ|гаранц|проект|услуг|support|включва|feature/i.test(nextLine)) {
+            features.push(nextLine);
+          }
+        }
+
+        // Badge (най-предпочитан, popular и т.н.)
+        if (/най-предпочитан|popular|препоръч|best value/i.test(nextLine) && nextLine.length < 40) {
+          badge = nextLine;
+        }
+      }
+
+      if (price_text || features.length > 0) {
+        // Определяме period
+        let period = null;
+        if (/месец|monthly|\/mo/i.test(price_text)) period = "monthly";
+        else if (/кв\.?м|sqm/i.test(price_text)) period = "per_sqm";
+
+        cards.push({
+          title: line,
+          price_text,
+          period,
+          badge,
+          features,
+        });
+      }
+    }
+
+    i++;
+  }
+
+  // Допълнителен pass: търсим "BASIC €350 / кв.м." на един ред
+  const inlineRe = /\b(basic|standard|standart|premium|pro|lite|базов|стандарт|премиум)\b[^\n]{0,30}?(\d{1,6}(?:[.,]\d{1,3})*)\s*(лв\.?|лева|bgn|eur|€|\$|£)(?:[^\n]{0,20})?/gi;
+  let m;
+  while ((m = inlineRe.exec(text)) !== null) {
+    const title = m[1];
+    const price_text = m[0].trim();
+    const already = cards.find(c => c.title.toLowerCase() === title.toLowerCase());
+    if (!already) {
+      cards.push({ title, price_text, period: /кв\.?м/i.test(price_text) ? "per_sqm" : null, badge: "", features: [] });
+    }
+  }
+
+  const seen = new Set();
+  const unique = cards.filter(c => {
+    const k = `${c.title.toLowerCase()}|${c.price_text}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  const installment_plans = unique.filter(c => c.period === "monthly");
+  const pricing_cards = unique.filter(c => c.period !== "monthly");
+
+  return {
+    pricing_cards: pricing_cards.slice(0, 20),
+    installment_plans: installment_plans.slice(0, 20),
+  };
+}
+
+
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
 
@@ -3041,6 +3149,11 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
 const getNetworkPayloads =
 await attachNetworkMining(page);
+
+// For pricing pages: wait longer for React/Next.js to render price cards
+if (/ceni|pricing|price|пакет|tarif/i.test(url)) {
+  try { await page.waitForTimeout(1500); } catch {}
+}
 
 if(!/\/proekt\/|\/id-/i.test(url)){
  await waitForHydrationSettled(page);
@@ -3106,7 +3219,7 @@ getNetworkPayloads();
       pricing = await extractPricingFromPage(page);
 
       if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+        console.log(`[PRICING] DOM: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
       }
     } catch (e) {
       console.error("[PRICING] Extract error:", e.message);
@@ -3246,6 +3359,20 @@ const allLinks = Array.from(
 
     if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
+    }
+
+    // ── TEXT-LEVEL PRICING FALLBACK ──
+    // Ако DOM extraction не е намерила цени, опитваме text parser
+    if ((!pricing?.pricing_cards?.length && !pricing?.installment_plans?.length)) {
+      try {
+        const textPricing = extractPricingFromText(content);
+        if ((textPricing.pricing_cards.length || 0) > 0 || (textPricing.installment_plans.length || 0) > 0) {
+          pricing = textPricing;
+          console.log(`[PRICING] Text fallback: ${pricing.pricing_cards.length} cards, ${pricing.installment_plans.length} installment`);
+        }
+      } catch (e) {
+        console.error("[PRICING] Text fallback error:", e.message);
+      }
     }
 
     return {
