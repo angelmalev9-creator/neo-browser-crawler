@@ -90,6 +90,7 @@ return await page.evaluate(()=>{
 
 const out=[];
 const seen=new Set();
+const SKIP_TAGS=new Set(['STYLE','SCRIPT','NOSCRIPT','SVG','LINK','META']);
 
 function push(v){
 v=(v||'').replace(/\s+/g,' ').trim();
@@ -105,7 +106,13 @@ if(!root) return;
 
 const walker=document.createTreeWalker(
 root,
-NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT
+NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT,
+{
+  acceptNode(node){
+    if(node.nodeType===1 && SKIP_TAGS.has(node.tagName)) return NodeFilter.FILTER_REJECT;
+    return NodeFilter.FILTER_ACCEPT;
+  }
+}
 );
 
 let n;
@@ -135,6 +142,7 @@ walk(document);
 document.querySelectorAll(
 '[role="dialog"],[data-radix-portal],body > div'
 ).forEach(el=>{
+if(SKIP_TAGS.has(el.tagName)) return;
 push(el.innerText||el.textContent);
 });
 
