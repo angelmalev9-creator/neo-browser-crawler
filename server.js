@@ -2463,27 +2463,69 @@ async function extractStructured(page) {
       } catch {}
 
       // ── GLOBAL FALLBACK: "Ctrl+A → Copy" approach ──
-      // Grab ALL visible text from the entire page via document.body.innerText.
-      // This guarantees we capture text inside arbitrary divs (e.g. pricing
-      // cards with €650 in a div.text-5xl) that the selector-based extraction
-      // above may miss. We then deduplicate against already-seen text.
+      // Three aggressive methods to catch ALL text on the page,
+      // including prices in arbitrary divs that innerText/selectors miss.
       let globalFallbackText = "";
       try {
-        const fullBodyText = (document.body.innerText || "").trim();
-        if (fullBodyText) {
-          // Split into lines, deduplicate against seenTexts
-          const fallbackLines = [];
-          const lines = fullBodyText.split(/\n+/);
-          for (const rawLine of lines) {
-            const line = rawLine.replace(/\s+/g, " ").trim();
-            if (!line || line.length < 2) continue;
-            if (seenTexts.has(line)) continue;
-            seenTexts.add(line);
-            fallbackLines.push(line);
+        const fallbackFragments = new Set();
+
+        // METHOD 1: Selection API — literal Ctrl+A equivalent
+        // This is exactly what the browser does when you press Ctrl+A:
+        // it selects everything visible, and toString() gives the selected text.
+        try {
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          const range = document.createRange();
+          range.selectNodeContents(document.body);
+          sel.addRange(range);
+          const selectedText = sel.toString();
+          sel.removeAllRanges(); // clean up
+          if (selectedText) {
+            selectedText.split(/\n+/).forEach(line => {
+              const t = line.replace(/\s+/g, ' ').trim();
+              if (t && t.length >= 2) fallbackFragments.add(t);
+            });
           }
-          if (fallbackLines.length > 0) {
-            globalFallbackText = fallbackLines.join("\n");
+        } catch {}
+
+        // METHOD 2: TreeWalker on ALL text nodes (ignores CSS display rules)
+        // This catches text that innerText hides due to CSS layout.
+        try {
+          const tw = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            null
+          );
+          let textNode;
+          while (textNode = tw.nextNode()) {
+            const t = (textNode.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length >= 2) fallbackFragments.add(t);
           }
+        } catch {}
+
+        // METHOD 3: textContent of every leaf element (catches rendered
+        // content in divs/spans that have no child elements)
+        try {
+          document.querySelectorAll('div, span, td, th, dt, dd, label, strong, b, em, i, mark, small, big, sub, sup, a, figcaption, cite, blockquote, pre, code, time, data, var, samp, kbd, abbr, dfn, address').forEach(el => {
+            // Only leaf-level: if it has child elements, skip (we'll get those individually)
+            if (el.children.length === 0 || el.children.length <= 2) {
+              const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (t && t.length >= 2 && t.length <= 500) {
+                fallbackFragments.add(t);
+              }
+            }
+          });
+        } catch {}
+
+        // Deduplicate against already-seen text from selector-based extraction
+        const fallbackLines = [];
+        for (const frag of fallbackFragments) {
+          if (seenTexts.has(frag)) continue;
+          seenTexts.add(frag);
+          fallbackLines.push(frag);
+        }
+        if (fallbackLines.length > 0) {
+          globalFallbackText = fallbackLines.join("\n");
         }
       } catch {}
 
@@ -2947,10 +2989,7 @@ await forceRenderEverything(page);
     const data = await extractStructured(page);
 
 let shadowText = "";
-
-if (/pricing|ceni|service|product/i.test(url)) {
- shadowText = await extractShadowAndPortalText(page);
-}
+shadowText = await extractShadowAndPortalText(page);
 
 const apiPayloads =
 getNetworkPayloads();
