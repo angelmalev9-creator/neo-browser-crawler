@@ -2930,8 +2930,9 @@ async function extractProductSpecsFromPage(page) {
 
 
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, deadline) {
   const startTime = Date.now();
+  const timeLeft = () => deadline ? deadline - Date.now() : Infinity;
 
   try {
     console.log("[PAGE]", url);
@@ -2982,33 +2983,41 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    const dialogTexts = await expandHiddenContent(page);
-    if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
+    // Also skip if deadline is near — this is expensive
+    let dialogTexts = null;
+    if (timeLeft() > 5000) {
+      dialogTexts = await expandHiddenContent(page);
+      if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
+    }
 
     // Extract structured content
     const data = await extractStructured(page);
 
 let shadowText = "";
-shadowText = await extractShadowAndPortalText(page);
+if (timeLeft() > 3000) {
+  shadowText = await extractShadowAndPortalText(page);
+}
 
 const apiPayloads =
 getNetworkPayloads();
 
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
-    try {
-      pricing = await extractPricingFromPage(page);
+    if (timeLeft() > 3000) {
+      try {
+        pricing = await extractPricingFromPage(page);
 
-      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+        if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+          console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
+        }
+      } catch (e) {
+        console.error("[PRICING] Extract error:", e.message);
       }
-    } catch (e) {
-      console.error("[PRICING] Extract error:", e.message);
     }
 
     // NEW: Product/vehicle spec extraction for detail pages
     let product_specs = null;
-    if (pageType === 'product_detail') {
+    if (pageType === 'product_detail' && timeLeft() > 3000) {
       try {
         product_specs = await extractProductSpecsFromPage(page);
         if (product_specs.specs.length > 0 || product_specs.prices.length > 0) {
@@ -3020,25 +3029,29 @@ getNetworkPayloads();
     }
 
     // *** EXISTING: Extract SiteMap from this page ***
-    try {
-      const rawSiteMap = await extractSiteMapFromPage(page);
-      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
-        siteMaps.push(rawSiteMap);
-        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+    if (timeLeft() > 2000) {
+      try {
+        const rawSiteMap = await extractSiteMapFromPage(page);
+        if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
+          siteMaps.push(rawSiteMap);
+          console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
+        }
+      } catch (e) {
+        console.error("[SITEMAP] Extract error:", e.message);
       }
-    } catch (e) {
-      console.error("[SITEMAP] Extract error:", e.message);
     }
 
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
-    try {
-      const caps = await extractCapabilitiesFromPage(page);
-      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
-        capabilitiesMaps.push(caps);
-        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+    if (timeLeft() > 2000) {
+      try {
+        const caps = await extractCapabilitiesFromPage(page);
+        if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+          capabilitiesMaps.push(caps);
+          console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
+        }
+      } catch (e) {
+        console.error("[CAPS] Extract error:", e.message);
       }
-    } catch (e) {
-      console.error("[CAPS] Extract error:", e.message);
     }
 
     // Format content — включва и текст от Radix/React dialogs + product specs
@@ -3122,7 +3135,7 @@ const standardLinks = await collectAllLinks(page, base);
 
 let buttonLinks = [];
 
-if (pageType === "general") {
+if (pageType === "general" && timeLeft() > 3000) {
   buttonLinks = await discoverLinksViaButtons(page, base);
 
   const extraCount = buttonLinks.length;
@@ -3316,7 +3329,10 @@ const lowPriorityQueue = []; // footer fallback
       const pg = await ctx.newPage();
       await applyStealthScripts(pg);
 
-      while (Date.now() < deadline) {
+      // Leave 8s buffer before deadline for post-processing (sitemap build, gzip, response)
+      const workerDeadline = deadline - 8000;
+
+      while (Date.now() < workerDeadline) {
         let url = null;
         while (queue.length || lowPriorityQueue.length) {
 
@@ -3337,7 +3353,7 @@ const lowPriorityQueue = []; // footer fallback
 
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, deadline);
 
         if (result.page) {
           // ✅ collect contacts
@@ -3382,8 +3398,14 @@ const lowPriorityQueue = []; // footer fallback
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap);
+    // Only do network calls (Supabase save + Worker send) if we have time
+    const postTimeLeft = deadline - Date.now();
+    if (postTimeLeft > 5000) {
+      await saveSiteMapToSupabase(combinedSiteMap);
+      await sendSiteMapToWorker(combinedSiteMap);
+    } else {
+      console.log(`[SITEMAP] Skipping save/send — only ${Math.round(postTimeLeft/1000)}s left`);
+    }
   }
 
   let combinedCapabilities = [];
