@@ -2462,73 +2462,6 @@ async function extractStructured(page) {
         });
       } catch {}
 
-      // ── GLOBAL FALLBACK: "Ctrl+A → Copy" approach ──
-      // Three aggressive methods to catch ALL text on the page,
-      // including prices in arbitrary divs that innerText/selectors miss.
-      let globalFallbackText = "";
-      try {
-        const fallbackFragments = new Set();
-
-        // METHOD 1: Selection API — literal Ctrl+A equivalent
-        // This is exactly what the browser does when you press Ctrl+A:
-        // it selects everything visible, and toString() gives the selected text.
-        try {
-          const sel = window.getSelection();
-          sel.removeAllRanges();
-          const range = document.createRange();
-          range.selectNodeContents(document.body);
-          sel.addRange(range);
-          const selectedText = sel.toString();
-          sel.removeAllRanges(); // clean up
-          if (selectedText) {
-            selectedText.split(/\n+/).forEach(line => {
-              const t = line.replace(/\s+/g, ' ').trim();
-              if (t && t.length >= 2) fallbackFragments.add(t);
-            });
-          }
-        } catch {}
-
-        // METHOD 2: TreeWalker on ALL text nodes (ignores CSS display rules)
-        // This catches text that innerText hides due to CSS layout.
-        try {
-          const tw = document.createTreeWalker(
-            document.body,
-            NodeFilter.SHOW_TEXT,
-            null
-          );
-          let textNode;
-          while (textNode = tw.nextNode()) {
-            const t = (textNode.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length >= 2) fallbackFragments.add(t);
-          }
-        } catch {}
-
-        // METHOD 3: textContent of every leaf element (catches rendered
-        // content in divs/spans that have no child elements)
-        try {
-          document.querySelectorAll('div, span, td, th, dt, dd, label, strong, b, em, i, mark, small, big, sub, sup, a, figcaption, cite, blockquote, pre, code, time, data, var, samp, kbd, abbr, dfn, address').forEach(el => {
-            // Only leaf-level: if it has child elements, skip (we'll get those individually)
-            if (el.children.length === 0 || el.children.length <= 2) {
-              const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-              if (t && t.length >= 2 && t.length <= 500) {
-                fallbackFragments.add(t);
-              }
-            }
-          });
-        } catch {}
-
-        // Deduplicate against already-seen text from selector-based extraction
-        const fallbackLines = [];
-        for (const frag of fallbackFragments) {
-          if (seenTexts.has(frag)) continue;
-          seenTexts.add(frag);
-          fallbackLines.push(frag);
-        }
-        if (fallbackLines.length > 0) {
-          globalFallbackText = fallbackLines.join("\n");
-        }
-      } catch {}
-
       return {
         rawContent: [
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
@@ -2537,7 +2470,6 @@ async function extractStructured(page) {
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
           topControlTexts.length ? `TOP_CONTROLS\n${topControlTexts.join("\n")}` : "",
-          globalFallbackText,
         ].filter(Boolean).join("\n\n"),
       };
     });
@@ -2930,9 +2862,8 @@ async function extractProductSpecsFromPage(page) {
 
 
 // ================= PROCESS SINGLE PAGE =================
-async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps, deadline) {
+async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
-  const timeLeft = () => deadline ? deadline - Date.now() : Infinity;
 
   try {
     console.log("[PAGE]", url);
@@ -2983,19 +2914,38 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    // Also skip if deadline is near — this is expensive
-    let dialogTexts = null;
-    if (timeLeft() > 5000) {
-      dialogTexts = await expandHiddenContent(page);
-      if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
-    }
+    const dialogTexts = await expandHiddenContent(page);
+    if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
     const data = await extractStructured(page);
 
+    // ── CTRL+A FALLBACK: simulate real keyboard select-all to grab text ──
+    // that selector-based extraction misses (e.g. €650 in div.text-5xl)
+    let ctrlAText = "";
+    try {
+      // Click body to ensure focus is on the page
+      await page.click("body", { timeout: 1000 }).catch(() => {});
+      // Simulate Ctrl+A — real keyboard event, selects everything visible
+      await page.keyboard.press("Control+a");
+      // Read the selected text via getSelection()
+      ctrlAText = await page.evaluate(() => {
+        const sel = window.getSelection();
+        const text = sel ? sel.toString() : "";
+        sel?.removeAllRanges(); // clean up selection
+        return text || "";
+      });
+      if (ctrlAText) {
+        console.log(`[CTRL+A] Grabbed ${ctrlAText.length} chars`);
+      }
+    } catch (e) {
+      // Non-critical — if it fails we still have extractStructured data
+    }
+
 let shadowText = "";
-if (timeLeft() > 3000) {
-  shadowText = await extractShadowAndPortalText(page);
+
+if (/pricing|ceni|service|product/i.test(url)) {
+ shadowText = await extractShadowAndPortalText(page);
 }
 
 const apiPayloads =
@@ -3003,21 +2953,19 @@ getNetworkPayloads();
 
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
-    if (timeLeft() > 3000) {
-      try {
-        pricing = await extractPricingFromPage(page);
+    try {
+      pricing = await extractPricingFromPage(page);
 
-        if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
-          console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
-        }
-      } catch (e) {
-        console.error("[PRICING] Extract error:", e.message);
+      if ((pricing?.pricing_cards?.length || 0) > 0 || (pricing?.installment_plans?.length || 0) > 0) {
+        console.log(`[PRICING] Page: ${pricing.pricing_cards?.length || 0} cards, ${pricing.installment_plans?.length || 0} installment`);
       }
+    } catch (e) {
+      console.error("[PRICING] Extract error:", e.message);
     }
 
     // NEW: Product/vehicle spec extraction for detail pages
     let product_specs = null;
-    if (pageType === 'product_detail' && timeLeft() > 3000) {
+    if (pageType === 'product_detail') {
       try {
         product_specs = await extractProductSpecsFromPage(page);
         if (product_specs.specs.length > 0 || product_specs.prices.length > 0) {
@@ -3029,29 +2977,25 @@ getNetworkPayloads();
     }
 
     // *** EXISTING: Extract SiteMap from this page ***
-    if (timeLeft() > 2000) {
-      try {
-        const rawSiteMap = await extractSiteMapFromPage(page);
-        if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
-          siteMaps.push(rawSiteMap);
-          console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
-        }
-      } catch (e) {
-        console.error("[SITEMAP] Extract error:", e.message);
+    try {
+      const rawSiteMap = await extractSiteMapFromPage(page);
+      if (rawSiteMap.buttons.length > 0 || rawSiteMap.forms.length > 0) {
+        siteMaps.push(rawSiteMap);
+        console.log(`[SITEMAP] Page: ${rawSiteMap.buttons.length} buttons, ${rawSiteMap.forms.length} forms`);
       }
+    } catch (e) {
+      console.error("[SITEMAP] Extract error:", e.message);
     }
 
     // *** NEW: Extract Capabilities from this page (forms/widgets/availability) ***
-    if (timeLeft() > 2000) {
-      try {
-        const caps = await extractCapabilitiesFromPage(page);
-        if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
-          capabilitiesMaps.push(caps);
-          console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
-        }
-      } catch (e) {
-        console.error("[CAPS] Extract error:", e.message);
+    try {
+      const caps = await extractCapabilitiesFromPage(page);
+      if ((caps.forms?.length || 0) > 0 || (caps.wizards?.length || 0) > 0 || (caps.iframes?.length || 0) > 0 || (caps.availability?.length || 0) > 0) {
+        capabilitiesMaps.push(caps);
+        console.log(`[CAPS] Page: ${caps.forms?.length || 0} forms, ${caps.wizards?.length || 0} wizards, ${caps.iframes?.length || 0} iframes, ${caps.availability?.length || 0} availability`);
       }
+    } catch (e) {
+      console.error("[CAPS] Extract error:", e.message);
     }
 
     // Format content — включва и текст от Radix/React dialogs + product specs
@@ -3069,6 +3013,10 @@ getNetworkPayloads();
 const rawAll=[
 
 data.rawContent,
+
+ctrlAText
+? `SELECTALL_CONTENT\n${ctrlAText}`
+:'',
 
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
@@ -3135,7 +3083,7 @@ const standardLinks = await collectAllLinks(page, base);
 
 let buttonLinks = [];
 
-if (pageType === "general" && timeLeft() > 3000) {
+if (pageType === "general") {
   buttonLinks = await discoverLinksViaButtons(page, base);
 
   const extraCount = buttonLinks.length;
@@ -3329,10 +3277,7 @@ const lowPriorityQueue = []; // footer fallback
       const pg = await ctx.newPage();
       await applyStealthScripts(pg);
 
-      // Leave 8s buffer before deadline for post-processing (sitemap build, gzip, response)
-      const workerDeadline = deadline - 8000;
-
-      while (Date.now() < workerDeadline) {
+      while (Date.now() < deadline) {
         let url = null;
         while (queue.length || lowPriorityQueue.length) {
 
@@ -3353,7 +3298,7 @@ const lowPriorityQueue = []; // footer fallback
 
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps, deadline);
+        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
           // ✅ collect contacts
@@ -3398,14 +3343,8 @@ const lowPriorityQueue = []; // footer fallback
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    // Only do network calls (Supabase save + Worker send) if we have time
-    const postTimeLeft = deadline - Date.now();
-    if (postTimeLeft > 5000) {
-      await saveSiteMapToSupabase(combinedSiteMap);
-      await sendSiteMapToWorker(combinedSiteMap);
-    } else {
-      console.log(`[SITEMAP] Skipping save/send — only ${Math.round(postTimeLeft/1000)}s left`);
-    }
+    await saveSiteMapToSupabase(combinedSiteMap);
+    await sendSiteMapToWorker(combinedSiteMap);
   }
 
   let combinedCapabilities = [];
