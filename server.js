@@ -645,7 +645,7 @@ async function extractSiteMapFromPage(page) {
 
     // EXTRACT PRICES (legacy, context-light)
     const prices = [];
-    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|лева|руб|грн|UAH)/gi;
+    const priceRegex = /(?:(€|\$|£|¥|₹|₽|₺|zł|Kč|kr|лв\.?)\s*(\d+[\s,.]?\d*)|(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|лева|руб|грн|UAH))/gi;
 
     const walker = document.createTreeWalker(
       document.body,
@@ -865,7 +865,22 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от|ab|desde|da|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|gbp|£|¥|₹|chf|pln|zł|czk|kč|sek|kr|nok|dkk|ron|lei|rub|₽|руб|try|₺|lv|грн|uah|brl|r\$|aud|cad|huf|ft|hrk|kn|jpy|cny|元|inr|mxn)(?:\s*\/?\s*(месец|month|mo|jahr|año|mese|monat|rok|ay|luna|месяц))?/i;
+    // Universal money regex: handles both "€350" and "350 EUR" patterns
+    const currencySymbols = '(?:лв\\.?|лева|bgn|eur|€|\\$|usd|gbp|£|¥|₹|chf|pln|zł|czk|kč|sek|kr|nok|dkk|ron|lei|rub|₽|руб|try|₺|lv|грн|uah|brl|r\\$|aud|cad|huf|ft|hrk|kn|jpy|cny|元|inr|mxn)';
+    const periodWords = '(?:месец|month|mo|jahr|año|mese|monat|rok|ay|luna|месяц)';
+    const numPattern = '\\d{1,6}(?:[\\s,.]\\d{1,3})*(?:[.,]\\d{1,2})?';
+    // Pattern 1: €350, $99, £1200 (symbol before number)
+    // Pattern 2: 350 EUR, 99 лв, 1200€ (number before symbol)
+    const moneyRe = new RegExp(
+      '(?:' +
+        '(' + currencySymbols + ')\\s*(' + numPattern + ')' +  // €350
+        '|' +
+        '(?:(?:from|от|ab|desde|da)\\s*)?' +
+        '(' + numPattern + ')\\s*(' + currencySymbols + ')' +  // 350 EUR
+      ')' +
+      '(?:\\s*\\/?\\s*(' + periodWords + '))?',
+      'i'
+    );
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -927,6 +942,60 @@ async function extractPricingFromPage(page) {
     };
 
     const cards=[];
+    const seen = new Set();
+
+    // ── Phase 0: Extract from data-attributes (data-price, data-amount, data-cost) ──
+    document.querySelectorAll('[data-price],[data-amount],[data-cost],[data-value]').forEach(el => {
+      if (!isVisible(el)) return;
+      const priceVal = el.getAttribute('data-price') || el.getAttribute('data-amount') || el.getAttribute('data-cost') || el.getAttribute('data-value') || '';
+      const elText = getText(el);
+      const displayPrice = elText || priceVal;
+      if (!displayPrice) return;
+      
+      const root = findCardRoot(el);
+      if (!root) return;
+      const title = pickTitle(root);
+      if (!title) return;
+      
+      const key = `${title}|${displayPrice}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      
+      cards.push({
+        title,
+        price_text: norm(displayPrice),
+        period: pickPeriod(root),
+        badge: pickBadge(root),
+        features: pickFeatures(root),
+      });
+    });
+
+    // ── Phase 0b: Extract from elements with price-related CSS classes ──
+    document.querySelectorAll('[class*="price"],[class*="cost"],[class*="amount"],[class*="cena"],[class*="pricing"]').forEach(el => {
+      if (!isVisible(el)) return;
+      const t = getText(el);
+      if (!t || t.length > 60) return;
+      // Must contain at least one digit and a currency symbol
+      if (!/\d/.test(t)) return;
+      if (!/[€$£¥₹₽₺]|лв|eur|usd|bgn|gbp/i.test(t)) return;
+      
+      const root = findCardRoot(el);
+      if (!root) return;
+      const title = pickTitle(root);
+      if (!title) return;
+      
+      const key = `${title}|${t}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      
+      cards.push({
+        title,
+        price_text: norm(t),
+        period: pickPeriod(root),
+        badge: pickBadge(root),
+        features: pickFeatures(root),
+      });
+    });
 
 document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
 try{
@@ -950,8 +1019,6 @@ features:[]
 });
 }catch{}
 });
-
-    const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
     let node;
@@ -2178,7 +2245,7 @@ async function expandHiddenContent(page) {
         'button, [role="button"], a[href="#"], a[href="javascript:void(0)"], span[onclick], div[onclick]'
       )).filter(isVisible).slice(0, 30);
       let smartClicks = 0;
-      const MAX_SMART_CLICKS = 3;
+      const MAX_SMART_CLICKS = 5;
       for (const btn of clickable) {
         if (smartClicks >= MAX_SMART_CLICKS) break;
         const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
@@ -2195,12 +2262,12 @@ async function expandHiddenContent(page) {
           // Short text with ellipsis-like patterns or "+" or "▸" symbols
           /[+▸▶►…]/.test(text) ||
           // Button is inside a section with collapsed content
-          btn.closest('[class*="collaps"],[class*="expand"],[class*="toggle"],[class*="detail"],[class*="more"]') ||
-          // Text is very short (1-3 words) suggesting a toggle label
-          text.split(/\s+/).length <= 3;
+          btn.closest('[class*="collaps"],[class*="expand"],[class*="toggle"],[class*="detail"],[class*="more"],[class*="pricing"],[class*="package"],[class*="plan"],[class*="card"]') ||
+          // Text contains "detail/more/view/show" type words (universal)
+          (text.split(/\s+/).length <= 4 && /detail|more|view|show|see|expand|reveal|open|info|подробн|детайл|повече|виж|покажи|разгъни|dettagli|detalles|détails|mehr|подробнее/i.test(text));
         
         if (looksLikeExpander) {
-          try { btn.click(); await sleep(120); smartClicks++; } catch {}
+          try { btn.click(); await sleep(200); smartClicks++; } catch {}
         }
       }
 
@@ -2820,7 +2887,7 @@ async function extractProductSpecsFromPage(page) {
       if (h1) title = norm(h1.innerText || h1.textContent || '');
 
       // ── Цена: широко търсене по CSS класове и text walker ─────────────────
-      const priceRe = /[\d][\d\s.,]*\s*(лв\.?|лева|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|руб|грн|UAH)/i;
+      const priceRe = /(?:(?:€|\$|£|¥|₹|₽|₺|zł|Kč|kr|лв\.?)\s*[\d][\d\s.,]*|[\d][\d\s.,]*\s*(?:лв\.?|лева|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|руб|грн|UAH))/i;
       document.querySelectorAll('[class*="price"],[class*="cena"],[class*="cost"],[class*="amount"],[class*="suma"]').forEach(el => {
         const t = norm(el.innerText || el.textContent || '');
         if (priceRe.test(t) && t.length < 100) prices.push(t);
@@ -2939,6 +3006,12 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   try {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+    
+    // For pages that might have dynamic pricing content, wait a bit longer
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 3000 });
+    } catch {}
+    
 const getNetworkPayloads =
 await attachNetworkMining(page);
 
