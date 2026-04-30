@@ -2920,66 +2920,6 @@ await forceRenderEverything(page);
     // Extract structured content
     const data = await extractStructured(page);
 
-    // ── CTRL+A FALLBACK: simulate real keyboard select-all to grab text ──
-    // that selector-based extraction misses (e.g. €650 in div.text-5xl)
-    let ctrlAText = "";
-    try {
-      // Click body to ensure focus is on the page
-      await page.click("body", { timeout: 1000 }).catch(() => {});
-      // Simulate Ctrl+A — real keyboard event, selects everything visible
-      await page.keyboard.press("Control+a");
-      // Read the selected text via getSelection()
-      ctrlAText = await page.evaluate(() => {
-        const sel = window.getSelection();
-        const text = sel ? sel.toString() : "";
-        sel?.removeAllRanges(); // clean up selection
-        return text || "";
-      });
-      if (ctrlAText) {
-        const priceMatches = ctrlAText.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
-        console.log(`[CTRL+A] Grabbed ${ctrlAText.length} chars${priceMatches ? `, PRICES FOUND: ${priceMatches.join(', ')}` : ', NO PRICES'}`);
-      } else {
-        console.log(`[CTRL+A] Empty — no text selected`);
-      }
-    } catch (e) {
-      console.log(`[CTRL+A] ERROR: ${e.message}`);
-    }
-
-    // ── TEXTCONTENT FALLBACK: grabs ALL text from DOM regardless of visibility ──
-    // This is the most aggressive method — textContent ignores CSS, gets everything.
-    // It catches text that both innerText and Ctrl+A miss.
-    let textContentFallback = "";
-    try {
-      textContentFallback = await page.evaluate(() => {
-        // Walk every element and collect textContent from leaf-level nodes
-        const texts = new Set();
-        const walk = (el) => {
-          // Skip script/style/noscript
-          const tag = el.tagName?.toLowerCase();
-          if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'svg') return;
-          
-          if (el.children.length === 0) {
-            // Leaf node — grab its text
-            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length >= 1) texts.add(t);
-          } else {
-            // Non-leaf — recurse
-            for (const child of el.children) {
-              walk(child);
-            }
-          }
-        };
-        walk(document.body);
-        return Array.from(texts).join('\n');
-      });
-      if (textContentFallback) {
-        const priceMatches = textContentFallback.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
-        console.log(`[TEXTCONTENT] Grabbed ${textContentFallback.length} chars${priceMatches ? `, PRICES FOUND: ${priceMatches.join(', ')}` : ', NO PRICES'}`);
-      }
-    } catch (e) {
-      console.log(`[TEXTCONTENT] ERROR: ${e.message}`);
-    }
-
 let shadowText = "";
 
 if (/pricing|ceni|service|product/i.test(url)) {
@@ -3052,14 +2992,6 @@ const rawAll=[
 
 data.rawContent,
 
-ctrlAText
-? `SELECTALL_CONTENT\n${ctrlAText}`
-:'',
-
-textContentFallback
-? `TEXTCONTENT_FALLBACK\n${textContentFallback}`
-:'',
-
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
 :'',
@@ -3105,12 +3037,6 @@ specsText
     }
 
     // Нормализираме числата СЛЕД като сме извлекли контактите
-    // DEBUG: check if rawAll contains price patterns
-    const rawPriceMatches = rawAll.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
-    if (rawPriceMatches) {
-      console.log(`[PRICES-IN-RAW] ${rawPriceMatches.join(', ')}`);
-    }
-
 const content = normalizeNumbers(
 clean(
 rawAll
@@ -3416,9 +3342,7 @@ const lowPriorityQueue = []; // footer fallback
 // ================= HTTP SERVER =================
 http
   .createServer((req, res) => {
-    const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
-
-    if (req.method === "GET" && parsedUrl.pathname === "/") {
+    if (req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
@@ -3432,179 +3356,6 @@ http
         contacts: lastResult?.contacts || null,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
       }));
-    }
-
-    // ── DEBUG ENDPOINT: POST /debug  { "url": "https://..." } ──
-    // Crawls a SINGLE page and returns a breakdown of every extraction method
-    // so you can see exactly what each one captures (or misses).
-    if (req.method === "POST" && parsedUrl.pathname === "/debug") {
-      let body = "";
-      req.on("data", c => (body += c));
-      req.on("end", async () => {
-        let browser;
-        try {
-          const parsed = JSON.parse(body || "{}");
-          if (!parsed.url) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            return res.end(JSON.stringify({ error: "Missing 'url'" }));
-          }
-
-          const targetUrl = parsed.url;
-          console.log(`[DEBUG] Single-page extraction for: ${targetUrl}`);
-
-          browser = await chromium.launch({
-            args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-          });
-          const ctx = await makeStealthContext(browser);
-          const page = await ctx.newPage();
-          await applyStealthScripts(page);
-
-          await page.goto(targetUrl, { timeout: 20000, waitUntil: "domcontentloaded" });
-          if(!/\/proekt\/|\/id-/i.test(targetUrl)){
-            await waitForHydrationSettled(page);
-          }
-          await forceRenderEverything(page);
-          await waitForRealContent(page, targetUrl);
-
-          // Scroll
-          await page.evaluate(async () => {
-            const step = window.innerHeight;
-            const max = document.body.scrollHeight;
-            const steps = Math.min(Math.ceil(max / step), 30);
-            for (let i = 0; i <= steps; i++) {
-              window.scrollTo(0, i * step);
-              await new Promise(r => setTimeout(r, 30));
-            }
-            window.scrollTo(0, max);
-          });
-          await page.waitForTimeout(300);
-
-          const results = {};
-
-          // 1. extractStructured
-          try {
-            const t0 = Date.now();
-            const data = await extractStructured(page);
-            results.extractStructured = {
-              ms: Date.now() - t0,
-              length: (data.rawContent || "").length,
-              preview: (data.rawContent || "").substring(0, 2000),
-            };
-          } catch (e) {
-            results.extractStructured = { error: e.message };
-          }
-
-          // 2. Ctrl+A keyboard simulation
-          try {
-            const t0 = Date.now();
-            await page.click("body", { timeout: 1000 }).catch(() => {});
-            await page.keyboard.press("Control+a");
-            const ctrlAText = await page.evaluate(() => {
-              const sel = window.getSelection();
-              const text = sel ? sel.toString() : "";
-              sel?.removeAllRanges();
-              return text || "";
-            });
-            results.ctrlA = {
-              ms: Date.now() - t0,
-              length: ctrlAText.length,
-              preview: ctrlAText.substring(0, 2000),
-            };
-          } catch (e) {
-            results.ctrlA = { error: e.message };
-          }
-
-          // 3. document.body.innerText
-          try {
-            const t0 = Date.now();
-            const innerText = await page.evaluate(() => document.body.innerText || "");
-            results.innerText = {
-              ms: Date.now() - t0,
-              length: innerText.length,
-              preview: innerText.substring(0, 2000),
-            };
-          } catch (e) {
-            results.innerText = { error: e.message };
-          }
-
-          // 4. TreeWalker all text nodes
-          try {
-            const t0 = Date.now();
-            const twText = await page.evaluate(() => {
-              const parts = [];
-              const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-              let node;
-              while (node = tw.nextNode()) {
-                const t = (node.textContent || "").trim();
-                if (t) parts.push(t);
-              }
-              return parts.join("\n");
-            });
-            results.treeWalker = {
-              ms: Date.now() - t0,
-              length: twText.length,
-              preview: twText.substring(0, 2000),
-            };
-          } catch (e) {
-            results.treeWalker = { error: e.message };
-          }
-
-          // 5. document.body.textContent
-          try {
-            const t0 = Date.now();
-            const tc = await page.evaluate(() => document.body.textContent || "");
-            results.textContent = {
-              ms: Date.now() - t0,
-              length: tc.length,
-              preview: tc.substring(0, 2000),
-            };
-          } catch (e) {
-            results.textContent = { error: e.message };
-          }
-
-          // 6. extractShadowAndPortalText
-          try {
-            const t0 = Date.now();
-            const shadow = await extractShadowAndPortalText(page);
-            results.shadowPortal = {
-              ms: Date.now() - t0,
-              length: (shadow || "").length,
-              preview: (shadow || "").substring(0, 2000),
-            };
-          } catch (e) {
-            results.shadowPortal = { error: e.message };
-          }
-
-          // 7. Quick euro/price grep — search all methods for price-like patterns
-          const pricePattern = /€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi;
-          results.pricesFound = {};
-          for (const [method, data] of Object.entries(results)) {
-            if (data?.preview) {
-              const matches = data.preview.match(pricePattern);
-              if (matches) results.pricesFound[method] = matches;
-            }
-          }
-
-          await browser.close();
-
-          console.log(`[DEBUG] Done. Methods: ${Object.keys(results).length}`);
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, url: targetUrl, results }, null, 2));
-
-        } catch (e) {
-          if (browser) await browser.close().catch(() => {});
-          console.error("[DEBUG ERROR]", e.message);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        }
-      });
-      return;
-    }
-
-    if (req.method === "GET") {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "Not found" }));
     }
 
     if (req.method !== "POST") {
@@ -3708,3 +3459,8 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
+
+
+
+
+
