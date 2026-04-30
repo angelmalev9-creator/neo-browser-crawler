@@ -3368,7 +3368,9 @@ const lowPriorityQueue = []; // footer fallback
 // ================= HTTP SERVER =================
 http
   .createServer((req, res) => {
-    if (req.method === "GET") {
+    const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+
+    if (req.method === "GET" && parsedUrl.pathname === "/") {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
@@ -3382,6 +3384,179 @@ http
         contacts: lastResult?.contacts || null,
         config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
       }));
+    }
+
+    // ── DEBUG ENDPOINT: POST /debug  { "url": "https://..." } ──
+    // Crawls a SINGLE page and returns a breakdown of every extraction method
+    // so you can see exactly what each one captures (or misses).
+    if (req.method === "POST" && parsedUrl.pathname === "/debug") {
+      let body = "";
+      req.on("data", c => (body += c));
+      req.on("end", async () => {
+        let browser;
+        try {
+          const parsed = JSON.parse(body || "{}");
+          if (!parsed.url) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ error: "Missing 'url'" }));
+          }
+
+          const targetUrl = parsed.url;
+          console.log(`[DEBUG] Single-page extraction for: ${targetUrl}`);
+
+          browser = await chromium.launch({
+            args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+          });
+          const ctx = await makeStealthContext(browser);
+          const page = await ctx.newPage();
+          await applyStealthScripts(page);
+
+          await page.goto(targetUrl, { timeout: 20000, waitUntil: "domcontentloaded" });
+          if(!/\/proekt\/|\/id-/i.test(targetUrl)){
+            await waitForHydrationSettled(page);
+          }
+          await forceRenderEverything(page);
+          await waitForRealContent(page, targetUrl);
+
+          // Scroll
+          await page.evaluate(async () => {
+            const step = window.innerHeight;
+            const max = document.body.scrollHeight;
+            const steps = Math.min(Math.ceil(max / step), 30);
+            for (let i = 0; i <= steps; i++) {
+              window.scrollTo(0, i * step);
+              await new Promise(r => setTimeout(r, 30));
+            }
+            window.scrollTo(0, max);
+          });
+          await page.waitForTimeout(300);
+
+          const results = {};
+
+          // 1. extractStructured
+          try {
+            const t0 = Date.now();
+            const data = await extractStructured(page);
+            results.extractStructured = {
+              ms: Date.now() - t0,
+              length: (data.rawContent || "").length,
+              preview: (data.rawContent || "").substring(0, 2000),
+            };
+          } catch (e) {
+            results.extractStructured = { error: e.message };
+          }
+
+          // 2. Ctrl+A keyboard simulation
+          try {
+            const t0 = Date.now();
+            await page.click("body", { timeout: 1000 }).catch(() => {});
+            await page.keyboard.press("Control+a");
+            const ctrlAText = await page.evaluate(() => {
+              const sel = window.getSelection();
+              const text = sel ? sel.toString() : "";
+              sel?.removeAllRanges();
+              return text || "";
+            });
+            results.ctrlA = {
+              ms: Date.now() - t0,
+              length: ctrlAText.length,
+              preview: ctrlAText.substring(0, 2000),
+            };
+          } catch (e) {
+            results.ctrlA = { error: e.message };
+          }
+
+          // 3. document.body.innerText
+          try {
+            const t0 = Date.now();
+            const innerText = await page.evaluate(() => document.body.innerText || "");
+            results.innerText = {
+              ms: Date.now() - t0,
+              length: innerText.length,
+              preview: innerText.substring(0, 2000),
+            };
+          } catch (e) {
+            results.innerText = { error: e.message };
+          }
+
+          // 4. TreeWalker all text nodes
+          try {
+            const t0 = Date.now();
+            const twText = await page.evaluate(() => {
+              const parts = [];
+              const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+              let node;
+              while (node = tw.nextNode()) {
+                const t = (node.textContent || "").trim();
+                if (t) parts.push(t);
+              }
+              return parts.join("\n");
+            });
+            results.treeWalker = {
+              ms: Date.now() - t0,
+              length: twText.length,
+              preview: twText.substring(0, 2000),
+            };
+          } catch (e) {
+            results.treeWalker = { error: e.message };
+          }
+
+          // 5. document.body.textContent
+          try {
+            const t0 = Date.now();
+            const tc = await page.evaluate(() => document.body.textContent || "");
+            results.textContent = {
+              ms: Date.now() - t0,
+              length: tc.length,
+              preview: tc.substring(0, 2000),
+            };
+          } catch (e) {
+            results.textContent = { error: e.message };
+          }
+
+          // 6. extractShadowAndPortalText
+          try {
+            const t0 = Date.now();
+            const shadow = await extractShadowAndPortalText(page);
+            results.shadowPortal = {
+              ms: Date.now() - t0,
+              length: (shadow || "").length,
+              preview: (shadow || "").substring(0, 2000),
+            };
+          } catch (e) {
+            results.shadowPortal = { error: e.message };
+          }
+
+          // 7. Quick euro/price grep — search all methods for price-like patterns
+          const pricePattern = /€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi;
+          results.pricesFound = {};
+          for (const [method, data] of Object.entries(results)) {
+            if (data?.preview) {
+              const matches = data.preview.match(pricePattern);
+              if (matches) results.pricesFound[method] = matches;
+            }
+          }
+
+          await browser.close();
+
+          console.log(`[DEBUG] Done. Methods: ${Object.keys(results).length}`);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, url: targetUrl, results }, null, 2));
+
+        } catch (e) {
+          if (browser) await browser.close().catch(() => {});
+          console.error("[DEBUG ERROR]", e.message);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
+    if (req.method === "GET") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Not found" }));
     }
 
     if (req.method !== "POST") {
