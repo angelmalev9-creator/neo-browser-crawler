@@ -147,6 +147,7 @@ return out.join('\n');
 
 
 async function attachNetworkMining(page){
+  await page.waitForLoadState("networkidle");
 
 const payloads=[];
 
@@ -186,7 +187,7 @@ async function forceRenderEverything(page){
 
 await page.evaluate(async()=>{
 
-for(let i=0;i<8;i++){
+for(let i=0;i<12;i++){
 
 window.scrollTo(
 0,
@@ -194,13 +195,13 @@ document.body.scrollHeight
 );
 
 document.querySelectorAll(
-'button,[role=tab],summary,[aria-expanded="false"]'
+'button,[role=tab],summary,[aria-expanded="false"],div'
 ).forEach(el=>{
 
 const t=(el.innerText||'').toLowerCase();
 
 if(
-/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
+/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers|basic|premium|standard/i.test(t)
 ){
 try{el.click()}catch{}
 }
@@ -208,12 +209,13 @@ try{el.click()}catch{}
 });
 
 await new Promise(
-r=>setTimeout(r,180)
+r=>setTimeout(r,250)
 );
 
 }
 
 window.scrollTo(0,0);
+await new Promise(r=>setTimeout(r,1000));
 
 });
 
@@ -847,6 +849,11 @@ async function sendSiteMapToWorker(siteMap) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function extractPricingFromPage(page) {
+  try {
+  await page.waitForFunction(() => {
+    return document.body.innerText.match(/€|лв|eur|bgn/i);
+  }, { timeout: 8000 });
+} catch {}
   return await page.evaluate(() => {
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
@@ -3459,7 +3466,6 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
-
 
 
 
