@@ -2936,14 +2936,48 @@ await forceRenderEverything(page);
         return text || "";
       });
       if (ctrlAText) {
-        // Log price-like patterns found in ctrlA text for debugging
         const priceMatches = ctrlAText.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
         console.log(`[CTRL+A] Grabbed ${ctrlAText.length} chars${priceMatches ? `, PRICES FOUND: ${priceMatches.join(', ')}` : ', NO PRICES'}`);
       } else {
         console.log(`[CTRL+A] Empty — no text selected`);
       }
     } catch (e) {
-      // Non-critical — if it fails we still have extractStructured data
+      console.log(`[CTRL+A] ERROR: ${e.message}`);
+    }
+
+    // ── TEXTCONTENT FALLBACK: grabs ALL text from DOM regardless of visibility ──
+    // This is the most aggressive method — textContent ignores CSS, gets everything.
+    // It catches text that both innerText and Ctrl+A miss.
+    let textContentFallback = "";
+    try {
+      textContentFallback = await page.evaluate(() => {
+        // Walk every element and collect textContent from leaf-level nodes
+        const texts = new Set();
+        const walk = (el) => {
+          // Skip script/style/noscript
+          const tag = el.tagName?.toLowerCase();
+          if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'svg') return;
+          
+          if (el.children.length === 0) {
+            // Leaf node — grab its text
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length >= 1) texts.add(t);
+          } else {
+            // Non-leaf — recurse
+            for (const child of el.children) {
+              walk(child);
+            }
+          }
+        };
+        walk(document.body);
+        return Array.from(texts).join('\n');
+      });
+      if (textContentFallback) {
+        const priceMatches = textContentFallback.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
+        console.log(`[TEXTCONTENT] Grabbed ${textContentFallback.length} chars${priceMatches ? `, PRICES FOUND: ${priceMatches.join(', ')}` : ', NO PRICES'}`);
+      }
+    } catch (e) {
+      console.log(`[TEXTCONTENT] ERROR: ${e.message}`);
     }
 
 let shadowText = "";
@@ -3020,6 +3054,10 @@ data.rawContent,
 
 ctrlAText
 ? `SELECTALL_CONTENT\n${ctrlAText}`
+:'',
+
+textContentFallback
+? `TEXTCONTENT_FALLBACK\n${textContentFallback}`
 :'',
 
 shadowText
