@@ -1,13 +1,6 @@
 import http from "http";
 import crypto from "crypto";
-import { gzipSync } from "zlib";
-import { createRequire } from "module";
-
-// playwright-extra не е ESM-native — зареждаме го чрез createRequire
-const require = createRequire(import.meta.url);
-const { chromium } = require("playwright-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-chromium.use(StealthPlugin());
+import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -24,7 +17,7 @@ let crawlFinished = false;
 let lastResult = null;
 let lastCrawlUrl = null;
 let lastCrawlTime = 0;
-const RESULT_TTL_MS = 120 * 1000;
+const RESULT_TTL_MS = 5 * 60 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
@@ -32,9 +25,7 @@ const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-websi
 const MIN_WORDS = 20;
 const PARALLEL_TABS = 8;          // ↑ was 5
 const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
-const MAX_SCROLL_STEPS = 5;
-const HYDRATION_WAIT_MS = 1800;
-const MUTATION_IDLE_MS = 2200;          // NEW: cap scroll depth
+const MAX_SCROLL_STEPS = 8;          // NEW: cap scroll depth
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
@@ -44,180 +35,6 @@ const clean = (t = "") =>
   t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
-
-
-async function waitForHydrationSettled(page){
-try{
-
-await page.evaluate(
-(idleMs)=>new Promise(resolve=>{
-
-let timer;
-
-const finish=()=>{
-obs.disconnect();
-resolve();
-};
-
-const reset=()=>{
-clearTimeout(timer);
-timer=setTimeout(finish,idleMs);
-};
-
-const obs=new MutationObserver(reset);
-
-obs.observe(document,{
-subtree:true,
-childList:true,
-attributes:true,
-characterData:true
-});
-
-reset();
-
-}),
-MUTATION_IDLE_MS
-);
-
-}catch{}
-}
-
-
-
-async function extractShadowAndPortalText(page){
-
-return await page.evaluate(()=>{
-
-const out=[];
-const seen=new Set();
-
-function push(v){
-v=(v||'').replace(/\s+/g,' ').trim();
-if(!v || v.length<2) return;
-if(seen.has(v)) return;
-seen.add(v);
-out.push(v);
-}
-
-function walk(root){
-
-if(!root) return;
-
-const walker=document.createTreeWalker(
-root,
-NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT
-);
-
-let n;
-
-while(n=walker.nextNode()){
-
-if(n.nodeType===3){
-push(n.textContent);
-continue;
-}
-
-try{
-if(n.shadowRoot){
-walk(n.shadowRoot);
-}
-
-push(
-n.innerText||n.textContent
-);
-
-}catch{}
-}
-}
-
-walk(document);
-
-document.querySelectorAll(
-'[role="dialog"],[data-radix-portal],body > div'
-).forEach(el=>{
-push(el.innerText||el.textContent);
-});
-
-return out.join('\n');
-
-});
-
-}
-
-
-
-async function attachNetworkMining(page){
-
-const payloads=[];
-
-page.on("response",async(res)=>{
-
-try{
-
-const ct=(res.headers()["content-type"]||"").toLowerCase();
-
-if(
-ct.includes("json") ||
-ct.includes("graphql")
-){
-
-const txt=await res.text();
-
-if(
-/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
-){
-payloads.push(
-txt.slice(0,100000)
-);
-}
-
-}
-
-}catch{}
-
-});
-
-return ()=>payloads.join("\n");
-}
-
-
-
-async function forceRenderEverything(page){
-
-await page.evaluate(async()=>{
-
-for(let i=0;i<8;i++){
-
-window.scrollTo(
-0,
-document.body.scrollHeight
-);
-
-document.querySelectorAll(
-'button,[role=tab],summary,[aria-expanded="false"]'
-).forEach(el=>{
-
-const t=(el.innerText||'').toLowerCase();
-
-if(
-/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
-){
-try{el.click()}catch{}
-}
-
-});
-
-await new Promise(
-r=>setTimeout(r,180)
-);
-
-}
-
-window.scrollTo(0,0);
-
-});
-
-}
 
 // ================= BG NUMBER NORMALIZER =================
 // IMPORTANT FIX: do NOT convert money amounts to words.
@@ -277,125 +94,85 @@ function normalizeDomain(u) {
 
 // ================= CONTACT EXTRACTION =================
 const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-
-// CRITICAL: НЕ дефинираме PHONE_CANDIDATE_RE като глобален /g обект.
-// Глобален regex с /g пази lastIndex между извикванията → при второ
-// извикване на extractContactsFromText started от грешна позиция и
-// пропуска ВСИЧКИ номера. Използваме фабрична функция вместо това.
+// broad phone-ish: +90 532 155 86 96, (052) 123-45-67, 0888 123 456 etc.
+const PHONE_CANDIDATE_RE = /(\+?\d[\d\s().-]{6,}\d)/g;
 const DATE_DOT_RE = /\b\d{1,2}\.\d{1,2}\.\d{4}\b/;
 
-function makePhoneRE() {
-  // Хваща: +359 88 123 456, (052) 123-45-67, 0888123456, 00 359 88 ...
-  // - Разрешаваме / като разделител (някои сайтове: 0888/123456)
-  // - {4,} вместо {6,} → минимум 6 цифри total (покрива 6-цифрени местни)
-  return /(\+?[\d][\d\s().\/\-]{4,}[\d])/g;
-}
-
 function normalizePhone(raw) {
-  const s = String(raw || "")
-    .replace(/\u00A0/g, " ")   // non-breaking space → space
-    .replace(/\u2011/g, "-")   // non-breaking hyphen → hyphen
-    .trim();
+  const s = String(raw || "").trim();
   if (!s) return "";
-  if (DATE_DOT_RE.test(s)) return ""; // отхвърляме дати: 10.12.2025
+  if (DATE_DOT_RE.test(s)) return ""; // avoid dates like 10.12.2025
 
-  const hasPlus = s.startsWith("+");
+  // keep leading +, strip other non-digits
+  const hasPlus = s.trim().startsWith("+");
   const digits = s.replace(/[^\d]/g, "");
-
-  // 7–15 цифри: покрива кратки местни (7) до международни (15)
-  if (digits.length < 7 || digits.length > 15) return "";
-
-  // Отхвърляме очевидно не-телефонни числа (години, zip codes, цени)
-  // Ако е чисто число без + и е точно 4 цифри → почти сигурно не е тел.
-  if (!hasPlus && digits.length === 4) return "";
+  // typical phone length guard (tolerant)
+  if (digits.length < 8 || digits.length > 15) return "";
 
   return hasPlus ? `+${digits}` : digits;
 }
 
 function extractContactsFromText(text) {
   const out = { emails: [], phones: [] };
+
   if (!text) return out;
 
-  // EMAIL_RE има /gi флаг — match() не пази state, безопасно е
   const emails = (text.match(EMAIL_RE) || [])
     .map(e => e.trim())
     .filter(Boolean);
 
-  // КРИТИЧНО: Нов regex обект при всяко извикване — никакъв споделен lastIndex
-  const re = makePhoneRE();
   const phonesRaw = [];
   let m;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = PHONE_CANDIDATE_RE.exec(text)) !== null) {
     phonesRaw.push(m[1]);
   }
-  const phones = phonesRaw.map(normalizePhone).filter(Boolean);
+  const phones = phonesRaw
+    .map(normalizePhone)
+    .filter(Boolean);
 
-  out.emails = Array.from(new Set(emails)).slice(0, 20);
-  out.phones = Array.from(new Set(phones)).slice(0, 20);
+  // dedupe
+  out.emails = Array.from(new Set(emails)).slice(0, 12);
+  out.phones = Array.from(new Set(phones)).slice(0, 12);
+
   return out;
 }
 
 async function extractContactsFromPage(page) {
   try {
     const dom = await page.evaluate(() => {
-      const norm = (s) => (s || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+
       const emails = new Set();
       const phones = new Set();
 
-      // 1. mailto: / tel: линкове
+      // mailto/tel links
       document.querySelectorAll('a[href^="mailto:"]').forEach(a => {
-        const v = (a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0];
-        if (v) emails.add(norm(v));
+        const href = a.getAttribute("href") || "";
+        const v = href.replace(/^mailto:/i, "").split("?")[0];
+        if (v) emails.add(v.trim());
       });
+
       document.querySelectorAll('a[href^="tel:"]').forEach(a => {
-        const raw = (a.getAttribute("href") || "").replace(/^tel:/i, "").trim();
-        if (raw) phones.add(raw);
-        const visible = norm(a.innerText || a.textContent || "");
-        if (visible && /[\d]/.test(visible)) phones.add(visible);
+        const href = a.getAttribute("href") || "";
+        const v = href.replace(/^tel:/i, "");
+        if (v) phones.add(v.trim());
       });
 
-      // 2. Контактни зони в DOM
+      // visible text hints near footer/contact areas
       const candidates = [];
-      const contactSelectors = [
-        "footer", "header",
-        "[id*='contact'],[class*='contact']",
-        "[id*='kontakt'],[class*='kontakt']",
-        "[id*='phone'],[class*='phone']",
-        "[id*='tel'],[class*='tel']",
-        "[id*='sidebar'],[class*='sidebar']",
-        "[id*='info'],[class*='info']",
-        ".widget",
-        "[itemtype*='LocalBusiness']",
-        "[itemtype*='Organization']",
-      ];
-      const seen = new Set();
-      for (const sel of contactSelectors) {
-        try {
-          document.querySelectorAll(sel).forEach(el => {
-            if (seen.has(el)) return;
-            seen.add(el);
-            const t = norm(el.innerText || el.textContent || "");
-            if (t) candidates.push(t);
-          });
-        } catch {}
-      }
-
-      // 3. Schema.org
-      document.querySelectorAll('[itemprop="telephone"]').forEach(el => {
-        const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
-        if (t) phones.add(t);
-      });
-      document.querySelectorAll('[itemprop="email"]').forEach(el => {
-        const t = norm(el.getAttribute("content") || el.innerText || el.textContent || "");
-        if (t) emails.add(t);
-      });
+      const footer = document.querySelector("footer");
+      if (footer) candidates.push(footer.innerText || "");
+      const contactSection =
+        document.querySelector("[id*='contact'],[class*='contact'],[id*='kontakti'],[class*='kontakti']");
+      if (contactSection) candidates.push(contactSection.innerText || "");
 
       return {
-        emails: Array.from(emails).filter(Boolean).slice(0, 20),
-        phones: Array.from(phones).filter(Boolean).slice(0, 20),
-        textHints: candidates.filter(Boolean).join("\n"),
+        emails: Array.from(emails).map(norm).filter(Boolean).slice(0, 12),
+        phones: Array.from(phones).map(norm).filter(Boolean).slice(0, 12),
+        textHints: candidates.map(norm).filter(Boolean).join("\n"),
       };
     });
+
     return dom || { emails: [], phones: [], textHints: "" };
   } catch {
     return { emails: [], phones: [], textHints: "" };
@@ -858,7 +635,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
+    const moneyRe = /(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|BGN|EUR|€|\$|eur)/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -912,37 +689,13 @@ async function extractPricingFromPage(page) {
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
 
-        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
+        if (looksCard && (hasTitle || hasFeatures) && txt.length >= 60) return el;
         el = el.parentElement;
       }
       return null;
     };
 
-    const cards=[];
-
-document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
-try{
-const j=JSON.parse(s.textContent||'{}');
-const arr=Array.isArray(j)?j:[j];
-arr.forEach(item=>{
-const offers=item.offers||item.hasOfferCatalog?.itemListElement;
-if(!offers) return;
-const list=Array.isArray(offers)?offers:[offers];
-list.forEach(o=>{
-const p=o.price||o.offers?.price;
-if(!p) return;
-cards.push({
-title:item.name||o.name||'Package',
-price_text:String(p),
-period:null,
-badge:'',
-features:[]
-});
-});
-});
-}catch{}
-});
-
+    const cards = [];
     const seen = new Set();
 
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
@@ -1717,7 +1470,7 @@ async function extractCapabilitiesFromPage(page) {
 
       const hasBookingIframe = bookingIframes.length > 0;
       const containerSelectors = selectorCandidates(container);
-      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|mai|heade|div\.elemento)/i.test(sel));
+      const genericWrapper = containerSelectors.some(sel => /^(div\.site|#page|main|header|div\.elementor)/i.test(sel));
       if (hasBookingIframe && genericWrapper && !String(raw || '').match(/пристигане|напускане|възрастни|guests|check-?in|check-?out/i)) return null;
       if (!hasCheckIn || !(hasCheckOut || hasGuests) || !hasAction || score < 5) return null;
 
@@ -2054,20 +1807,9 @@ function buildCombinedCapabilities(perPageCaps, baseOrigin) {
       // Same form on 15 pages → single fingerprint → single capability
       const normalized = { kind, schema };
       const fp = sha256Hex(stableStringify(normalized));
-     // TEMPLATE FINGERPRINTING (ignore cosmetic field names / repeated wrappers)
-const schemaStr = stableStringify(schema)
-  .replace(/#\w+/g, "#ID")
-  .replace(/:nth-of-type\(\d+\)/g, ":nth-of-type(N)")
-  .replace(/\b(field|input)_\d+\b/g, "$1_N")
-  .replace(/"selector_candidates":\[[^\]]*\]/g,'"selector_candidates":["GENERIC"]')
-.replace(/"price_text":"[^"]*"/g,'"price_text":"PRICE"')
-
-
-const templateFp = sha256Hex(kind + "|" + schemaStr);
-
-const key = `${kind}|${templateFp}`;
-if (seen.has(key)) return;
-seen.add(key);
+      const key = `${kind}|${fp}`;
+      if (seen.has(key)) return;
+      seen.add(key);
 
       combined.push({
         url,
@@ -2867,19 +2609,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
-const getNetworkPayloads =
-await attachNetworkMining(page);
-
-if(!/\/proekt\/|\/id-/i.test(url)){
- await waitForHydrationSettled(page);
-}
-
-await forceRenderEverything(page);
-
-    // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
-    const passedCf = await waitForRealContent(page, url);
-    if (!passedCf) return { links: [], page: null };
+    await page.goto(url, { timeout: 10000, waitUntil: "domcontentloaded" });
 
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
     await page.evaluate(async ({ stepMs, maxSteps }) => {
@@ -2914,20 +2644,11 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    const dialogTexts = await expandHiddenContent(page);
+    const dialogTexts = (pageType !== 'product_detail') ? await expandHiddenContent(page) : '';
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
     const data = await extractStructured(page);
-
-let shadowText = "";
-
-if (/pricing|ceni|service|product/i.test(url)) {
- shadowText = await extractShadowAndPortalText(page);
-}
-
-const apiPayloads =
-getNetworkPayloads();
 
     // NEW: Pricing/package structured extraction (cards + installment)
     let pricing = null;
@@ -2987,91 +2708,44 @@ getNetworkPayloads();
       specsText = `\n\nPRODUCT_SPECS\n${specLines.join('\n')}`;
     }
 
-   // SINGLE-PASS EXTRACTION PIPELINE (merge everything once, no second parsing passes)
-const rawAll=[
+    const rawAll = [
+      data.rawContent,
+      dialogTexts ? `DIALOG_CONTENT\n${dialogTexts}` : '',
+      specsText,
+    ].filter(Boolean).join('\n\n');
+    const htmlContent = normalizeNumbers(clean(rawAll));
 
-data.rawContent,
+    const content = htmlContent;
 
-shadowText
-? `SHADOW_CONTENT\n${shadowText}`
-:'',
-
-apiPayloads
-? `API_PAYLOADS\n${apiPayloads}`
-:'',
-
-dialogTexts
-? `DIALOG_CONTENT\n${dialogTexts}`
-:'',
-
-specsText
-
-].filter(Boolean).join('\n\n');
-
-    // КРИТИЧНО: Извличаме контакти от СУРОВИЯ текст — ПРЕДИ normalizeNumbers
-    // normalizeNumbers може да конвертира цифри в думи и да унищожи номерата
+    // ✅ NEW: contacts extraction (DOM + combined text)
     const domContacts = await extractContactsFromPage(page);
+    const textContacts = extractContactsFromText(`${htmlContent}\n\n${domContacts.textHints || ""}`);
 
-    // Подаваме RAW текст + textHints от DOM (footer, contact секции и т.н.)
-    const rawForContacts = `${rawAll}\n\n${domContacts.textHints || ""}`;
-    const textContacts = extractContactsFromText(rawForContacts);
+    const mergedEmails = Array.from(new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])).slice(0, 12);
+    const mergedPhones = Array.from(new Set([...(domContacts.phones || []).map(normalizePhone).filter(Boolean), ...(textContacts.phones || [])])).slice(0, 12);
 
-    // tel: href стойностите от DOM се нормализират тук в Node.js
-    // (в browser evaluate не можем да викаме normalizePhone)
-    const domPhones = (domContacts.phones || [])
-      .map(p => normalizePhone(p))
-      .filter(Boolean);
-
-    const mergedEmails = Array.from(
-      new Set([...(domContacts.emails || []), ...(textContacts.emails || [])])
-    ).slice(0, 20);
-
-    const mergedPhones = Array.from(
-      new Set([...domPhones, ...(textContacts.phones || [])])
-    ).slice(0, 20);
-
-    const contacts = { emails: mergedEmails, phones: mergedPhones };
+    const contacts = {
+      emails: mergedEmails,
+      phones: mergedPhones,
+    };
 
     if (contacts.emails.length || contacts.phones.length) {
       console.log(`[CONTACTS] Page: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
     }
 
-    // Нормализираме числата СЛЕД като сме извлекли контактите
-const content = normalizeNumbers(
-clean(
-rawAll
-.split(/\n+/)
-.filter(Boolean)
-.filter((v,i,a)=>a.indexOf(v)===i) // single-pass dedupe
-.join("\n")
-)
-);
-
-    const totalWords = countWordsExact(content);
+    const totalWords = countWordsExact(htmlContent);
 
     const elapsed = Date.now() - startTime;
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
-    // ── Link discovery: run expensive button discovery ONLY on listing/general pages ──
-const standardLinks = await collectAllLinks(page, base);
-
-let buttonLinks = [];
-
-if (pageType === "general") {
-  buttonLinks = await discoverLinksViaButtons(page, base);
-
-  const extraCount = buttonLinks.length;
-  if (extraCount > 0) {
-    console.log(`[DISCOVER] +${extraCount} button-discovered links`);
-  }
-}
-
-const allLinks = Array.from(
-  new Set([
-    ...standardLinks,
-    ...buttonLinks
-  ])
-);
+    // ── Link discovery: стандартни <a> + бутон-задвижени URL-и (universal) ──
+    const standardLinks = await collectAllLinks(page, base);
+    const buttonLinks = await discoverLinksViaButtons(page, base);
+    const allLinks = Array.from(new Set([...standardLinks, ...buttonLinks]));
+    const extraCount = allLinks.length - standardLinks.length;
+    if (extraCount > 0) {
+      console.log(`[DISCOVER] +${extraCount} button-discovered links (total ${allLinks.length})`);
+    }
 
     if (pageType !== "services" && pageType !== "product_detail" && totalWords < MIN_WORDS) {
       return { links: allLinks, page: null };
@@ -3098,65 +2772,6 @@ const allLinks = Array.from(
 }
 
 // ================= PARALLEL CRAWLER =================
-// ================= STEALTH + CLOUDFLARE BYPASS =================
-const STEALTH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-async function makeStealthContext(browser) {
-  return browser.newContext({
-    viewport: { width: 1920, height: 1080 },
-    userAgent: STEALTH_UA,
-    locale: 'bg-BG',
-    timezoneId: 'Europe/Sofia',
-    extraHTTPHeaders: {
-      'Accept-Language': 'bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Upgrade-Insecure-Requests': '1',
-    },
-  });
-}
-
-async function applyStealthScripts(page) {
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, 'languages', { get: () => ['bg-BG', 'bg', 'en-US', 'en'] });
-    if (!window.chrome) window.chrome = { runtime: {} };
-    delete window.__playwright;
-    delete window.__pw_manual;
-  });
-}
-
-async function waitForRealContent(page, url) {
-  const cfSignals = ['just a moment','checking your browser','performing security','please wait','enable javascript and cookies','ray id'];
-  const isCfPage = async () => {
-    try {
-      const title = (await page.title()).toLowerCase();
-      const body = await page.evaluate(() => ((document.body && document.body.innerText) || '').toLowerCase().slice(0, 600));
-      return cfSignals.some(s => title.includes(s) || body.includes(s));
-    } catch { return false; }
-  };
-  if (!(await isCfPage())) return true;
-  console.log('[CF] Cloudflare detected — waiting up to 15s for ' + url);
-  for (let i = 0; i < 15; i++) {
-    await page.waitForTimeout(1000);
-    if (!(await isCfPage())) {
-      console.log('[CF] Passed after ' + (i + 1) + 's');
-      await page.waitForTimeout(500);
-      return true;
-    }
-  }
-  console.log('[CF] Still blocked after 15s — skipping ' + url);
-  return false;
-}
-
 async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   // If caller passed a deadline (e.g. scrape-website knows its own timeout),
   // use that minus a 5s buffer for JSON serialization + response.
@@ -3171,18 +2786,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      "--lang=bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
-    ],
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"],
   });
 
   const stats = {
@@ -3194,7 +2798,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
   const pages = [];
   const queue = [];
-const lowPriorityQueue = []; // footer fallback
   const siteMaps = []; // collect sitemaps from all pages
   const capabilitiesMaps = []; // collect capabilities from all pages
   let base = "";
@@ -3203,9 +2806,11 @@ const lowPriorityQueue = []; // footer fallback
   const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
-    const initContext = await makeStealthContext(browser);
+    const initContext = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    });
     const initPage = await initContext.newPage();
-    await applyStealthScripts(initPage);
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
@@ -3221,24 +2826,14 @@ const lowPriorityQueue = []; // footer fallback
 
     // Add all discovered links, marking visited immediately to prevent duplicates
     let initCount = 0;
-   allInitialLinks.forEach(l => {
-  const nl = normalizeUrl(l);
-  if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
-
-  visited.add(nl);
-
-  // header/nav important pages first
-  if (
-    /about|service|pricing|price|ceni|contact|faq|product|proekt|rooms|booking/i.test(nl)
-  ) {
-    queue.push(nl);
-  } else {
-    // footer/blog/legal/etc later
-    lowPriorityQueue.push(nl);
-  }
-
-  initCount++;
-});
+    allInitialLinks.forEach(l => {
+      const nl = normalizeUrl(l);
+      if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
+        visited.add(nl);
+        queue.push(nl);
+        initCount++;
+      }
+    });
     console.log(`[INIT] Queued ${initCount} URLs from homepage (total: ${queue.length})`);
 
     await initPage.close();
@@ -3247,22 +2842,18 @@ const lowPriorityQueue = []; // footer fallback
     console.log(`[CRAWL] Found ${queue.length} URLs`);
 
     const createWorker = async () => {
-      const ctx = await makeStealthContext(browser);
+      const ctx = await browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      });
       const pg = await ctx.newPage();
-      await applyStealthScripts(pg);
 
       while (Date.now() < deadline) {
         let url = null;
-        while (queue.length || lowPriorityQueue.length) {
-
-  if (queue.length) {
-    url = queue.shift(); // header priority first
-  } else {
-    url = lowPriorityQueue.shift(); // then footer pages
-  }
-
-  break;
-}
+        while (queue.length > 0) {
+          url = queue.shift();
+          break; // already deduplicated at push time via visited Set
+        }
 
         if (!url) {
           await new Promise(r => setTimeout(r, 30));
@@ -3433,16 +3024,8 @@ http
 
         console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
-               const gz = gzipSync(
-          JSON.stringify({ success: true, ...result })
-        );
-
-        res.writeHead(200, {
-          "Content-Type": "application/json",
-          "Content-Encoding": "gzip"
-        });
-
-        res.end(gz);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, ...result }));
       } catch (e) {
         crawlInProgress = false;
         console.error("[CRAWL ERROR]", e.message);
@@ -3459,8 +3042,3 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
-
-
-
-
-
