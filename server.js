@@ -2282,9 +2282,8 @@ async function expandHiddenContent(page) {
     await page.waitForTimeout(200);
   } catch {}
 
-  // ── Фаза 2: Radix UI / React Dialogs — клик → извлечи текст → затвори ──
+  // ── Фаза 2: Dialog/Modal extraction — click buttons that reveal hidden content ──
   try {
-    // Намери всички dialog trigger бутони
     const triggerTexts = await page.evaluate(() => {
       const isVisible = (el) => {
         try {
@@ -2295,70 +2294,140 @@ async function expandHiddenContent(page) {
         } catch { return false; }
       };
 
-      const dialogTriggerRe = /пакет|basic|standard|premium|детайли|спецификация|виж|повече|цена|price|package|details|план|plan/i;
-      const skipRe = /nav|menu|header|footer|cookie|gdpr/i;
+      const skipRe = /nav|menu|header|footer|cookie|gdpr|consent/i;
+      const triggers = new Set();
 
-      // Radix: aria-haspopup="dialog" или data-state="closed" на бутони
-      const radixTriggers = Array.from(document.querySelectorAll(
-        '[aria-haspopup="dialog"], button[data-state="closed"], [data-radix-collection-item]'
-      )).filter(isVisible).slice(0, 15);
+      // Strategy 1: Any element with aria-haspopup="dialog" — guaranteed dialog trigger
+      document.querySelectorAll('[aria-haspopup="dialog"]').forEach(el => {
+        if (isVisible(el)) triggers.add(el);
+      });
 
-      // Текстови triggers за пакети
-      const textTriggers = Array.from(document.querySelectorAll('button, [role="button"]'))
-        .filter(isVisible)
-        .filter(el => dialogTriggerRe.test(el.textContent || el.getAttribute('aria-label') || ''))
-        .filter(el => !skipRe.test(el.closest('[class]')?.className || ''))
-        .slice(0, 15);
+      // Strategy 2: Buttons with data-state (Radix UI pattern)
+      document.querySelectorAll('button[data-state="closed"], [data-radix-collection-item]').forEach(el => {
+        if (isVisible(el)) triggers.add(el);
+      });
 
-      // Обедини и dedupe
-      const all = new Set([...radixTriggers, ...textTriggers]);
-      return Array.from(all).map((el, i) => {
+      // Strategy 3: Buttons inside card-like containers (pricing cards, product cards, etc.)
+      // These often have "view details", "more info", etc. in any language
+      const cardSelectors = [
+        '[class*="card"]', '[class*="pricing"]', '[class*="package"]', '[class*="plan"]',
+        '[class*="tier"]', '[class*="offer"]', '[class*="product"]', '[class*="item"]',
+        '[class*="service"]', '[class*="feature"]',
+      ];
+      for (const sel of cardSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(card => {
+            if (!isVisible(card)) return;
+            // Find buttons inside this card that are NOT submit/form buttons
+            card.querySelectorAll('button, [role="button"], a[href="#"], a[href="javascript:void(0)"]').forEach(btn => {
+              if (!isVisible(btn)) return;
+              const text = (btn.textContent || '').trim();
+              if (!text || text.length > 60) return;
+              // Skip navigation links and form submits
+              if (/submit|send|buy|purchase|add to cart|изпрати|купи/i.test(text)) return;
+              if (skipRe.test(btn.closest('[class]')?.className || '')) return;
+              triggers.add(btn);
+            });
+          });
+        } catch {}
+      }
+
+      // Strategy 4: Any button whose text suggests it reveals details (universal)
+      const revealRe = /detail|more|info|view|show|see|expand|learn|подробн|детайл|повече|виж|покажи|разгъни|detalles|détails|dettagli|mehr|подробнее|посмотреть|göster|ver\b|voir/i;
+      document.querySelectorAll('button, [role="button"]').forEach(btn => {
+        if (!isVisible(btn)) return;
+        const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
+        if (revealRe.test(text) && text.length <= 40) {
+          if (!skipRe.test(btn.closest('[class]')?.className || '')) {
+            triggers.add(btn);
+          }
+        }
+      });
+
+      // Dedupe and tag
+      const arr = Array.from(triggers).slice(0, 20);
+      return arr.map((el, i) => {
         el.setAttribute('data-crawler-trigger', String(i));
         return { idx: i, text: (el.textContent || '').trim().slice(0, 60) };
       });
     });
 
-    // За всеки trigger: клик → изчакай → вземи текст → затвори
+    if (triggerTexts.length > 0) {
+      console.log(`[DIALOG] Found ${triggerTexts.length} potential triggers: ${triggerTexts.map(t => t.text.slice(0, 30)).join(', ')}`);
+    }
+
+    // Click each trigger, capture dialog/overlay content, close
     const collected = [];
-    for (const { idx } of triggerTexts) {
+    for (const { idx, text: triggerText } of triggerTexts) {
       try {
+        // Remember DOM state before click
+        const beforeDialogs = await page.evaluate(() => 
+          document.querySelectorAll('[role="dialog"],[data-state="open"],[class*="modal"],[class*="overlay"]').length
+        );
+
         await page.evaluate((idx) => {
           const el = document.querySelector(`[data-crawler-trigger="${idx}"]`);
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(450); // React re-render
+        await page.waitForTimeout(500); // Wait for React/Vue re-render + animation
 
-        const text = await page.evaluate(() => {
-          // Вземи текст от отворения dialog
-          const dialog = document.querySelector(
-            '[role="dialog"][data-state="open"], [role="dialog"]:not([data-state="closed"]), [role="dialog"]'
+        // Check if a new dialog/modal appeared
+        const dialogText = await page.evaluate((beforeCount) => {
+          // Look for newly opened dialogs
+          const dialogs = document.querySelectorAll(
+            '[role="dialog"], [data-state="open"], [class*="modal"]:not([class*="modal-backdrop"]), ' +
+            '.ReactModal__Content, [class*="dialog"], [class*="popup"]:not([class*="cookie"])'
           );
-          if (!dialog) return '';
-          return (dialog.innerText || dialog.textContent || '').replace(/\s+/g, ' ').trim();
-        });
+          
+          // Also check for Radix portals (content rendered outside the card)
+          const portals = document.querySelectorAll('[data-radix-portal], [data-radix-popper-content-wrapper]');
+          
+          const allOverlays = [...dialogs, ...portals];
+          
+          if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
+          
+          // Get text from the newest overlay
+          const texts = [];
+          allOverlays.forEach(el => {
+            const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length > 20) texts.push(t);
+          });
+          
+          return texts.join('\n\n');
+        }, beforeDialogs);
 
-        if (text && text.length > 20) {
-          collected.push(text);
-          console.log(`[DIALOG] Извлечен текст: ${text.slice(0, 80)}...`);
+        if (dialogText && dialogText.length > 20) {
+          collected.push(dialogText);
+          console.log(`[DIALOG] Captured ${dialogText.length} chars from trigger "${triggerText.slice(0, 30)}"`);
         }
 
-        // Затвори dialog-а
+        // Close dialog — try multiple methods
         await page.evaluate(() => {
-          // Опит 1: Escape key
+          // Method 1: Escape key
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-          // Опит 2: Close бутон
-          const closeBtn = document.querySelector(
-            '[role="dialog"] button[aria-label*="close" i], [role="dialog"] button[aria-label*="затвори" i], ' +
-            '[role="dialog"] [data-radix-focus-guard] ~ * button:first-child'
-          );
-          if (closeBtn) closeBtn.click();
-          // Опит 3: data-state бутон
-          const stateBtn = document.querySelector('[role="dialog"] button[data-state]');
-          if (stateBtn) stateBtn.click();
+          // Method 2: Click close button
+          const closeSelectors = [
+            '[role="dialog"] button[aria-label*="close" i]',
+            '[role="dialog"] button[aria-label*="Close" i]',
+            '[data-state="open"] button[aria-label*="close" i]',
+            '.ReactModal__Content button[aria-label*="close" i]',
+            '[class*="modal"] button[class*="close"]',
+            '[role="dialog"] button:first-child',
+            'button[data-dismiss="modal"]',
+          ];
+          for (const sel of closeSelectors) {
+            try {
+              const btn = document.querySelector(sel);
+              if (btn) { btn.click(); return; }
+            } catch {}
+          }
+          // Method 3: Click overlay backdrop
+          const backdrop = document.querySelector('[class*="backdrop"], [class*="overlay"][role="presentation"]');
+          if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(300);
       } catch {}
     }
 
@@ -3007,9 +3076,31 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     console.log("[PAGE]", url);
     await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
     
-    // For pages that might have dynamic pricing content, wait a bit longer
+    // Wait for SPA content to render — try networkidle first, then check for dynamic content
     try {
       await page.waitForLoadState('networkidle', { timeout: 3000 });
+    } catch {}
+
+    // Smart wait: if the page has few visible elements, wait a bit more for SPA rendering
+    try {
+      await page.evaluate(() => new Promise(resolve => {
+        let checks = 0;
+        const maxChecks = 10;
+        const check = () => {
+          checks++;
+          const elements = document.querySelectorAll('h1, h2, h3, [class*="card"], [class*="price"], [data-price], article, section');
+          const visible = Array.from(elements).filter(el => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          });
+          if (visible.length >= 3 || checks >= maxChecks) {
+            resolve();
+          } else {
+            setTimeout(check, 200);
+          }
+        };
+        check();
+      }));
     } catch {}
     
 const getNetworkPayloads =
