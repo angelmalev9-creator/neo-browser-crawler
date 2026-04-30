@@ -28,16 +28,18 @@ const RESULT_TTL_MS = 120 * 1000;
 const visited = new Set();
 
 // ================= LIMITS =================
-const MAX_SECONDS = 120;             // ↓ was 180 — fits within scrape-website's 120s fetch timeout
+const MAX_SECONDS = 120;             // fits within scrape-website's 120s fetch timeout
 const MIN_WORDS = 20;
-const PARALLEL_TABS = 8;          // ↑ was 5
-const SCROLL_STEP_MS = 30;           // ↓ was 100ms per scroll step
+const PARALLEL_TABS = 8;
+const SCROLL_STEP_MS = 30;
 const MAX_SCROLL_STEPS = 5;
 const HYDRATION_WAIT_MS = 1800;
-const MUTATION_IDLE_MS = 2200;          // NEW: cap scroll depth
+const MUTATION_IDLE_MS = 2200;
+const MAX_PAGES = 40;                // max pages to crawl
+const MAX_DEPTH = 5;                 // max link-following depth
 
 const SKIP_URL_RE =
-  /(wp-content\/uploads|media|gallery|video|photo|attachment|privacy|terms|cookies|gdpr)/i;
+  /(wp-content\/uploads|wp-json|\/feed\/?$|\/rss\/?$|sitemap\.xml|\/attachment\/|\/author\/|\/tag\/|\/category\/|\/comment|\/trackback|\/xmlrpc|\/wp-admin|\/wp-login|privacy|terms|cookies|gdpr|impressum|datenschutz|disclaimer|legal|politica|politique|blog\/|news\/|article\/|archive\/|login|register|signup|sign-up|sign-in|cart|checkout|wishlist|basket|warenkorb|panier)/i;
 
 // ================= UTILS =================
 const clean = (t = "") =>
@@ -164,7 +166,7 @@ ct.includes("graphql")
 const txt=await res.text();
 
 if(
-/price|ceni|pricing|package|plan|amount|cost|rate|tariff|subscription|monthly|annual|лв|€|eur|usd|packages/i.test(txt)
+/price|cost|amount|rate|tariff|subscription|monthly|annual|€|£|\$|¥|₹|currency|checkout|cart|product|service|plan|package|offer|catalog/i.test(txt)
 ){
 payloads.push(
 txt.slice(0,100000)
@@ -199,9 +201,17 @@ document.querySelectorAll(
 
 const t=(el.innerText||'').toLowerCase();
 
-if(
-/цени|pricing|packages|plans|details|tariffs|pricing plans|subscriptions|пакети|планове|абонамент|услуги|rates|offers/i.test(t)
-){
+// Universal: click any tab/accordion/expand button that might reveal content
+// Detects pricing/services/plans/packages/details in any language by checking
+// if the element is a tab, accordion trigger, or has aria-expanded
+const isInteractive = el.tagName === 'SUMMARY' || 
+  el.getAttribute('aria-expanded') === 'false' ||
+  el.getAttribute('role') === 'tab';
+
+// Also click buttons with short text (likely tab/toggle labels, not navigation)
+const isShortLabel = t.length > 0 && t.length < 40;
+
+if(isInteractive || (isShortLabel && el.closest('[class*="tab"],[class*="accordion"],[class*="toggle"],[class*="pricing"],[class*="plan"]'))){
 try{el.click()}catch{}
 }
 
@@ -219,37 +229,13 @@ window.scrollTo(0,0);
 
 }
 
-// ================= BG NUMBER NORMALIZER =================
-// IMPORTANT FIX: do NOT convert money amounts to words.
-// Keep numeric prices intact for downstream extraction.
-const BG_0_19 = [
-  "нула","едно","две","три","четири","пет","шест","седем","осем","девет",
-  "десет","единадесет","дванадесет","тринадесет","четиринадесет",
-  "петнадесет","шестнадесет","седемнадесет","осемнадесет","деветнадесет"
-];
-const BG_TENS = ["", "", "двадесет","тридесет","четиридесет","петдесет","шестдесет","седемдесет","осемдесет","деветдесет"];
-
-function numberToBgWords(n) {
-  n = Number(n);
-  if (Number.isNaN(n)) return n;
-  if (n < 20) return BG_0_19[n];
-  if (n < 100) {
-    const t = Math.floor(n / 10);
-    const r = n % 10;
-    return BG_TENS[t] + (r ? " и " + BG_0_19[r] : "");
-  }
-  return String(n);
-}
-
+// ================= NUMBER NORMALIZER =================
+// Universal: only normalize numbers next to countable units (rooms, people, nights, sqm)
+// Keeps all prices and standalone numbers intact
 function normalizeNumbers(text = "") {
-  try {
-    // ✅ Exclude money units (лв/лева/€/$/EUR/BGN) from normalization.
-    // Keep digits for prices so pack/pricing extraction works reliably.
-    return text.replace(
-      /(\d+)\s?(стая|стаи|човек|човека|нощувка|нощувки|кв\.?|sqm)/gi,
-      (_, num, unit) => `${numberToBgWords(num)} ${unit}`
-    );
-  } catch { return text; }
+  // No-op: we keep all numbers as-is for universal compatibility
+  // Downstream extractors handle number parsing per their own logic
+  return text;
 }
 
 // ================= URL NORMALIZER =================
@@ -405,14 +391,14 @@ async function extractContactsFromPage(page) {
 // ================= PAGE TYPE =================
 function detectPageType(url = "", title = "") {
   const s = (url + " " + title).toLowerCase();
-  if (/za-nas|about/.test(s)) return "about";
-  if (/uslugi|services|pricing|price|ceni|tseni/.test(s)) return "services";
-  if (/kontakti|contact/.test(s)) return "contact";
-  if (/faq|vuprosi|questions/.test(s)) return "faq";
-  if (/blog|news|article/.test(s)) return "blog";
-  // Product/vehicle/property detail pages — URL contains ID or product slug
-  const PRODUCT_URL_RE = /prodajba-|\/proekt\/|\/id-\d|[?&]id=\d|(\/|[-_])(car|auto|vehicle|property|imot|apartament|hotel|offer|listing|detail|product|item)(\/|-\d|$)|\d{4,}-[a-z]/i;
-  if (PRODUCT_URL_RE.test(url)) return "product_detail";
+  // Universal patterns: check URL slugs and page titles in any language
+  if (/\/(about|za-nas|uber-uns|a-propos|sobre|chi-siamo|o-nas|hakkimizda|om-oss)\b/i.test(s) || /\babout\b/i.test(title)) return "about";
+  if (/\/(service|pricing|price|plans?|tariff|paket|packages?|rates?|uslugi|ceni|tseni|leistungen|preise|servicios|precios|servizi|prezzi)\b/i.test(s)) return "services";
+  if (/\/(contact|kontakt|kontakti|contatto|contacto|kontakty|iletisim)\b/i.test(s) || /\bcontact\b/i.test(title)) return "contact";
+  if (/\/(faq|questions|vuprosi|hilfe|ayuda|domande|pomoc)\b/i.test(s) || /\bfaq\b/i.test(title)) return "faq";
+  if (/\/(blog|news|article|novini|actualites|noticias|notizie|aktuelles)\b/i.test(s)) return "blog";
+  // Product/vehicle/property detail pages — URL contains ID pattern or detail slug
+  if (/[?&]id=\d|\/id[-_]\d|\/detail\/|\/product\/|\/item\/|\d{4,}-[a-z]/i.test(url)) return "product_detail";
   return "general";
 }
 
@@ -422,31 +408,45 @@ function detectPageType(url = "", title = "") {
 
 // Keyword mappings for buttons and fields
 const KEYWORD_MAP = {
-  // Booking
+  // Booking — universal patterns
+  "book": ["book", "reserve", "booking", "reservation"],
+  "reserve": ["book", "reserve", "reservation"],
   "резерв": ["book", "reserve", "booking"],
   "запази": ["book", "reserve"],
-  "резервация": ["booking", "reservation"],
-  "резервирай": ["book", "reserve"],
+  "buchen": ["book", "reserve"],
+  "prenota": ["book", "reserve"],
+  "réserver": ["book", "reserve"],
+  "reservar": ["book", "reserve"],
   // Search
+  "search": ["search", "find", "lookup"],
+  "find": ["search", "find"],
   "търси": ["search", "find"],
-  "провери": ["check", "verify"],
-  "покажи": ["show", "display"],
-  // Dates
-  "настаняване": ["check-in", "checkin", "arrival"],
-  "напускане": ["check-out", "checkout", "departure"],
-  "пристигане": ["arrival", "check-in"],
-  "заминаване": ["departure", "check-out"],
+  "suchen": ["search", "find"],
+  "buscar": ["search", "find"],
+  "chercher": ["search", "find"],
+  // Actions
+  "submit": ["submit", "send"],
+  "send": ["send", "submit"],
+  "изпрати": ["send", "submit"],
+  "senden": ["send", "submit"],
+  "enviar": ["send", "submit"],
+  "envoyer": ["send", "submit"],
   // Contact
-  "контакт": ["contact"],
-  "контакти": ["contact", "contacts"],
-  "свържи": ["contact", "reach"],
-  // Rooms
-  "стаи": ["rooms", "accommodation"],
-  "стая": ["room"],
+  "contact": ["contact", "reach"],
+  "контакт": ["contact", "reach"],
+  "kontakt": ["contact"],
+  // Dates
+  "check-in": ["check-in", "checkin", "arrival"],
+  "check-out": ["check-out", "checkout", "departure"],
+  "настаняване": ["check-in", "arrival"],
+  "напускане": ["check-out", "departure"],
+  "arrival": ["check-in", "arrival"],
+  "departure": ["check-out", "departure"],
   // Other
+  "price": ["prices", "rates", "cost"],
+  "service": ["services"],
   "цени": ["prices", "rates"],
   "услуги": ["services"],
-  "изпрати": ["send", "submit"],
 };
 
 function generateKeywords(text) {
@@ -472,10 +472,14 @@ function generateKeywords(text) {
 function detectActionType(text) {
   const lower = text.toLowerCase();
 
-  if (/резерв|book|запази|reserve/i.test(lower)) return "booking";
-  if (/контакт|contact|свържи/i.test(lower)) return "contact";
-  if (/търси|search|провери|check|submit|изпрати/i.test(lower)) return "submit";
-  if (/стаи|rooms|услуги|services|за нас|about|галерия|gallery/i.test(lower)) return "navigation";
+  // Universal booking/reservation patterns
+  if (/\b(book|reserve|reserv|buchen|prenota|réserver|reservar|запис|резерв|запази|foglal|boka)\b/i.test(lower)) return "booking";
+  // Universal contact patterns
+  if (/\b(contact|kontakt|contatto|contacto|связ|свърж|iletişim|kontakty)\b/i.test(lower)) return "contact";
+  // Universal submit/search/action patterns
+  if (/\b(search|find|submit|send|check|filter|apply|go|enter|изпрати|търси|suchen|buscar|chercher|cerca|szukaj|ara)\b/i.test(lower)) return "submit";
+  // Universal navigation
+  if (/\b(about|service|room|gallery|portfolio|menu|home|faq|help)\b/i.test(lower)) return "navigation";
 
   return "other";
 }
@@ -496,37 +500,40 @@ function generateFieldKeywords(name, placeholder, label) {
   const keywords = new Set();
   const searchText = `${name} ${placeholder} ${label}`.toLowerCase();
 
-  // Check-in patterns
-  if (/check-?in|checkin|arrival|от|настаняване|пристигане|from|start/i.test(searchText)) {
-    ["check-in", "checkin", "от", "настаняване", "arrival", "from"].forEach(k => keywords.add(k));
+  // Date-related
+  if (/check-?in|checkin|arrival|from|start|anreise|arrivée|llegada|arrivo|пристигане|настаняване|приезд|giriş/i.test(searchText)) {
+    ["check-in", "arrival", "from"].forEach(k => keywords.add(k));
+  }
+  if (/check-?out|checkout|departure|to\b|end|abreise|départ|salida|partenza|напускане|заминаване|отъезд|çıkış/i.test(searchText)) {
+    ["check-out", "departure", "to"].forEach(k => keywords.add(k));
   }
 
-  // Check-out patterns
-  if (/check-?out|checkout|departure|до|напускане|заминаване|to|end/i.test(searchText)) {
-    ["check-out", "checkout", "до", "напускане", "departure", "to"].forEach(k => keywords.add(k));
+  // People/guests
+  if (/guest|adult|person|people|pax|room|гост|човек|деца|child|kinder|enfant|huésped|ospite|гостей|misafir/i.test(searchText)) {
+    ["guests", "adults", "persons"].forEach(k => keywords.add(k));
   }
 
-  // Guests patterns
-  if (/guest|adult|човек|гост|брой|persons|pax/i.test(searchText)) {
-    ["guests", "гости", "човека", "adults", "persons", "брой"].forEach(k => keywords.add(k));
+  // Name
+  if (/\bname\b|име|nom\b|nombre|nome|имя|isim|naam/i.test(searchText)) {
+    ["name"].forEach(k => keywords.add(k));
   }
 
-  // Name patterns
-  if (/name|име/i.test(searchText)) {
-    ["name", "име"].forEach(k => keywords.add(k));
+  // Email
+  if (/email|e-?mail|имейл|correo|courriel|почта|e-posta/i.test(searchText)) {
+    ["email"].forEach(k => keywords.add(k));
   }
 
-  // Email patterns
-  if (/email|имейл|e-mail/i.test(searchText)) {
-    ["email", "имейл", "e-mail"].forEach(k => keywords.add(k));
+  // Phone
+  if (/phone|tel|телефон|teléfono|téléphone|telefon|telefono|телефон/i.test(searchText)) {
+    ["phone"].forEach(k => keywords.add(k));
   }
 
-  // Phone patterns
-  if (/phone|телефон|тел/i.test(searchText)) {
-    ["phone", "телефон"].forEach(k => keywords.add(k));
+  // Message/notes
+  if (/message|comment|note|съобщение|сообщение|nachricht|mensaje|messaggio|mesaj/i.test(searchText)) {
+    ["message"].forEach(k => keywords.add(k));
   }
 
-  // Add name/id as keywords
+  // Add field name/id as keyword
   if (name) keywords.add(name.toLowerCase());
 
   return Array.from(keywords);
@@ -638,7 +645,7 @@ async function extractSiteMapFromPage(page) {
 
     // EXTRACT PRICES (legacy, context-light)
     const prices = [];
-    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|лева)/gi;
+    const priceRegex = /(\d+[\s,.]?\d*)\s*(лв\.?|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|лева|руб|грн|UAH)/gi;
 
     const walker = document.createTreeWalker(
       document.body,
@@ -858,7 +865,7 @@ async function extractPricingFromPage(page) {
 
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-    const moneyRe=/((?:from|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|lv)(?:\s*\/?\s*(месец|month|mo))?/i;
+    const moneyRe=/((?:from|от|ab|desde|da|от)?\s*\d{1,6}(?:[\s,.]\d{1,3})*(?:[.,]\d{1,2})?)\s*(лв\.?|лева|bgn|eur|€|\$|usd|gbp|£|¥|₹|chf|pln|zł|czk|kč|sek|kr|nok|dkk|ron|lei|rub|₽|руб|try|₺|lv|грн|uah|brl|r\$|aud|cad|huf|ft|hrk|kn|jpy|cny|元|inr|mxn)(?:\s*\/?\s*(месец|month|mo|jahr|año|mese|monat|rok|ay|luna|месяц))?/i;
 
     const getText = (el) => norm(el?.innerText || el?.textContent || "");
     const pickTitle = (root) => {
@@ -870,12 +877,12 @@ async function extractPricingFromPage(page) {
     };
 
     const pickBadge = (root) => {
-      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag']");
+      const b = root.querySelector("[class*='badge'],[class*='label'],[class*='tag'],[class*='popular'],[class*='best'],[class*='recommend']");
       const t = getText(b);
       if (t && t.length <= 40) return t;
       const all = getText(root);
-      if (/популярен|най-популярен|special|оферта/i.test(all)) {
-        const m = all.match(/(популярен|най-популярен|специална оферта)/i);
+      if (/popular|best|recommended|most|top|special|featured|популярен|най-|empfohlen|beliebt|recomendado|consigliato|recommandé/i.test(all)) {
+        const m = all.match(/(most popular|best value|recommended|популярен|най-популярен|special offer|best seller|top pick|featured)/i);
         return m ? m[0] : "";
       }
       return "";
@@ -894,8 +901,9 @@ async function extractPricingFromPage(page) {
 
     const pickPeriod = (root) => {
       const t = getText(root);
-      if (/\/\s*месец|на месец|месец/i.test(t)) return "monthly";
-      if (/еднократно|one[-\s]?time|еднократ/i.test(t)) return "one_time";
+      if (/\/\s*(месец|month|mo|monat|mese|mes|mois)|per month|на месец|pro monat|al mese|por mes|par mois/i.test(t)) return "monthly";
+      if (/\/\s*(year|год|jahr|anno|año|an\b)|per year|на година|pro jahr|all'anno|por año|par an/i.test(t)) return "yearly";
+      if (/еднократно|one[-\s]?time|einmalig|una tantum|pago único|paiement unique/i.test(t)) return "one_time";
       return null;
     };
 
@@ -950,7 +958,7 @@ features:[]
     while (node = walker.nextNode()) {
       const txt = norm(node.textContent || "");
       if (!txt) continue;
-      if (!moneyRe.test(txt) && !/по договаряне/i.test(txt)) continue;
+      if (!moneyRe.test(txt) && !/по договаряне|on request|auf anfrage|sur demande|a consultar|su richiesta|price on request|call for price|contact for price/i.test(txt)) continue;
 
       const parent = node.parentElement;
       if (!parent || !isVisible(parent)) continue;
@@ -963,7 +971,7 @@ features:[]
 
       const rootText = getText(root);
       const moneyMatch = rootText.match(moneyRe);
-      const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне/i.test(rootText) ? "По договаряне" : "");
+      const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне|on request|auf anfrage|sur demande|a consultar|price on request|call for price/i.test(rootText) ? "On request" : "");
 
       const period = pickPeriod(root);
 
@@ -983,11 +991,11 @@ features:[]
       });
     }
 
-    const installment_plans = cards.filter(c => c.period === "monthly" || /месец/i.test((c.title || "") + " " + (c.price_text || "")));
+    const installment_plans = cards.filter(c => c.period === "monthly" || /месец|month|monat|mese|mes|mois|mo\b|\/mo|per month/i.test((c.title || "") + " " + (c.price_text || "")));
     const pricing_cards = cards.filter(c => !installment_plans.includes(c));
 
     installment_plans.forEach(p => {
-      p.title = norm(p.title.replace(/\/\s*месец/i, "").replace(/пакет\s*\/\s*месец/i, "пакет")).trim();
+      p.title = norm(p.title.replace(/\/\s*(месец|month|mo|monat)/i, "").trim());
     });
 
     return {
@@ -1186,7 +1194,7 @@ async function extractCapabilitiesFromPage(page) {
         if (siblingBtns.length < 2) return;
 
         // Filter out nav/submit-like buttons
-        const submitRe = /напред|назад|next|back|prev|submit|изпрати|запази|book|reserve|резерв|close|затвори|отказ|cancel/i;
+        const submitRe = /next|back|prev|forward|submit|send|cancel|close|continue|save|book|reserve|confirm|order|buy|напред|назад|изпрати|запази|резерв|затвори|отказ|weiter|zurück|siguiente|anterior|suivant|précédent|avanti|indietro|dalej|wstecz|ileri|geri/i;
         const optionBtns = siblingBtns.filter(b => {
           const t = (b.textContent || "").trim();
           // short text (1-30 chars), not a nav/submit button
@@ -1337,7 +1345,7 @@ async function extractCapabilitiesFromPage(page) {
       });
 
       const bestSubmit =
-        submitCandidates.find(b => /изпрати|send|submit|запази|резерв|book|reserve/i.test(b.text)) ||
+        submitCandidates.find(b => /submit|send|book|reserve|save|go|apply|confirm|order|buy|purchase|изпрати|запази|резерв|senden|buchen|prenota|réserver|reservar|enviar|envoyer|bestellen|comprar|acheter|acquista/i.test(b.text)) ||
         submitCandidates[0] ||
         null;
 
@@ -1518,14 +1526,14 @@ async function extractCapabilitiesFromPage(page) {
     };
 
     const bookingRe = {
-      checkIn: /(пристигане|настаняване|check\s*-?in|arrival|checkin)/i,
-      checkOut: /(напускане|заминаване|check\s*-?out|departure|checkout)/i,
-      guests: /(възрастни|adults?|guests?|гости|деца|children|rooms?|стаи?|promo\s*code|промо\s*код)/i,
-      action: /(резервирай|резервация|book(?:\s*now)?|reserve|search|availability|провери|търси)/i,
-      noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:|виж повече|направи запитване)/i,
-      menuNoise: /(начало|home|за нас|about|контакти|contact|галерия|gallery|оферти|offers|цени|pricing|blog|новини|faq|всички стаи|стаи и апартаменти|rooms? & suites|accommodation)/i,
-      roomNoise: /(делукс|double|studio|апартамент|suite|standard room|family room|superior|junior suite|икономична стая)/i,
-      genericActionNoise: /(виж повече|learn more|details|прочети повече|направи запитване|изпрати запитване)/i,
+      checkIn: /(check\s*-?in|arrival|checkin|пристигане|настаняване|anreise|arrivée|llegada|arrivo|приезд|giriş)/i,
+      checkOut: /(check\s*-?out|departure|checkout|напускане|заминаване|abreise|départ|salida|partenza|отъезд|çıkış)/i,
+      guests: /(adults?|guests?|persons?|people|rooms?|children|kids|pax|гости|възрастни|деца|стаи?|gäste|invités|huéspedes|ospiti|гостей|misafir|promo\s*code|промо\s*код|coupon|gutschein)/i,
+      action: /(book(?:\s*now)?|reserve|search|availability|check|find|резервирай|резервация|провери|търси|buchen|réserver|reservar|prenota|забронировать|ara|boka)/i,
+      noise: /(jquery|document\.ready|swiper|slidesperview|pagination|navigation|autoplay|loop:)/i,
+      menuNoise: /(^home$|^about$|^contact$|^gallery$|^faq$|^blog$|^news$|^menu$)/i,
+      roomNoise: /(deluxe|double|studio|suite|standard|family|superior|junior|economy|single|twin)/i,
+      genericActionNoise: /(learn more|read more|details|more info|see more|show more)/i,
     };
 
     const interactiveSelectors = 'button, a, input, select, textarea, [role="button"], [role="combobox"], [aria-haspopup], [aria-label], [placeholder]';
@@ -1539,7 +1547,7 @@ async function extractCapabilitiesFromPage(page) {
       const id = String(el.id || '').toLowerCase();
       const href = String(el.getAttribute?.('href') || '').toLowerCase();
       const txt = getInteractiveText(el).toLowerCase();
-      if (tag === 'a' && /(^#|javascript:|\/accommodation|\/rooms|\/contact|\/offers|\/restaurant|\/about|\/home|\/blog|\/faq)/i.test(href)) return true;
+      if (tag === 'a' && /(^#$|^javascript:|^\/$)/i.test(href)) return true;
       if (/menu-link|menu-text|submenu|offcanvas|nav|navbar|header-menu|mobile-menu|desktop-menu/i.test(cls)) return true;
       if (/nav|menu|header|offcanvas/i.test(id)) return true;
       if (el.closest('header, nav, [class*="menu"], [class*="nav"], [class*="header"], [class*="offcanvas"]')) return true;
@@ -1911,7 +1919,7 @@ async function extractCapabilitiesFromPage(page) {
       }
 
       // Method 3: Navigation buttons (Напред/Назад, Next/Back) near inputs
-      const navButtonRe = /напред|назад|next|back|previous|стъпка|step/i;
+      const navButtonRe = /next|back|prev|forward|continue|step|напред|назад|стъпка|weiter|zurück|siguiente|anterior|suivant|précédent|avanti|indietro|dalej|wstecz|ileri|geri/i;
       document.querySelectorAll('button, [role="button"], a[class*="btn"]').forEach(btn => {
         try {
           if (btn.closest('form')) return;
@@ -1998,7 +2006,7 @@ async function extractCapabilitiesFromPage(page) {
         });
 
         const bestSubmit =
-          submitCandidates.find(b => /изпрати|send|submit|запази|напред|next|резерв|book/i.test(b.text)) ||
+          submitCandidates.find(b => /submit|send|next|forward|continue|book|reserve|save|confirm|go|apply|изпрати|напред|запази|резерв|weiter|siguiente|suivant|avanti|dalej|ileri/i.test(b.text)) ||
           submitCandidates[0] ||
           null;
 
@@ -2162,19 +2170,38 @@ async function expandHiddenContent(page) {
         try { tab.click(); await sleep(100); } catch {}
       }
 
-      // 4. "Виж детайли" / текстови trigger бутони (НЕ-dialog)
-      const textTriggerRe = /виж детайли|виж повече|повече информация|разгъни|покажи|show more|read more|expand|see more/i;
-      const skipRe = /nav|menu|header|footer|cookie|gdpr/i;
+      // 4. Content-revealing buttons — uses DOM semantics, not hardcoded text
+      // Detects: aria-haspopup, data-toggle, buttons inside collapsed containers,
+      // or short-text buttons near hidden content. Max 3 clicks.
+      const skipRe = /nav|menu|header|footer|cookie|gdpr|consent/i;
       const clickable = Array.from(document.querySelectorAll(
         'button, [role="button"], a[href="#"], a[href="javascript:void(0)"], span[onclick], div[onclick]'
       )).filter(isVisible).slice(0, 30);
+      let smartClicks = 0;
+      const MAX_SMART_CLICKS = 3;
       for (const btn of clickable) {
+        if (smartClicks >= MAX_SMART_CLICKS) break;
         const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
-        if (!textTriggerRe.test(text)) continue;
+        if (!text || text.length > 60) continue;
         if (skipRe.test(btn.closest('[class]')?.className || '')) continue;
-        // Пропусни ако отваря dialog — ще се handle-ва отделно
         if (btn.getAttribute('aria-haspopup') === 'dialog') continue;
-        try { btn.click(); await sleep(120); } catch {}
+        
+        // Smart detection: is this button likely to reveal hidden content?
+        const looksLikeExpander = 
+          // Has a sibling/child that is hidden
+          btn.nextElementSibling?.style?.display === 'none' ||
+          btn.getAttribute('data-toggle') ||
+          btn.getAttribute('data-bs-toggle') ||
+          // Short text with ellipsis-like patterns or "+" or "▸" symbols
+          /[+▸▶►…]/.test(text) ||
+          // Button is inside a section with collapsed content
+          btn.closest('[class*="collaps"],[class*="expand"],[class*="toggle"],[class*="detail"],[class*="more"]') ||
+          // Text is very short (1-3 words) suggesting a toggle label
+          text.split(/\s+/).length <= 3;
+        
+        if (looksLikeExpander) {
+          try { btn.click(); await sleep(120); smartClicks++; } catch {}
+        }
       }
 
       // 5. <details> force open
@@ -2360,9 +2387,18 @@ async function extractStructured(page) {
       let current = null;
       const processedElements = new Set();
 
+      // Skip elements inside nav, footer, header, cookie bars — we capture those once from homepage
+      const isInBoilerplate = (el) => {
+        try {
+          const bp = el.closest('nav, footer, header, [role="navigation"], [class*="cookie"], [class*="gdpr"], [class*="consent"], [class*="banner"], [id*="cookie"], [id*="gdpr"]');
+          return !!bp;
+        } catch { return false; }
+      };
+
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
         if (el.closest("details.wp-block-details, details")) return;
+        if (isInBoilerplate(el)) return;
         let parent = el.parentElement;
         while (parent) {
           if (processedElements.has(parent)) return;
@@ -2479,6 +2515,7 @@ async function extractStructured(page) {
 }
 
 // ================= LINK DISCOVERY =================
+// Collect ALL links from a page (used for inner pages)
 async function collectAllLinks(page, base) {
   try {
     return await page.evaluate(base => {
@@ -2489,6 +2526,40 @@ async function collectAllLinks(page, base) {
           if (u.origin === base) urls.add(u.href.split("#")[0]);
         } catch {}
       });
+      return Array.from(urls);
+    }, base);
+  } catch { return []; }
+}
+
+// Collect only header/footer/nav links (used for homepage — selective crawling)
+async function collectNavLinks(page, base) {
+  try {
+    return await page.evaluate(base => {
+      const urls = new Set();
+      const origin = new URL(base).origin;
+      const navSelectors = [
+        'header a[href]',
+        'nav a[href]',
+        'footer a[href]',
+        '[role="navigation"] a[href]',
+        '[class*="nav"] a[href]',
+        '[class*="menu"] a[href]',
+        '[id*="nav"] a[href]',
+        '[id*="menu"] a[href]',
+      ];
+      const seen = new Set();
+      for (const sel of navSelectors) {
+        try {
+          document.querySelectorAll(sel).forEach(a => {
+            if (seen.has(a)) return;
+            seen.add(a);
+            try {
+              const u = new URL(a.href, base);
+              if (u.origin === origin) urls.add(u.href.split("#")[0]);
+            } catch {}
+          });
+        } catch {}
+      }
       return Array.from(urls);
     }, base);
   } catch { return []; }
@@ -2749,7 +2820,7 @@ async function extractProductSpecsFromPage(page) {
       if (h1) title = norm(h1.innerText || h1.textContent || '');
 
       // ── Цена: широко търсене по CSS класове и text walker ─────────────────
-      const priceRe = /[\d][\d\s.,]*\s*(лв\.?|лева|BGN|EUR|€|\$)/i;
+      const priceRe = /[\d][\d\s.,]*\s*(лв\.?|лева|BGN|EUR|€|\$|USD|GBP|£|¥|₹|CHF|PLN|zł|CZK|Kč|SEK|kr|NOK|DKK|RON|lei|RUB|₽|TRY|₺|руб|грн|UAH)/i;
       document.querySelectorAll('[class*="price"],[class*="cena"],[class*="cost"],[class*="amount"],[class*="suma"]').forEach(el => {
         const t = norm(el.innerText || el.textContent || '');
         if (priceRe.test(t) && t.length < 100) prices.push(t);
@@ -2871,7 +2942,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 const getNetworkPayloads =
 await attachNetworkMining(page);
 
-if(!/\/proekt\/|\/id-/i.test(url)){
+if(!/[?&]id=\d|\/detail\/|\/product\//i.test(url)){
  await waitForHydrationSettled(page);
 }
 
@@ -2922,7 +2993,7 @@ await forceRenderEverything(page);
 
 let shadowText = "";
 
-if (/pricing|ceni|service|product/i.test(url)) {
+if (/pricing|price|service|product|plan|package|tariff|shop|store|catalog/i.test(url)) {
  shadowText = await extractShadowAndPortalText(page);
 }
 
@@ -3158,15 +3229,12 @@ async function waitForRealContent(page, url) {
 }
 
 async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
-  // If caller passed a deadline (e.g. scrape-website knows its own timeout),
-  // use that minus a 5s buffer for JSON serialization + response.
-  // Otherwise fall back to MAX_SECONDS.
   const effectiveMs = deadlineMs
     ? Math.min(deadlineMs, MAX_SECONDS * 1000)
     : MAX_SECONDS * 1000;
   const deadline = Date.now() + effectiveMs;
   console.log("\n[CRAWL START]", startUrl);
-  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, deadline in ${Math.round(effectiveMs / 1000)}s`);
+  console.log(`[CONFIG] ${PARALLEL_TABS} tabs, deadline in ${Math.round(effectiveMs / 1000)}s, max ${MAX_PAGES} pages, depth ${MAX_DEPTH}`);
   if (siteId) console.log(`[SITE ID] ${siteId}`);
 
   const browser = await chromium.launch({
@@ -3193,13 +3261,13 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   };
 
   const pages = [];
-  const queue = [];
-const lowPriorityQueue = []; // footer fallback
-  const siteMaps = []; // collect sitemaps from all pages
-  const capabilitiesMaps = []; // collect capabilities from all pages
+  const queue = [];       // [{url, depth}]
+  const lowPriorityQueue = [];
+  const siteMaps = [];
+  const capabilitiesMaps = [];
   let base = "";
+  let headerFooterText = ""; // captured once from homepage
 
-  // ✅ NEW: aggregate contacts across pages
   const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
@@ -3210,72 +3278,90 @@ const lowPriorityQueue = []; // footer fallback
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
 
-    const initialLinks = await collectAllLinks(initPage, base);
+    // Capture header/footer text ONCE from homepage
+    try {
+      headerFooterText = await initPage.evaluate(() => {
+        const parts = [];
+        const seen = new Set();
+        ['header', 'footer', 'nav', '[role="navigation"]'].forEach(sel => {
+          document.querySelectorAll(sel).forEach(el => {
+            if (seen.has(el)) return;
+            seen.add(el);
+            const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length > 5) parts.push(t);
+          });
+        });
+        return parts.join('\n');
+      });
+      console.log(`[INIT] Captured ${headerFooterText.length} chars of header/footer text (once)`);
+    } catch {}
+
+    // Use SELECTIVE nav link discovery — only header/footer/nav links
+    const navLinks = await collectNavLinks(initPage, base);
+    // Also get button-discovered links for SPAs
     const initButtonLinks = await discoverLinksViaButtons(initPage, base);
-    const allInitialLinks = Array.from(new Set([...initialLinks, ...initButtonLinks]));
+    const allInitialLinks = Array.from(new Set([...navLinks, ...initButtonLinks]));
 
     // Add homepage first
     const homeNorm = normalizeUrl(initPage.url());
     visited.add(homeNorm);
-    queue.push(homeNorm);
+    queue.push({ url: homeNorm, depth: 0 });
 
-    // Add all discovered links, marking visited immediately to prevent duplicates
+    // Prioritize important pages from nav, skip blog/news/terms/etc.
     let initCount = 0;
-   allInitialLinks.forEach(l => {
-  const nl = normalizeUrl(l);
-  if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
+    allInitialLinks.forEach(l => {
+      const nl = normalizeUrl(l);
+      if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
 
-  visited.add(nl);
+      visited.add(nl);
 
-  // header/nav important pages first
-  if (
-    /about|service|pricing|price|ceni|contact|faq|product|proekt|rooms|booking/i.test(nl)
-  ) {
-    queue.push(nl);
-  } else {
-    // footer/blog/legal/etc later
-    lowPriorityQueue.push(nl);
-  }
+      // Priority: pages likely to have important business info (services, pricing, about, contact, FAQ)
+      // Universal slugs covering EN, BG, DE, FR, ES, IT, TR, RU, and common patterns
+      const PRIORITY_RE = /\/(about|service|pricing|price|plans?|tariff|contact|faq|product|portfolio|team|feature|offer|package|rate|shop|store|catalog|menu|za-nas|uslugi|ceni|tseni|kontakt|vuprosi|proekt|leistungen|preise|uber-uns|kontakt|servizio|prezzi|chi-siamo|servicios|precios|sobre|iletisim|hakkimizda|o-nas|cennik)\b/i;
 
-  initCount++;
-});
-    console.log(`[INIT] Queued ${initCount} URLs from homepage (total: ${queue.length})`);
+      if (PRIORITY_RE.test(nl)) {
+        queue.push({ url: nl, depth: 1 });
+      } else {
+        lowPriorityQueue.push({ url: nl, depth: 1 });
+      }
+
+      initCount++;
+    });
+    console.log(`[INIT] Queued ${initCount} nav URLs (priority: ${queue.length}, low: ${lowPriorityQueue.length})`);
 
     await initPage.close();
     await initContext.close();
-
-    console.log(`[CRAWL] Found ${queue.length} URLs`);
 
     const createWorker = async () => {
       const ctx = await makeStealthContext(browser);
       const pg = await ctx.newPage();
       await applyStealthScripts(pg);
 
-      while (Date.now() < deadline) {
-        let url = null;
-        while (queue.length || lowPriorityQueue.length) {
+      while (Date.now() < deadline && stats.saved < MAX_PAGES) {
+        let item = null;
+        if (queue.length) {
+          item = queue.shift();
+        } else if (lowPriorityQueue.length) {
+          item = lowPriorityQueue.shift();
+        }
 
-  if (queue.length) {
-    url = queue.shift(); // header priority first
-  } else {
-    url = lowPriorityQueue.shift(); // then footer pages
-  }
-
-  break;
-}
-
-        if (!url) {
+        if (!item) {
           await new Promise(r => setTimeout(r, 30));
-          if (queue.length === 0) break;
+          if (queue.length === 0 && lowPriorityQueue.length === 0) break;
           continue;
         }
 
+        // Enforce depth limit
+        if (item.depth > MAX_DEPTH) continue;
+        // Enforce page limit
+        if (stats.saved >= MAX_PAGES) break;
+
         stats.visited++;
 
-        const result = await processPage(pg, url, base, stats, siteMaps, capabilitiesMaps);
+        const result = await processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps);
 
         if (result.page) {
-          // ✅ collect contacts
+          // Collect contacts
           const c = result.page?.structured?.contacts;
           if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
           if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
@@ -3284,18 +3370,21 @@ const lowPriorityQueue = []; // footer fallback
           stats.saved++;
         }
 
-        // Push discovered links into queue immediately (deduped, no queue.includes check — use visited Set)
-        let newLinksAdded = 0;
-        result.links.forEach(l => {
-          const nl = normalizeUrl(l);
-          if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
-            visited.add(nl); // reserve immediately to avoid duplicate queue entries
-            queue.push(nl);
-            newLinksAdded++;
+        // Only follow links from pages within depth limit, and only relevant internal links
+        if (item.depth < MAX_DEPTH) {
+          let newLinksAdded = 0;
+          result.links.forEach(l => {
+            const nl = normalizeUrl(l);
+            if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
+              visited.add(nl);
+              // Inner page links go to low priority
+              lowPriorityQueue.push({ url: nl, depth: item.depth + 1 });
+              newLinksAdded++;
+            }
+          });
+          if (newLinksAdded > 0) {
+            console.log(`[QUEUE] +${newLinksAdded} new URLs (depth ${item.depth + 1}) → total: ${queue.length + lowPriorityQueue.length}`);
           }
-        });
-        if (newLinksAdded > 0) {
-          console.log(`[QUEUE] +${newLinksAdded} new URLs → queue: ${queue.length}`);
         }
       }
 
@@ -3307,7 +3396,7 @@ const lowPriorityQueue = []; // footer fallback
 
   } finally {
     await browser.close();
-    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages`);
+    console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages (max ${MAX_PAGES})`);
   }
 
   let combinedSiteMap = null;
@@ -3459,8 +3548,3 @@ http
     console.log(`Config: ${PARALLEL_TABS} tabs`);
     console.log(`Worker: ${WORKER_URL}`);
   });
-
-
-
-
-
