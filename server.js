@@ -2936,7 +2936,11 @@ await forceRenderEverything(page);
         return text || "";
       });
       if (ctrlAText) {
-        console.log(`[CTRL+A] Grabbed ${ctrlAText.length} chars`);
+        // Log price-like patterns found in ctrlA text for debugging
+        const priceMatches = ctrlAText.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
+        console.log(`[CTRL+A] Grabbed ${ctrlAText.length} chars${priceMatches ? `, PRICES FOUND: ${priceMatches.join(', ')}` : ', NO PRICES'}`);
+      } else {
+        console.log(`[CTRL+A] Empty — no text selected`);
       }
     } catch (e) {
       // Non-critical — if it fails we still have extractStructured data
@@ -3063,6 +3067,12 @@ specsText
     }
 
     // Нормализираме числата СЛЕД като сме извлекли контактите
+    // DEBUG: check if rawAll contains price patterns
+    const rawPriceMatches = rawAll.match(/€\s*\d+|\d+\s*€|\d+[\.,]\d{2}\s*(лв|лева|bgn|eur)/gi);
+    if (rawPriceMatches) {
+      console.log(`[PRICES-IN-RAW] ${rawPriceMatches.join(', ')}`);
+    }
+
 const content = normalizeNumbers(
 clean(
 rawAll
