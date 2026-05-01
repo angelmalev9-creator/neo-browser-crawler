@@ -47,11 +47,27 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
+// Safe evaluate with hard timeout — prevents hanging Promises inside page.evaluate
+async function safeEval(page, fn, arg, timeoutMs = 5000) {
+  return Promise.race([
+    typeof arg !== 'undefined' ? page.evaluate(fn, arg) : page.evaluate(fn),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('safeEval timeout')), timeoutMs))
+  ]);
+}
+
+// Safe page operation with timeout — wraps any async page call
+function withTimeout(promise, ms = 10000, label = 'operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms))
+  ]);
+}
+
 
 async function waitForHydrationSettled(page){
 try{
 
-await page.evaluate(
+await safeEval(page,
 (idleMs)=>new Promise(resolve=>{
 
 let timer;
@@ -75,10 +91,14 @@ attributes:true,
 characterData:true
 });
 
+// Hard safety: resolve after 4x idleMs regardless
+setTimeout(finish, idleMs * 4);
+
 reset();
 
 }),
-MUTATION_IDLE_MS
+MUTATION_IDLE_MS,
+10000  // 10s hard timeout for safeEval
 );
 
 }catch{}
@@ -2187,7 +2207,7 @@ async function expandHiddenContent(page) {
 
   try {
     // ── Фаза 1: accordions, tabs, details (без dialog) ────────────────────
-    await page.evaluate(async () => {
+    await withTimeout(page.evaluate(async () => {
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
       const isVisible = (el) => {
@@ -2277,7 +2297,7 @@ async function expandHiddenContent(page) {
       });
 
       await sleep(200);
-    });
+    }), 8000, 'expandHiddenContent-phase1');
 
     await page.waitForTimeout(200);
   } catch {}
@@ -3083,7 +3103,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
 
     // Smart wait: if the page has few visible elements, wait a bit more for SPA rendering
     try {
-      await page.evaluate(() => new Promise(resolve => {
+      await safeEval(page, () => new Promise(resolve => {
         let checks = 0;
         const maxChecks = 10;
         const check = () => {
@@ -3100,7 +3120,7 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
           }
         };
         check();
-      }));
+      }), undefined, 4000);  // 4s hard timeout
     } catch {}
     
 const getNetworkPayloads =
@@ -3293,7 +3313,15 @@ const standardLinks = await collectAllLinks(page, base);
 let buttonLinks = [];
 
 if (pageType === "general") {
-  buttonLinks = await discoverLinksViaButtons(page, base);
+  try {
+    buttonLinks = await withTimeout(
+      discoverLinksViaButtons(page, base),
+      8000,
+      'discoverLinksViaButtons'
+    );
+  } catch (e) {
+    console.error(`[DISCOVER] Timeout: ${e.message}`);
+  }
 
   const extraCount = buttonLinks.length;
   if (extraCount > 0) {
@@ -3463,7 +3491,16 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     // Use SELECTIVE nav link discovery — only header/footer/nav links
     const navLinks = await collectNavLinks(initPage, base);
     // Also get button-discovered links for SPAs
-    const initButtonLinks = await discoverLinksViaButtons(initPage, base);
+    let initButtonLinks = [];
+    try {
+      initButtonLinks = await withTimeout(
+        discoverLinksViaButtons(initPage, base),
+        8000,
+        'init discoverLinksViaButtons'
+      );
+    } catch (e) {
+      console.error(`[INIT] Button discovery timeout: ${e.message}`);
+    }
     const allInitialLinks = Array.from(new Set([...navLinks, ...initButtonLinks]));
 
     // Add homepage first
@@ -3522,7 +3559,18 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
         stats.visited++;
 
-        const result = await processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps);
+        let result;
+        try {
+          result = await withTimeout(
+            processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
+            25000,
+            `processPage(${item.url})`
+          );
+        } catch (e) {
+          console.error(`[PAGE] ✗ TIMEOUT ${item.url}: ${e.message}`);
+          // Page timed out — skip it and continue with next
+          continue;
+        }
 
         if (result.page) {
           // Collect contacts
