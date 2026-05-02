@@ -2365,8 +2365,17 @@ async function expandHiddenContent(page) {
       });
 
       // Dedupe and tag
-      const arr = Array.from(triggers).slice(0, 20);
-      return arr.map((el, i) => {
+      // ✅ FIX: Dedupe by text content (not just by element identity) and cap at 12
+      const seenTriggerTexts = new Set();
+      const deduped = [];
+      for (const el of triggers) {
+        const txt = (el.textContent || '').trim().slice(0, 60).toLowerCase();
+        if (!txt || txt.length < 2 || seenTriggerTexts.has(txt)) continue;
+        seenTriggerTexts.add(txt);
+        deduped.push(el);
+        if (deduped.length >= 12) break;
+      }
+      return deduped.map((el, i) => {
         el.setAttribute('data-crawler-trigger', String(i));
         return { idx: i, text: (el.textContent || '').trim().slice(0, 60) };
       });
@@ -2377,8 +2386,18 @@ async function expandHiddenContent(page) {
     }
 
     // Click each trigger, capture dialog/overlay content, close
+    // ✅ FIX: Time-budget the dialog loop — max 10s total, max 12 triggers, reduced waits
+    const DIALOG_BUDGET_MS = 10000;
+    const MAX_DIALOG_TRIGGERS = 12;
+    const dialogStartTime = Date.now();
     const collected = [];
-    for (const { idx, text: triggerText } of triggerTexts) {
+    const triggersToProcess = triggerTexts.slice(0, MAX_DIALOG_TRIGGERS);
+    for (const { idx, text: triggerText } of triggersToProcess) {
+      // ✅ FIX: Check time budget before each trigger
+      if (Date.now() - dialogStartTime > DIALOG_BUDGET_MS) {
+        console.log(`[DIALOG] Time budget exhausted (${DIALOG_BUDGET_MS}ms) — processed ${collected.length} dialogs, skipping remaining`);
+        break;
+      }
       try {
         // Remember DOM state before click
         const beforeDialogs = await page.evaluate(() => 
@@ -2390,7 +2409,7 @@ async function expandHiddenContent(page) {
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(500); // Wait for React/Vue re-render + animation
+        await page.waitForTimeout(350); // ✅ FIX: was 500ms → 350ms
 
         // Check if a new dialog/modal appeared
         const dialogText = await page.evaluate((beforeCount) => {
@@ -2447,7 +2466,7 @@ async function expandHiddenContent(page) {
           if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(200); // ✅ FIX: was 300ms → 200ms
       } catch {}
     }
 
@@ -3169,7 +3188,18 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    const dialogTexts = await expandHiddenContent(page);
+    // ✅ FIX: Wrap in withTimeout — expandHiddenContent must not exceed 15s,
+    // leaving room for the rest of processPage within the 25s budget.
+    let dialogTexts = '';
+    try {
+      dialogTexts = await withTimeout(
+        expandHiddenContent(page),
+        15000,
+        'expandHiddenContent'
+      );
+    } catch (e) {
+      console.log(`[DIALOG] expandHiddenContent timed out: ${e.message}`);
+    }
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
@@ -3563,7 +3593,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
         try {
           result = await withTimeout(
             processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-            25000,
+            35000,
             `processPage(${item.url})`
           );
         } catch (e) {
