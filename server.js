@@ -2365,7 +2365,7 @@ async function expandHiddenContent(page) {
       });
 
       // Dedupe and tag
-      // ✅ FIX: Dedupe by text content (not just by element identity) and cap at 12
+      // ✅ FIX: Dedupe by text content and cap at 12
       const seenTriggerTexts = new Set();
       const deduped = [];
       for (const el of triggers) {
@@ -3432,7 +3432,7 @@ async function waitForRealContent(page, url) {
   return false;
 }
 
-async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc = null) {
+async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   const effectiveMs = deadlineMs
     ? Math.min(deadlineMs, MAX_SECONDS * 1000)
     : MAX_SECONDS * 1000;
@@ -3457,23 +3457,22 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc 
     ],
   });
 
-  const stats = sharedAcc?.stats || {
+  const stats = {
     visited: 0,
     saved: 0,
     byType: {},
     errors: 0,
   };
 
-  // ✅ FIX: Use shared accumulator if provided, so HTTP handler can read partial results
-  const pages = sharedAcc?.pages || [];
+  const pages = [];
   const queue = [];       // [{url, depth}]
   const lowPriorityQueue = [];
-  const siteMaps = sharedAcc?.siteMaps || [];
-  const capabilitiesMaps = sharedAcc?.capabilitiesMaps || [];
+  const siteMaps = [];
+  const capabilitiesMaps = [];
   let base = "";
   let headerFooterText = ""; // captured once from homepage
 
-  const contactAgg = sharedAcc?.contactAgg || { emails: new Set(), phones: new Set() };
+  const contactAgg = { emails: new Set(), phones: new Set() };
 
   try {
     const initContext = await makeStealthContext(browser);
@@ -3482,7 +3481,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc 
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
-    if (sharedAcc) sharedAcc.base = base;
 
     // Capture header/footer text ONCE from homepage
     try {
@@ -3571,16 +3569,19 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc 
         // Enforce page limit
         if (stats.saved >= MAX_PAGES) break;
 
-        stats.visited++;
-
-        // ✅ FIX: Dynamic timeout — use whatever time is left until deadline,
-        // capped at 30s per page, min 8s. If less than 8s left, skip page.
+        // ✅ FIX: Check how much time is left. If less than 10s, stop crawling
+        // so we have time for post-processing (sitemap build, Supabase save etc.)
         const timeLeft = deadline - Date.now();
-        if (timeLeft < 8000) {
-          console.log(`[PAGE] ✗ SKIP ${item.url}: only ${Math.round(timeLeft/1000)}s left before deadline`);
+        if (timeLeft < 10000) {
+          console.log(`[PAGE] ✗ SKIP ${item.url}: only ${Math.round(timeLeft / 1000)}s left before deadline — stopping`);
           break;
         }
-        const pageTimeout = Math.min(Math.max(timeLeft - 3000, 8000), 30000);
+        // ✅ FIX: Dynamic page timeout — give this page at most (timeLeft - 8s),
+        // capped at 30s, min 8s. This ensures we always have ~8s for the next page
+        // or for post-processing.
+        const pageTimeout = Math.min(Math.max(timeLeft - 8000, 8000), 30000);
+
+        stats.visited++;
 
         let result;
         try {
@@ -3644,7 +3645,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc 
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    // ✅ FIX: Only do network ops if we have enough time left (>5s)
+    // ✅ FIX: Only do network ops if we have enough time (>5s)
     if (deadline - Date.now() > 5000) {
       await saveSiteMapToSupabase(combinedSiteMap);
       await sendSiteMapToWorker(combinedSiteMap);
@@ -3756,67 +3757,7 @@ http
         if (siteId) console.log("[SITE ID]", siteId);
         if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
 
-        // ✅ FIX: Shared accumulator — crawlSmart pushes pages here in real time.
-        // If we hit the response deadline, we can still return partial data.
-        const sharedAcc = {
-          pages: [],
-          siteMaps: [],
-          capabilitiesMaps: [],
-          contactAgg: { emails: new Set(), phones: new Set() },
-          stats: { visited: 0, saved: 0, byType: {}, errors: 0 },
-          base: '',
-        };
-
-        // ✅ FIX: Hard response deadline — we MUST reply before Edge Function dies.
-        const responseBudgetMs = deadlineMs
-          ? Math.max(deadlineMs - 8000, 15000)
-          : (MAX_SECONDS + 5) * 1000;
-
-        let result;
-        let timedOut = false;
-
-        try {
-          result = await Promise.race([
-            crawlSmart(parsed.url, siteId, deadlineMs, sharedAcc),
-            new Promise((_, reject) => setTimeout(() => {
-              timedOut = true;
-              reject(new Error(`Response deadline exceeded (${Math.round(responseBudgetMs / 1000)}s)`));
-            }, responseBudgetMs))
-          ]);
-        } catch (e) {
-          if (timedOut) {
-            // ✅ FIX: Build partial result from shared accumulator
-            console.log(`[DEADLINE] Response budget exhausted — returning ${sharedAcc.pages.length} pages collected so far`);
-
-            let combinedSiteMap = null;
-            if (sharedAcc.siteMaps.length > 0 && siteId) {
-              try {
-                const enriched = sharedAcc.siteMaps.map(raw => enrichSiteMap(raw, siteId, sharedAcc.base));
-                combinedSiteMap = buildCombinedSiteMap(enriched, siteId, sharedAcc.base);
-              } catch {}
-            }
-
-            let combinedCapabilities = [];
-            if (sharedAcc.capabilitiesMaps.length > 0) {
-              try {
-                combinedCapabilities = buildCombinedCapabilities(sharedAcc.capabilitiesMaps, sharedAcc.base);
-              } catch {}
-            }
-
-            result = {
-              pages: sharedAcc.pages,
-              stats: { ...sharedAcc.stats, partial: true },
-              siteMap: combinedSiteMap,
-              capabilities: combinedCapabilities,
-              contacts: {
-                emails: Array.from(sharedAcc.contactAgg.emails).filter(Boolean).slice(0, 20),
-                phones: Array.from(sharedAcc.contactAgg.phones).filter(Boolean).slice(0, 20),
-              },
-            };
-          } else {
-            throw e;
-          }
-        }
+        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
 
         crawlInProgress = false;
         crawlFinished = true;
