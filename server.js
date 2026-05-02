@@ -2386,20 +2386,16 @@ async function expandHiddenContent(page) {
     }
 
     // Click each trigger, capture dialog/overlay content, close
-    // ✅ FIX: Time-budget the dialog loop — max 10s total, max 12 triggers, reduced waits
+    // ✅ FIX: Time-budget the dialog loop — max 10s total, reduced waits
     const DIALOG_BUDGET_MS = 10000;
-    const MAX_DIALOG_TRIGGERS = 12;
     const dialogStartTime = Date.now();
     const collected = [];
-    const triggersToProcess = triggerTexts.slice(0, MAX_DIALOG_TRIGGERS);
-    for (const { idx, text: triggerText } of triggersToProcess) {
-      // ✅ FIX: Check time budget before each trigger
+    for (const { idx, text: triggerText } of triggerTexts) {
       if (Date.now() - dialogStartTime > DIALOG_BUDGET_MS) {
         console.log(`[DIALOG] Time budget exhausted (${DIALOG_BUDGET_MS}ms) — processed ${collected.length} dialogs, skipping remaining`);
         break;
       }
       try {
-        // Remember DOM state before click
         const beforeDialogs = await page.evaluate(() => 
           document.querySelectorAll('[role="dialog"],[data-state="open"],[class*="modal"],[class*="overlay"]').length
         );
@@ -2409,30 +2405,21 @@ async function expandHiddenContent(page) {
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(350); // ✅ FIX: was 500ms → 350ms
+        await page.waitForTimeout(350);
 
-        // Check if a new dialog/modal appeared
         const dialogText = await page.evaluate((beforeCount) => {
-          // Look for newly opened dialogs
           const dialogs = document.querySelectorAll(
             '[role="dialog"], [data-state="open"], [class*="modal"]:not([class*="modal-backdrop"]), ' +
             '.ReactModal__Content, [class*="dialog"], [class*="popup"]:not([class*="cookie"])'
           );
-          
-          // Also check for Radix portals (content rendered outside the card)
           const portals = document.querySelectorAll('[data-radix-portal], [data-radix-popper-content-wrapper]');
-          
           const allOverlays = [...dialogs, ...portals];
-          
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
-          
-          // Get text from the newest overlay
           const texts = [];
           allOverlays.forEach(el => {
             const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
             if (t && t.length > 20) texts.push(t);
           });
-          
           return texts.join('\n\n');
         }, beforeDialogs);
 
@@ -2441,11 +2428,8 @@ async function expandHiddenContent(page) {
           console.log(`[DIALOG] Captured ${dialogText.length} chars from trigger "${triggerText.slice(0, 30)}"`);
         }
 
-        // Close dialog — try multiple methods
         await page.evaluate(() => {
-          // Method 1: Escape key
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-          // Method 2: Click close button
           const closeSelectors = [
             '[role="dialog"] button[aria-label*="close" i]',
             '[role="dialog"] button[aria-label*="Close" i]',
@@ -2461,12 +2445,11 @@ async function expandHiddenContent(page) {
               if (btn) { btn.click(); return; }
             } catch {}
           }
-          // Method 3: Click overlay backdrop
           const backdrop = document.querySelector('[class*="backdrop"], [class*="overlay"][role="presentation"]');
           if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(200); // ✅ FIX: was 300ms → 200ms
+        await page.waitForTimeout(200);
       } catch {}
     }
 
@@ -3188,8 +3171,7 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    // ✅ FIX: Wrap in withTimeout — expandHiddenContent must not exceed 15s,
-    // leaving room for the rest of processPage within the 25s budget.
+    // ✅ FIX: Wrap in withTimeout to prevent blowing the page budget
     let dialogTexts = '';
     try {
       dialogTexts = await withTimeout(
@@ -3450,7 +3432,7 @@ async function waitForRealContent(page, url) {
   return false;
 }
 
-async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
+async function crawlSmart(startUrl, siteId = null, deadlineMs = null, sharedAcc = null) {
   const effectiveMs = deadlineMs
     ? Math.min(deadlineMs, MAX_SECONDS * 1000)
     : MAX_SECONDS * 1000;
@@ -3475,22 +3457,23 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     ],
   });
 
-  const stats = {
+  const stats = sharedAcc?.stats || {
     visited: 0,
     saved: 0,
     byType: {},
     errors: 0,
   };
 
-  const pages = [];
+  // ✅ FIX: Use shared accumulator if provided, so HTTP handler can read partial results
+  const pages = sharedAcc?.pages || [];
   const queue = [];       // [{url, depth}]
   const lowPriorityQueue = [];
-  const siteMaps = [];
-  const capabilitiesMaps = [];
+  const siteMaps = sharedAcc?.siteMaps || [];
+  const capabilitiesMaps = sharedAcc?.capabilitiesMaps || [];
   let base = "";
   let headerFooterText = ""; // captured once from homepage
 
-  const contactAgg = { emails: new Set(), phones: new Set() };
+  const contactAgg = sharedAcc?.contactAgg || { emails: new Set(), phones: new Set() };
 
   try {
     const initContext = await makeStealthContext(browser);
@@ -3499,6 +3482,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
+    if (sharedAcc) sharedAcc.base = base;
 
     // Capture header/footer text ONCE from homepage
     try {
@@ -3589,11 +3573,20 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
         stats.visited++;
 
+        // ✅ FIX: Dynamic timeout — use whatever time is left until deadline,
+        // capped at 30s per page, min 8s. If less than 8s left, skip page.
+        const timeLeft = deadline - Date.now();
+        if (timeLeft < 8000) {
+          console.log(`[PAGE] ✗ SKIP ${item.url}: only ${Math.round(timeLeft/1000)}s left before deadline`);
+          break;
+        }
+        const pageTimeout = Math.min(Math.max(timeLeft - 3000, 8000), 30000);
+
         let result;
         try {
           result = await withTimeout(
             processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-            35000,
+            pageTimeout,
             `processPage(${item.url})`
           );
         } catch (e) {
@@ -3641,6 +3634,9 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages (max ${MAX_PAGES})`);
   }
 
+  const postCrawlTimeLeft = deadline - Date.now();
+  console.log(`[POST-CRAWL] ${Math.round(postCrawlTimeLeft / 1000)}s left for post-processing`);
+
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
@@ -3648,8 +3644,13 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap);
+    // ✅ FIX: Only do network ops if we have enough time left (>5s)
+    if (deadline - Date.now() > 5000) {
+      await saveSiteMapToSupabase(combinedSiteMap);
+      await sendSiteMapToWorker(combinedSiteMap);
+    } else {
+      console.log(`[SITEMAP] Skipping Supabase/Worker save — only ${Math.round((deadline - Date.now()) / 1000)}s left`);
+    }
   }
 
   let combinedCapabilities = [];
@@ -3755,7 +3756,67 @@ http
         if (siteId) console.log("[SITE ID]", siteId);
         if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
 
-        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
+        // ✅ FIX: Shared accumulator — crawlSmart pushes pages here in real time.
+        // If we hit the response deadline, we can still return partial data.
+        const sharedAcc = {
+          pages: [],
+          siteMaps: [],
+          capabilitiesMaps: [],
+          contactAgg: { emails: new Set(), phones: new Set() },
+          stats: { visited: 0, saved: 0, byType: {}, errors: 0 },
+          base: '',
+        };
+
+        // ✅ FIX: Hard response deadline — we MUST reply before Edge Function dies.
+        const responseBudgetMs = deadlineMs
+          ? Math.max(deadlineMs - 8000, 15000)
+          : (MAX_SECONDS + 5) * 1000;
+
+        let result;
+        let timedOut = false;
+
+        try {
+          result = await Promise.race([
+            crawlSmart(parsed.url, siteId, deadlineMs, sharedAcc),
+            new Promise((_, reject) => setTimeout(() => {
+              timedOut = true;
+              reject(new Error(`Response deadline exceeded (${Math.round(responseBudgetMs / 1000)}s)`));
+            }, responseBudgetMs))
+          ]);
+        } catch (e) {
+          if (timedOut) {
+            // ✅ FIX: Build partial result from shared accumulator
+            console.log(`[DEADLINE] Response budget exhausted — returning ${sharedAcc.pages.length} pages collected so far`);
+
+            let combinedSiteMap = null;
+            if (sharedAcc.siteMaps.length > 0 && siteId) {
+              try {
+                const enriched = sharedAcc.siteMaps.map(raw => enrichSiteMap(raw, siteId, sharedAcc.base));
+                combinedSiteMap = buildCombinedSiteMap(enriched, siteId, sharedAcc.base);
+              } catch {}
+            }
+
+            let combinedCapabilities = [];
+            if (sharedAcc.capabilitiesMaps.length > 0) {
+              try {
+                combinedCapabilities = buildCombinedCapabilities(sharedAcc.capabilitiesMaps, sharedAcc.base);
+              } catch {}
+            }
+
+            result = {
+              pages: sharedAcc.pages,
+              stats: { ...sharedAcc.stats, partial: true },
+              siteMap: combinedSiteMap,
+              capabilities: combinedCapabilities,
+              contacts: {
+                emails: Array.from(sharedAcc.contactAgg.emails).filter(Boolean).slice(0, 20),
+                phones: Array.from(sharedAcc.contactAgg.phones).filter(Boolean).slice(0, 20),
+              },
+            };
+          } else {
+            throw e;
+          }
+        }
 
         crawlInProgress = false;
         crawlFinished = true;
