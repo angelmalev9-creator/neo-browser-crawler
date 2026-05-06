@@ -1139,6 +1139,58 @@ function guessVendorFromText(s = "") {
   return "unknown";
 }
 
+// ================= CMS DETECTION (one-shot, on homepage) =================
+// Reads <meta name="generator"> first (most authoritative), then falls back
+// to a few rock-solid HTML/DOM markers. Returns short lowercase string or "unknown".
+async function detectCms(page) {
+  try {
+    return await page.evaluate(() => {
+      // 1) <meta name="generator"> — the canonical signal
+      const gen = (document.querySelector('meta[name="generator"]')?.content || '').toLowerCase();
+      if (gen) {
+        if (gen.includes('wordpress')) return 'wordpress';
+        if (gen.includes('shopify'))   return 'shopify';
+        if (gen.includes('wix'))       return 'wix';
+        if (gen.includes('squarespace')) return 'squarespace';
+        if (gen.includes('webflow'))   return 'webflow';
+        if (gen.includes('drupal'))    return 'drupal';
+        if (gen.includes('joomla'))    return 'joomla';
+        if (gen.includes('ghost'))     return 'ghost';
+        if (gen.includes('hubspot'))   return 'hubspot';
+        if (gen.includes('typo3'))     return 'typo3';
+        if (gen.includes('prestashop')) return 'prestashop';
+        if (gen.includes('magento'))   return 'magento';
+        if (gen.includes('blogger'))   return 'blogger';
+        if (gen.includes('weebly'))    return 'weebly';
+        if (gen.includes('duda'))      return 'duda';
+        if (gen.includes('framer'))    return 'framer';
+        if (gen.includes('tilda'))     return 'tilda';
+        if (gen.includes('bitrix'))    return 'bitrix';
+        // unknown generator — return its first token rather than discard
+        return gen.split(/[\s/]+/)[0].slice(0, 40) || 'unknown';
+      }
+
+      // 2) Hard DOM/HTML fallbacks (only the really reliable ones)
+      const html = document.documentElement.outerHTML;
+      if (/wp-content\/|wp-includes\/|\/wp-json\//.test(html)) return 'wordpress';
+      if (window.Shopify || /cdn\.shopify\.com|myshopify\.com/.test(html)) return 'shopify';
+      if (/static\.parastorage\.com|wix\.com/.test(html))     return 'wix';
+      if (/squarespace\.com|static1\.squarespace/.test(html)) return 'squarespace';
+      if (/assets\.website-files\.com/.test(html) || document.documentElement.getAttribute('data-wf-site')) return 'webflow';
+      if (/sites\/default\/files\/|drupal-settings-json/.test(html)) return 'drupal';
+      if (/\/media\/jui\/|\/templates\/system\//.test(html))  return 'joomla';
+      if (/framerusercontent\.com/.test(html))                return 'framer';
+      if (/static\.tildacdn\.com|tildacdn\.com/.test(html))   return 'tilda';
+      if (window.__NEXT_DATA__ || /_next\/static\//.test(html)) return 'nextjs';
+      if (window.__NUXT__ || /\/_nuxt\//.test(html))          return 'nuxt';
+
+      return 'unknown';
+    });
+  } catch {
+    return 'unknown';
+  }
+}
+
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
@@ -3471,6 +3523,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   const capabilitiesMaps = [];
   let base = "";
   let headerFooterText = ""; // captured once from homepage
+  let cms = "unknown";        // detected once from homepage
 
   const contactAgg = { emails: new Set(), phones: new Set() };
 
@@ -3499,6 +3552,14 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
       });
       console.log(`[INIT] Captured ${headerFooterText.length} chars of header/footer text (once)`);
     } catch {}
+
+    // Detect CMS once on homepage (cheap, ~5–20ms)
+    try {
+      cms = await detectCms(initPage);
+      console.log(`[CMS] Detected: ${cms}`);
+    } catch (e) {
+      console.log(`[CMS] Detection failed: ${e.message}`);
+    }
 
     // Use SELECTIVE nav link discovery — only header/footer/nav links
     const navLinks = await collectNavLinks(initPage, base);
@@ -3669,7 +3730,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts, cms };
 }
 
 // ================= HTTP SERVER =================
