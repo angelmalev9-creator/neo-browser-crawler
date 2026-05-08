@@ -940,34 +940,16 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-const pickFeatures = (root) => {
-  const items = [];
-
-  root.querySelectorAll("li").forEach(li => {
-    const t = getText(li);
-    if (!t) return;
-    if (t.length < 3 || t.length > 140) return;
-
-    // Detect excluded / disabled items
-    const cls = (li.className || "").toLowerCase();
-    const html = (li.innerHTML || "").toLowerCase();
-    const text = t.toLowerCase();
-
-    const excluded =
-      /not included|не е включено|excluded|disabled|unavailable/.test(text) ||
-      /line-through|opacity|disabled|excluded|inactive/.test(cls) ||
-      /fa-times|fa-xmark|icon-x|icon-close|cross|cancel|times/.test(html) ||
-      li.querySelector(
-        '[class*="x"],[class*="close"],[class*="times"],[class*="cross"],[data-state="unchecked"]'
-      );
-
-    if (excluded) return;
-
-    items.push(t);
-  });
-
-  return Array.from(new Set(items)).slice(0, 30);
-};
+    const pickFeatures = (root) => {
+      const items = [];
+      root.querySelectorAll("li").forEach(li => {
+        const t = getText(li);
+        if (!t) return;
+        if (t.length < 3 || t.length > 140) return;
+        items.push(t);
+      });
+      return Array.from(new Set(items)).slice(0, 30);
+    };
 
     const pickPeriod = (root) => {
       const t = getText(root);
@@ -2488,11 +2470,185 @@ for (const el of triggers) {
           
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
           
-          // Get text from the newest overlay
+          // ── NEO FIX: Structured extraction — detect included vs excluded items ──
+          // Instead of plain innerText, walk the DOM to find list items with
+          // checkmarks (✓/✔/☑) vs crosses (✕/✗/✘/☒) or visual indicators
+          // (green=included, gray/red=excluded, opacity, line-through, etc.)
+          function extractStructuredDialogContent(container) {
+            const lines = [];
+            
+            // Find the dialog title/heading
+            const heading = container.querySelector('h1, h2, h3, h4, [class*="title"], [class*="heading"], [class*="header"]');
+            if (heading) {
+              const headingText = (heading.innerText || heading.textContent || '').trim();
+              if (headingText) lines.push(headingText);
+            }
+            
+            // Find all list-like sections (groups of items)
+            const sections = container.querySelectorAll('[class*="section"], [class*="category"], [class*="group"], [class*="block"], [class*="feature"], [class*="spec"]');
+            const processedEls = new Set();
+            
+            function isExcluded(el) {
+              // Check multiple signals that an item is NOT included:
+              const style = window.getComputedStyle(el);
+              // 1. Opacity < 0.6 (grayed out)
+              if (parseFloat(style.opacity) < 0.6) return true;
+              // 2. Text decoration line-through
+              if (style.textDecoration.includes('line-through')) return true;
+              // 3. Color is gray-ish (RGB all between 130-200, i.e. not pure black/dark)
+              const color = style.color;
+              const rgbMatch = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+              if (rgbMatch) {
+                const [, r, g, b] = rgbMatch.map(Number);
+                if (r > 140 && g > 140 && b > 140) return true; // light gray
+              }
+              // 4. Check for X/cross SVG icon or Unicode
+              const svgInEl = el.querySelector('svg');
+              if (svgInEl) {
+                const svgClass = (svgInEl.getAttribute('class') || '').toLowerCase();
+                const svgHTML = svgInEl.innerHTML || '';
+                // X icon: typically has diagonal lines (no circle/check path)
+                if (svgClass.includes('x') || svgClass.includes('cross') || svgClass.includes('close') || svgClass.includes('times')) return true;
+                // Check SVG path data for X pattern (two diagonal lines)
+                if (/M\s*\d.*L\s*\d.*M\s*\d.*L\s*\d/i.test(svgHTML) && !/circle|check|polyline/i.test(svgHTML)) {
+                  // Heuristic: if SVG has 2 lines but no check/circle, it's likely an X
+                }
+              }
+              // 5. Check for CSS class indicators
+              const cls = (el.getAttribute('class') || '') + ' ' + (el.parentElement?.getAttribute('class') || '');
+              if (/\b(excluded|disabled|unavailable|not-included|inactive|muted|dimmed)\b/i.test(cls)) return true;
+              // 6. Check for data attributes
+              if (el.getAttribute('data-included') === 'false' || el.getAttribute('data-available') === 'false') return true;
+              return false;
+            }
+            
+            function isIncluded(el) {
+              // Check for explicit inclusion signals
+              const cls = (el.getAttribute('class') || '') + ' ' + (el.parentElement?.getAttribute('class') || '');
+              if (/\b(included|active|available|enabled)\b/i.test(cls)) return true;
+              // Green color
+              const style = window.getComputedStyle(el);
+              const color = style.color;
+              const rgbMatch = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+              if (rgbMatch) {
+                const [, r, g, b] = rgbMatch.map(Number);
+                if (g > 120 && g > r * 1.3 && g > b * 1.3) return true; // greenish
+              }
+              return false;
+            }
+            
+            function getItemStatus(itemEl) {
+              // Check the item itself and its icon/badge child
+              const iconEl = itemEl.querySelector('svg, [class*="icon"], [class*="check"], [class*="badge"]');
+              const parentRow = itemEl.closest('[class*="row"], [class*="item"], [class*="feature"], li, tr');
+              const checkEl = parentRow || itemEl;
+              
+              if (isExcluded(checkEl)) return 'excluded';
+              if (iconEl && isExcluded(iconEl)) return 'excluded';
+              
+              // Check for Unicode check/cross marks in text
+              const fullText = (checkEl.innerText || checkEl.textContent || '');
+              if (/^[\s]*[✕✗✘☒✖✖✗✘×❌]\s/.test(fullText)) return 'excluded';
+              if (/^[\s]*[✓✔☑✅]\s/.test(fullText)) return 'included';
+              
+              // Check icon color
+              if (iconEl) {
+                const iconStyle = window.getComputedStyle(iconEl);
+                const iconColor = iconStyle.color;
+                const rgbMatch = iconColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                if (rgbMatch) {
+                  const [, r, g, b] = rgbMatch.map(Number);
+                  if (g > 120 && g > r * 1.3 && g > b * 1.3) return 'included'; // green icon
+                  if (r > 140 && g > 140 && b > 140) return 'excluded'; // gray icon
+                  if (r > 180 && g < 100 && b < 100) return 'excluded'; // red icon
+                }
+              }
+              
+              if (isIncluded(checkEl)) return 'included';
+              return 'unknown';
+            }
+            
+            // Process sections
+            function processContainer(cont) {
+              // Find section heading
+              const sectionHead = cont.querySelector('h3, h4, h5, [class*="title"], [class*="heading"], [class*="label"]');
+              let sectionTitle = '';
+              if (sectionHead && !processedEls.has(sectionHead)) {
+                sectionTitle = (sectionHead.innerText || sectionHead.textContent || '').trim();
+                processedEls.add(sectionHead);
+              }
+              
+              // Find the included/excluded badge for this section
+              const badge = cont.querySelector('[class*="badge"], [class*="tag"], [class*="status"], [class*="label"]');
+              let sectionStatus = '';
+              if (badge) {
+                const badgeText = (badge.innerText || badge.textContent || '').trim().toLowerCase();
+                if (badgeText === 'включено' || badgeText === 'included') sectionStatus = 'Включено';
+                if (badgeText === 'не е включено' || badgeText === 'not included' || badgeText === 'не включва') sectionStatus = 'Не е включено';
+              }
+              
+              if (sectionTitle || sectionStatus) {
+                lines.push(`${sectionTitle}${sectionStatus ? '\n' + sectionStatus : ''}`);
+              }
+              
+              // Find list items
+              const items = cont.querySelectorAll('li, [class*="item"]:not([class*="section"]):not([class*="group"]), [class*="row"], [class*="spec"]');
+              items.forEach(item => {
+                if (processedEls.has(item)) return;
+                const text = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!text || text.length < 3 || text.length > 200) return;
+                // Skip if it's actually a section header we already processed
+                if (item === sectionHead || item === badge) return;
+                processedEls.add(item);
+                
+                const status = getItemStatus(item);
+                if (status === 'included') {
+                  lines.push(`✓ ${text}`);
+                } else if (status === 'excluded') {
+                  lines.push(`✗ ${text} (не е включено)`);
+                } else {
+                  lines.push(text);
+                }
+              });
+            }
+            
+            if (sections.length > 0) {
+              sections.forEach(s => processContainer(s));
+            }
+            
+            // If no structured sections found, fall back to enhanced innerText
+            if (lines.length <= 1) {
+              // Still try to detect items with check/cross marks at the container level
+              const allItems = container.querySelectorAll('li, [class*="item"], [class*="row"], [class*="feature"], [class*="spec"]');
+              if (allItems.length > 0) {
+                allItems.forEach(item => {
+                  if (processedEls.has(item)) return;
+                  const text = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (!text || text.length < 3 || text.length > 200) return;
+                  processedEls.add(item);
+                  const status = getItemStatus(item);
+                  if (status === 'included') {
+                    lines.push(`✓ ${text}`);
+                  } else if (status === 'excluded') {
+                    lines.push(`✗ ${text} (не е включено)`);
+                  } else {
+                    lines.push(text);
+                  }
+                });
+              } else {
+                // Pure fallback: plain text
+                const t = (container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t && t.length > 20) lines.push(t);
+              }
+            }
+            
+            return lines.join('\n');
+          }
+          
           const texts = [];
           allOverlays.forEach(el => {
-            const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length > 20) texts.push(t);
+            const structured = extractStructuredDialogContent(el);
+            if (structured && structured.length > 20) texts.push(structured);
           });
           
           return texts.join('\n\n');
