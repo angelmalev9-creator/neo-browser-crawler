@@ -940,16 +940,50 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-    const pickFeatures = (root) => {
-      const items = [];
-      root.querySelectorAll("li").forEach(li => {
-        const t = getText(li);
-        if (!t) return;
-        if (t.length < 3 || t.length > 140) return;
-        items.push(t);
-      });
-      return Array.from(new Set(items)).slice(0, 30);
-    };
+const pickFeatures = (root) => {
+  const items = [];
+
+  root.querySelectorAll("li").forEach(li => {
+    const t = getText(li);
+
+    if (!t) return;
+    if (t.length < 3 || t.length > 140) return;
+
+    const style = window.getComputedStyle(li);
+
+    const opacity = parseFloat(style.opacity || "1");
+    const color = (style.color || "").toLowerCase();
+
+    const cls = (li.className || "").toLowerCase();
+    const html = (li.innerHTML || "").toLowerCase();
+
+    // Detect grey / disabled rows
+    const isGrey =
+      opacity < 0.85 ||
+      /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(color) ||
+      /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(color);
+
+    // Detect X icons / disabled states
+    const excluded =
+      isGrey ||
+      /not included|не е включено|excluded|disabled|inactive|unavailable/i.test(t) ||
+      /line-through|disabled|excluded|inactive/i.test(cls) ||
+      /fa-times|fa-xmark|icon-x|icon-close|cross|cancel|times/i.test(html) ||
+      li.querySelector(`
+        [class*="x"],
+        [class*="close"],
+        [class*="times"],
+        [class*="cross"],
+        [data-state="unchecked"]
+      `);
+
+    if (excluded) return;
+
+    items.push(t);
+  });
+
+  return Array.from(new Set(items)).slice(0, 30);
+};
 
     const pickPeriod = (root) => {
       const t = getText(root);
