@@ -2384,41 +2384,20 @@ async function expandHiddenContent(page) {
       // Dedupe and tag
       // ✅ NEO FIX: Dedupe by text + DOM position. Buttons with same text (e.g. 3× "Вижте детайли")
       // in different positions on the page open DIFFERENT dialogs and must be kept.
-const seenTriggerKeys = new Set();
-const deduped = [];
-
-for (const el of triggers) {
-  const txt = (el.textContent || '')
-    .trim()
-    .replace(/\s+/g, ' ')
-    .slice(0, 80)
-    .toLowerCase();
-
-  if (!txt || txt.length < 2) continue;
-
-  const rect = el.getBoundingClientRect();
-
-  // REAL spatial fingerprint:
-  // same text + different X/Y position = different trigger
-  // fixes pricing cards in horizontal grids
-  const x = Math.round(rect.left);
-  const y = Math.round(rect.top);
-  const w = Math.round(rect.width);
-  const h = Math.round(rect.height);
-
-  // Extra DOM context so rerendered buttons don't collide
-  const parentTag =
-    el.parentElement?.tagName?.toLowerCase() || '';
-
-  const key = `${txt}::${x}::${y}::${w}::${h}::${parentTag}`;
-
-  if (seenTriggerKeys.has(key)) continue;
-
-  seenTriggerKeys.add(key);
-  deduped.push(el);
-
-  if (deduped.length >= 20) break;
-}
+      const seenTriggerKeys = new Set();
+      const deduped = [];
+      for (const el of triggers) {
+        const txt = (el.textContent || '').trim().slice(0, 60).toLowerCase();
+        if (!txt || txt.length < 2) continue;
+        // Use bounding rect Y position (rounded to 50px) as spatial key
+        const rect = el.getBoundingClientRect();
+        const posKey = `${Math.round(rect.top / 50)}`;
+        const key = `${txt}::${posKey}`;
+        if (seenTriggerKeys.has(key)) continue;
+        seenTriggerKeys.add(key);
+        deduped.push(el);
+        if (deduped.length >= 15) break;
+      }
       return deduped.map((el, i) => {
         el.setAttribute('data-crawler-trigger', String(i));
         return { idx: i, text: (el.textContent || '').trim().slice(0, 60) };
