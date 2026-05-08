@@ -47,6 +47,30 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
+// ── NEO FIX: Strip repeated footer/nav/boilerplate from page content ──
+// Removes everything after the TOP_CONTROLS marker (site-wide nav/footer).
+// Also deduplicates paragraph-level blocks within a single page.
+function stripFooterAndDedup(rawText) {
+  if (!rawText) return rawText;
+  // 1. Remove footer: everything from TOP_CONTROLS onward is nav/footer boilerplate
+  const footerIdx = rawText.indexOf('TOP_CONTROLS');
+  let main = footerIdx > 0 ? rawText.slice(0, footerIdx) : rawText;
+  // 2. Within-page dedup: many CMS repeat the entire body text (breadcrumb zone etc.)
+  //    Split into paragraph-like blocks, keep only first occurrence
+  const lines = main.split('\n');
+  const seen = new Set();
+  const deduped = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Short lines (<40 chars) are kept as-is (headings, labels)
+    if (trimmed.length < 40) { deduped.push(line); continue; }
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    deduped.push(line);
+  }
+  return deduped.join('\n');
+}
+
 // Safe evaluate with hard timeout — prevents hanging Promises inside page.evaluate
 async function safeEval(page, fn, arg, timeoutMs = 5000) {
   return Promise.race([
@@ -2365,15 +2389,22 @@ async function expandHiddenContent(page) {
       });
 
       // Dedupe and tag
-      // ✅ FIX: Dedupe by text content (not just by element identity) and cap at 12
-      const seenTriggerTexts = new Set();
+      // ✅ NEO FIX: Don't dedupe by text alone — buttons with same text in different
+      // cards (e.g. 3× "Вижте детайли") open DIFFERENT dialogs. Instead, dedupe by
+      // text+parent context: same text is allowed if buttons are in different containers.
+      const seenTriggerKeys = new Set();
       const deduped = [];
       for (const el of triggers) {
         const txt = (el.textContent || '').trim().slice(0, 60).toLowerCase();
-        if (!txt || txt.length < 2 || seenTriggerTexts.has(txt)) continue;
-        seenTriggerTexts.add(txt);
+        if (!txt || txt.length < 2) continue;
+        // Build a context key: text + closest card/section heading or index
+        const card = el.closest('[class*="card"],[class*="pricing"],[class*="package"],[class*="plan"],[class*="tier"],[class*="offer"],[class*="product"],[class*="item"],[class*="service"]');
+        const cardHeading = card ? (card.querySelector('h1,h2,h3,h4,h5,h6,[class*="title"],[class*="name"],[class*="heading"]')?.textContent || '').trim().slice(0, 40) : '';
+        const key = cardHeading ? `${txt}::${cardHeading.toLowerCase()}` : txt;
+        if (seenTriggerKeys.has(key)) continue;
+        seenTriggerKeys.add(key);
         deduped.push(el);
-        if (deduped.length >= 12) break;
+        if (deduped.length >= 15) break;  // increased from 12 to 15
       }
       return deduped.map((el, i) => {
         el.setAttribute('data-crawler-trigger', String(i));
@@ -2386,14 +2417,14 @@ async function expandHiddenContent(page) {
     }
 
     // Click each trigger, capture dialog/overlay content, close
-    // ✅ FIX: Time-budget the dialog loop — max 10s total, max 12 triggers, reduced waits
-    const DIALOG_BUDGET_MS = 10000;
-    const MAX_DIALOG_TRIGGERS = 12;
+    // ✅ NEO FIX: Increased budget, better close detection, content dedup
+    const DIALOG_BUDGET_MS = 15000;  // was 10s, now 15s — more time for multiple dialogs
+    const MAX_DIALOG_TRIGGERS = 15;
     const dialogStartTime = Date.now();
     const collected = [];
+    const seenDialogTexts = new Set();  // dedup identical dialog content
     const triggersToProcess = triggerTexts.slice(0, MAX_DIALOG_TRIGGERS);
     for (const { idx, text: triggerText } of triggersToProcess) {
-      // ✅ FIX: Check time budget before each trigger
       if (Date.now() - dialogStartTime > DIALOG_BUDGET_MS) {
         console.log(`[DIALOG] Time budget exhausted (${DIALOG_BUDGET_MS}ms) — processed ${collected.length} dialogs, skipping remaining`);
         break;
@@ -2409,43 +2440,40 @@ async function expandHiddenContent(page) {
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(350); // ✅ FIX: was 500ms → 350ms
+        await page.waitForTimeout(400);
 
         // Check if a new dialog/modal appeared
         const dialogText = await page.evaluate((beforeCount) => {
-          // Look for newly opened dialogs
           const dialogs = document.querySelectorAll(
             '[role="dialog"], [data-state="open"], [class*="modal"]:not([class*="modal-backdrop"]), ' +
             '.ReactModal__Content, [class*="dialog"], [class*="popup"]:not([class*="cookie"])'
           );
-          
-          // Also check for Radix portals (content rendered outside the card)
           const portals = document.querySelectorAll('[data-radix-portal], [data-radix-popper-content-wrapper]');
-          
           const allOverlays = [...dialogs, ...portals];
-          
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
-          
-          // Get text from the newest overlay
           const texts = [];
           allOverlays.forEach(el => {
             const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
             if (t && t.length > 20) texts.push(t);
           });
-          
           return texts.join('\n\n');
         }, beforeDialogs);
 
         if (dialogText && dialogText.length > 20) {
-          collected.push(dialogText);
-          console.log(`[DIALOG] Captured ${dialogText.length} chars from trigger "${triggerText.slice(0, 30)}"`);
+          // Dedup: skip if we already captured nearly identical content
+          const sig = dialogText.slice(0, 100).toLowerCase();
+          if (!seenDialogTexts.has(sig)) {
+            seenDialogTexts.add(sig);
+            collected.push(dialogText);
+            console.log(`[DIALOG] Captured ${dialogText.length} chars from trigger "${triggerText.slice(0, 30)}"`);
+          }
         }
 
-        // Close dialog — try multiple methods
+        // Close dialog — try multiple methods, then WAIT for it to close
         await page.evaluate(() => {
           // Method 1: Escape key
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-          // Method 2: Click close button
+          // Method 2: Click close button (expanded selectors)
           const closeSelectors = [
             '[role="dialog"] button[aria-label*="close" i]',
             '[role="dialog"] button[aria-label*="Close" i]',
@@ -2454,6 +2482,10 @@ async function expandHiddenContent(page) {
             '[class*="modal"] button[class*="close"]',
             '[role="dialog"] button:first-child',
             'button[data-dismiss="modal"]',
+            // Radix close buttons
+            '[data-radix-portal] button[aria-label*="close" i]',
+            '[data-radix-portal] button:has(svg)',  // icon-only close buttons
+            '[class*="dialog"] button[class*="close"]',
           ];
           for (const sel of closeSelectors) {
             try {
@@ -2466,7 +2498,18 @@ async function expandHiddenContent(page) {
           if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(200); // ✅ FIX: was 300ms → 200ms
+        // Wait for dialog to actually close before clicking next trigger
+        await page.waitForTimeout(300);
+        // Verify dialog closed
+        try {
+          await page.evaluate(() => {
+            const still = document.querySelector('[role="dialog"],[data-state="open"],[class*="modal"]:not([style*="display: none"])');
+            if (still) {
+              document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            }
+          });
+          await page.waitForTimeout(150);
+        } catch {}
       } catch {}
     }
 
@@ -3275,7 +3318,7 @@ getNetworkPayloads();
    // SINGLE-PASS EXTRACTION PIPELINE (merge everything once, no second parsing passes)
 const rawAll=[
 
-data.rawContent,
+stripFooterAndDedup(data.rawContent),
 
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
@@ -3650,6 +3693,36 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     await saveSiteMapToSupabase(combinedSiteMap);
     await sendSiteMapToWorker(combinedSiteMap);
+  }
+
+  // ── NEO FIX: Condense portfolio/project/gallery pages ──
+  // Instead of 30+ near-identical pages (each with only title+area),
+  // merge them into 1 compact summary page. Saves ~24K chars.
+  const portfolioRe = /\/(proekt\/|project\/|zavursheni-proekti\/|completed|portfolio\/|gallery\/|galerie\/|galleria\/|galeria\/)/i;
+  const portfolioPages = pages.filter(p => portfolioRe.test(p.url));
+  if (portfolioPages.length >= 5) {
+    // Extract just the essential info from each
+    const compactLines = portfolioPages.map(p => {
+      const name = (p.title || '').replace(/^.*\|/, '').trim() || p.url.split('/').pop();
+      // Extract area/size if present
+      const areaMatch = (p.content || '').match(/(\d+)\s*кв\.?\s*м/);
+      const area = areaMatch ? ` — ${areaMatch[1]} кв.м.` : '';
+      return `${name}${area}`;
+    });
+    // Remove portfolio pages and add single compact page
+    const nonPortfolio = pages.filter(p => !portfolioRe.test(p.url));
+    pages.length = 0;
+    pages.push(...nonPortfolio);
+    pages.push({
+      url: portfolioPages[0].url.replace(/\/[^/]+$/, ''),
+      title: 'Проекти и завършени обекти (обобщено)',
+      pageType: 'general',
+      content: `ПРОЕКТИ И ЗАВЪРШЕНИ ОБЕКТИ (${portfolioPages.length} бр.):\n${compactLines.join('\n')}`,
+      structured: { pricing: null, contacts: { emails: [], phones: [] }, product_specs: null },
+      wordCount: compactLines.join(' ').split(/\s+/).length,
+      status: 'ok',
+    });
+    console.log(`[OPTIMIZE] Condensed ${portfolioPages.length} portfolio pages → 1 compact page`);
   }
 
   let combinedCapabilities = [];
