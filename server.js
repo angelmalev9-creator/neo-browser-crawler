@@ -1139,58 +1139,6 @@ function guessVendorFromText(s = "") {
   return "unknown";
 }
 
-// ================= CMS DETECTION (one-shot, on homepage) =================
-// Reads <meta name="generator"> first (most authoritative), then falls back
-// to a few rock-solid HTML/DOM markers. Returns short lowercase string or "unknown".
-async function detectCms(page) {
-  try {
-    return await page.evaluate(() => {
-      // 1) <meta name="generator"> — the canonical signal
-      const gen = (document.querySelector('meta[name="generator"]')?.content || '').toLowerCase();
-      if (gen) {
-        if (gen.includes('wordpress')) return 'wordpress';
-        if (gen.includes('shopify'))   return 'shopify';
-        if (gen.includes('wix'))       return 'wix';
-        if (gen.includes('squarespace')) return 'squarespace';
-        if (gen.includes('webflow'))   return 'webflow';
-        if (gen.includes('drupal'))    return 'drupal';
-        if (gen.includes('joomla'))    return 'joomla';
-        if (gen.includes('ghost'))     return 'ghost';
-        if (gen.includes('hubspot'))   return 'hubspot';
-        if (gen.includes('typo3'))     return 'typo3';
-        if (gen.includes('prestashop')) return 'prestashop';
-        if (gen.includes('magento'))   return 'magento';
-        if (gen.includes('blogger'))   return 'blogger';
-        if (gen.includes('weebly'))    return 'weebly';
-        if (gen.includes('duda'))      return 'duda';
-        if (gen.includes('framer'))    return 'framer';
-        if (gen.includes('tilda'))     return 'tilda';
-        if (gen.includes('bitrix'))    return 'bitrix';
-        // unknown generator — return its first token rather than discard
-        return gen.split(/[\s/]+/)[0].slice(0, 40) || 'unknown';
-      }
-
-      // 2) Hard DOM/HTML fallbacks (only the really reliable ones)
-      const html = document.documentElement.outerHTML;
-      if (/wp-content\/|wp-includes\/|\/wp-json\//.test(html)) return 'wordpress';
-      if (window.Shopify || /cdn\.shopify\.com|myshopify\.com/.test(html)) return 'shopify';
-      if (/static\.parastorage\.com|wix\.com/.test(html))     return 'wix';
-      if (/squarespace\.com|static1\.squarespace/.test(html)) return 'squarespace';
-      if (/assets\.website-files\.com/.test(html) || document.documentElement.getAttribute('data-wf-site')) return 'webflow';
-      if (/sites\/default\/files\/|drupal-settings-json/.test(html)) return 'drupal';
-      if (/\/media\/jui\/|\/templates\/system\//.test(html))  return 'joomla';
-      if (/framerusercontent\.com/.test(html))                return 'framer';
-      if (/static\.tildacdn\.com|tildacdn\.com/.test(html))   return 'tilda';
-      if (window.__NEXT_DATA__ || /_next\/static\//.test(html)) return 'nextjs';
-      if (window.__NUXT__ || /\/_nuxt\//.test(html))          return 'nuxt';
-
-      return 'unknown';
-    });
-  } catch {
-    return 'unknown';
-  }
-}
-
 async function extractCapabilitiesFromPage(page) {
   return await page.evaluate(() => {
     const isVisible = (el) => {
@@ -2417,7 +2365,7 @@ async function expandHiddenContent(page) {
       });
 
       // Dedupe and tag
-      // ✅ FIX: Dedupe by text content and cap at 12
+      // ✅ FIX: Dedupe by text content (not just by element identity) and cap at 12
       const seenTriggerTexts = new Set();
       const deduped = [];
       for (const el of triggers) {
@@ -2438,16 +2386,20 @@ async function expandHiddenContent(page) {
     }
 
     // Click each trigger, capture dialog/overlay content, close
-    // ✅ FIX: Time-budget the dialog loop — max 10s total, reduced waits
+    // ✅ FIX: Time-budget the dialog loop — max 10s total, max 12 triggers, reduced waits
     const DIALOG_BUDGET_MS = 10000;
+    const MAX_DIALOG_TRIGGERS = 12;
     const dialogStartTime = Date.now();
     const collected = [];
-    for (const { idx, text: triggerText } of triggerTexts) {
+    const triggersToProcess = triggerTexts.slice(0, MAX_DIALOG_TRIGGERS);
+    for (const { idx, text: triggerText } of triggersToProcess) {
+      // ✅ FIX: Check time budget before each trigger
       if (Date.now() - dialogStartTime > DIALOG_BUDGET_MS) {
         console.log(`[DIALOG] Time budget exhausted (${DIALOG_BUDGET_MS}ms) — processed ${collected.length} dialogs, skipping remaining`);
         break;
       }
       try {
+        // Remember DOM state before click
         const beforeDialogs = await page.evaluate(() => 
           document.querySelectorAll('[role="dialog"],[data-state="open"],[class*="modal"],[class*="overlay"]').length
         );
@@ -2457,21 +2409,30 @@ async function expandHiddenContent(page) {
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(350);
+        await page.waitForTimeout(350); // ✅ FIX: was 500ms → 350ms
 
+        // Check if a new dialog/modal appeared
         const dialogText = await page.evaluate((beforeCount) => {
+          // Look for newly opened dialogs
           const dialogs = document.querySelectorAll(
             '[role="dialog"], [data-state="open"], [class*="modal"]:not([class*="modal-backdrop"]), ' +
             '.ReactModal__Content, [class*="dialog"], [class*="popup"]:not([class*="cookie"])'
           );
+          
+          // Also check for Radix portals (content rendered outside the card)
           const portals = document.querySelectorAll('[data-radix-portal], [data-radix-popper-content-wrapper]');
+          
           const allOverlays = [...dialogs, ...portals];
+          
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
+          
+          // Get text from the newest overlay
           const texts = [];
           allOverlays.forEach(el => {
             const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
             if (t && t.length > 20) texts.push(t);
           });
+          
           return texts.join('\n\n');
         }, beforeDialogs);
 
@@ -2480,8 +2441,11 @@ async function expandHiddenContent(page) {
           console.log(`[DIALOG] Captured ${dialogText.length} chars from trigger "${triggerText.slice(0, 30)}"`);
         }
 
+        // Close dialog — try multiple methods
         await page.evaluate(() => {
+          // Method 1: Escape key
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          // Method 2: Click close button
           const closeSelectors = [
             '[role="dialog"] button[aria-label*="close" i]',
             '[role="dialog"] button[aria-label*="Close" i]',
@@ -2497,11 +2461,12 @@ async function expandHiddenContent(page) {
               if (btn) { btn.click(); return; }
             } catch {}
           }
+          // Method 3: Click overlay backdrop
           const backdrop = document.querySelector('[class*="backdrop"], [class*="overlay"][role="presentation"]');
           if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(200); // ✅ FIX: was 300ms → 200ms
       } catch {}
     }
 
@@ -3223,7 +3188,8 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    // ✅ FIX: Wrap in withTimeout to prevent blowing the page budget
+    // ✅ FIX: Wrap in withTimeout — expandHiddenContent must not exceed 15s,
+    // leaving room for the rest of processPage within the 25s budget.
     let dialogTexts = '';
     try {
       dialogTexts = await withTimeout(
@@ -3523,7 +3489,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   const capabilitiesMaps = [];
   let base = "";
   let headerFooterText = ""; // captured once from homepage
-  let cms = "unknown";        // detected once from homepage
 
   const contactAgg = { emails: new Set(), phones: new Set() };
 
@@ -3552,14 +3517,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
       });
       console.log(`[INIT] Captured ${headerFooterText.length} chars of header/footer text (once)`);
     } catch {}
-
-    // Detect CMS once on homepage (cheap, ~5–20ms)
-    try {
-      cms = await detectCms(initPage);
-      console.log(`[CMS] Detected: ${cms}`);
-    } catch (e) {
-      console.log(`[CMS] Detection failed: ${e.message}`);
-    }
 
     // Use SELECTIVE nav link discovery — only header/footer/nav links
     const navLinks = await collectNavLinks(initPage, base);
@@ -3630,25 +3587,13 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
         // Enforce page limit
         if (stats.saved >= MAX_PAGES) break;
 
-        // ✅ FIX: Check how much time is left. If less than 10s, stop crawling
-        // so we have time for post-processing (sitemap build, Supabase save etc.)
-        const timeLeft = deadline - Date.now();
-        if (timeLeft < 10000) {
-          console.log(`[PAGE] ✗ SKIP ${item.url}: only ${Math.round(timeLeft / 1000)}s left before deadline — stopping`);
-          break;
-        }
-        // ✅ FIX: Dynamic page timeout — give this page at most (timeLeft - 8s),
-        // capped at 30s, min 8s. This ensures we always have ~8s for the next page
-        // or for post-processing.
-        const pageTimeout = Math.min(Math.max(timeLeft - 8000, 8000), 30000);
-
         stats.visited++;
 
         let result;
         try {
           result = await withTimeout(
             processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-            pageTimeout,
+            35000,
             `processPage(${item.url})`
           );
         } catch (e) {
@@ -3696,9 +3641,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages (max ${MAX_PAGES})`);
   }
 
-  const postCrawlTimeLeft = deadline - Date.now();
-  console.log(`[POST-CRAWL] ${Math.round(postCrawlTimeLeft / 1000)}s left for post-processing`);
-
   let combinedSiteMap = null;
   if (siteMaps.length > 0 && siteId) {
     console.log(`\n[SITEMAP] Building combined map from ${siteMaps.length} pages...`);
@@ -3706,13 +3648,8 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    // ✅ FIX: Only do network ops if we have enough time (>5s)
-    if (deadline - Date.now() > 5000) {
-      await saveSiteMapToSupabase(combinedSiteMap);
-      await sendSiteMapToWorker(combinedSiteMap);
-    } else {
-      console.log(`[SITEMAP] Skipping Supabase/Worker save — only ${Math.round((deadline - Date.now()) / 1000)}s left`);
-    }
+    await saveSiteMapToSupabase(combinedSiteMap);
+    await sendSiteMapToWorker(combinedSiteMap);
   }
 
   let combinedCapabilities = [];
@@ -3730,7 +3667,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
-  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts, cms };
+  return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
 }
 
 // ================= HTTP SERVER =================
