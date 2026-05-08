@@ -2351,8 +2351,9 @@ async function expandHiddenContent(page) {
         if (isVisible(el)) triggers.add(el);
       });
 
-      // Strategy 3: Buttons inside card-like containers (pricing cards, product cards, etc.)
+      // Strategy 3: Clickable elements inside card-like containers (pricing cards, product cards, etc.)
       // These often have "view details", "more info", etc. in any language
+      // ✅ NEO FIX: Search for ALL clickable elements, not just button/a[href="#"]
       const cardSelectors = [
         '[class*="card"]', '[class*="pricing"]', '[class*="package"]', '[class*="plan"]',
         '[class*="tier"]', '[class*="offer"]', '[class*="product"]', '[class*="item"]',
@@ -2362,13 +2363,16 @@ async function expandHiddenContent(page) {
         try {
           document.querySelectorAll(sel).forEach(card => {
             if (!isVisible(card)) return;
-            // Find buttons inside this card that are NOT submit/form buttons
-            card.querySelectorAll('button, [role="button"], a[href="#"], a[href="javascript:void(0)"]').forEach(btn => {
+            // Find ANY clickable inside this card — buttons, links, role=button, onclick
+            card.querySelectorAll('button, [role="button"], a, span[onclick], div[onclick], [data-radix-collection-item], [class*="trigger"], [class*="btn"], [class*="button"]').forEach(btn => {
               if (!isVisible(btn)) return;
               const text = (btn.textContent || '').trim();
               if (!text || text.length > 60) return;
-              // Skip navigation links and form submits
-              if (/submit|send|buy|purchase|add to cart|изпрати|купи/i.test(text)) return;
+              // Skip actual navigation links (have real href to another page)
+              const href = btn.getAttribute('href');
+              if (href && href.length > 1 && !href.startsWith('#') && !href.startsWith('javascript:') && !/^\/?(kontakt|contact|#)/.test(href)) return;
+              // Skip submit buttons
+              if (/submit|send|buy|purchase|add to cart|изпрати|купи|изберете пакет|заяви/i.test(text)) return;
               if (skipRe.test(btn.closest('[class]')?.className || '')) return;
               triggers.add(btn);
             });
@@ -2376,12 +2380,16 @@ async function expandHiddenContent(page) {
         } catch {}
       }
 
-      // Strategy 4: Any button whose text suggests it reveals details (universal)
+      // Strategy 4: Any clickable element whose text suggests it reveals details (universal)
+      // ✅ NEO FIX: Include <a> tags — many sites use links as dialog triggers
       const revealRe = /detail|more|info|view|show|see|expand|learn|подробн|детайл|повече|виж|покажи|разгъни|detalles|détails|dettagli|mehr|подробнее|посмотреть|göster|ver\b|voir/i;
-      document.querySelectorAll('button, [role="button"]').forEach(btn => {
+      document.querySelectorAll('button, [role="button"], a, [class*="trigger"], [class*="btn"]').forEach(btn => {
         if (!isVisible(btn)) return;
         const text = (btn.textContent || btn.getAttribute('aria-label') || '').trim();
         if (revealRe.test(text) && text.length <= 40) {
+          // Skip real navigation links
+          const href = btn.getAttribute('href');
+          if (href && href.length > 1 && !href.startsWith('#') && !href.startsWith('javascript:')) return;
           if (!skipRe.test(btn.closest('[class]')?.className || '')) {
             triggers.add(btn);
           }
