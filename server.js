@@ -47,7 +47,6 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
-// ── NEO: Strip repeated footer/nav from page content ──
 function stripFooterAndDedup(rawText) {
   if (!rawText) return rawText;
   const footerIdx = rawText.indexOf('TOP_CONTROLS');
@@ -2382,37 +2381,18 @@ async function expandHiddenContent(page) {
         }
       });
 
-      // Strategy 5: ALL visible buttons/links with reveal-like text — regardless of container
-      // ✅ NEO: This catches cases where buttons are not inside [class*="card"] containers
-      // (e.g. Radix DialogTrigger, standalone "View details" buttons)
-      const revealReAll = /детайл|detail|подробн|повече|виж|view|show|see|mehr|detalles/i;
-      const allClickable = document.querySelectorAll('button, [role="button"], a');
-      allClickable.forEach(el => {
-        if (!isVisible(el)) return;
-        if (triggers.has(el)) return;  // already found
-        const text = (el.textContent || '').trim();
-        if (!text || text.length > 40 || text.length < 3) return;
-        if (!revealReAll.test(text)) return;
-        // Skip if it's a real navigation link to another page
-        if (el.tagName === 'A') {
-          const href = el.getAttribute('href') || '';
-          if (href && !href.startsWith('#') && !href.startsWith('javascript:') && !href.includes('?plan=') && href.length > 1) return;
-        }
-        if (skipRe.test(el.closest('[class]')?.className || '')) return;
-        triggers.add(el);
-      });
-
       // Dedupe and tag
-      // ✅ NEO FIX: Don't dedupe by text alone — buttons with same text in different
-      // cards (e.g. 3× "Вижте детайли") open DIFFERENT dialogs.
+      // ✅ NEO FIX: Dedupe by text + DOM position. Buttons with same text (e.g. 3× "Вижте детайли")
+      // in different positions on the page open DIFFERENT dialogs and must be kept.
       const seenTriggerKeys = new Set();
       const deduped = [];
       for (const el of triggers) {
         const txt = (el.textContent || '').trim().slice(0, 60).toLowerCase();
         if (!txt || txt.length < 2) continue;
-        const card = el.closest('[class*="card"],[class*="pricing"],[class*="package"],[class*="plan"],[class*="tier"],[class*="offer"],[class*="product"],[class*="item"],[class*="service"]');
-        const cardIdx = card ? Array.from(card.parentElement?.children || []).indexOf(card) : -1;
-        const key = card ? `${txt}::${cardIdx}` : txt;
+        // Use bounding rect Y position (rounded to 50px) as spatial key
+        const rect = el.getBoundingClientRect();
+        const posKey = `${Math.round(rect.top / 50)}`;
+        const key = `${txt}::${posKey}`;
         if (seenTriggerKeys.has(key)) continue;
         seenTriggerKeys.add(key);
         deduped.push(el);
@@ -3695,21 +3675,21 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     await sendSiteMapToWorker(combinedSiteMap);
   }
 
-  // ── NEO: Condense portfolio/project pages into 1 compact entry ──
   const portfolioRe = /\/(proekt\/|project\/|zavursheni-proekti\/|completed|portfolio\/|gallery\/)/i;
   const portfolioPages = pages.filter(p => portfolioRe.test(p.url));
   if (portfolioPages.length >= 5) {
     const compactLines = portfolioPages.map(p => {
-      const name = (p.title || '').replace(/^.*\|/, '').trim() || p.url.split('/').pop();
+      const slug = p.url.split('/').pop() || '';
+      const titleClean = (p.title || '').replace(/\|.*$/, '').trim();
       const areaMatch = (p.content || '').match(/(\d+)\s*кв\.?\s*м/);
       const area = areaMatch ? ` — ${areaMatch[1]} кв.м.` : '';
-      return `${name}${area}`;
+      return `${titleClean || slug}${area}`;
     });
     const nonPortfolio = pages.filter(p => !portfolioRe.test(p.url));
     pages.length = 0;
     pages.push(...nonPortfolio);
     pages.push({
-      url: portfolioPages[0].url.replace(/\/[^/]+$/, ''),
+      url: base + '/projects-summary',
       title: 'Проекти и завършени обекти (обобщено)',
       pageType: 'general',
       content: `ПРОЕКТИ И ЗАВЪРШЕНИ ОБЕКТИ (${portfolioPages.length} бр.):\n${compactLines.join('\n')}`,
