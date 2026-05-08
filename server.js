@@ -47,23 +47,6 @@ const clean = (t = "") =>
 
 const countWordsExact = (t = "") => t.split(/\s+/).filter(Boolean).length;
 
-function stripFooterAndDedup(rawText) {
-  if (!rawText) return rawText;
-  const footerIdx = rawText.indexOf('TOP_CONTROLS');
-  let main = footerIdx > 0 ? rawText.slice(0, footerIdx) : rawText;
-  const lines = main.split('\n');
-  const seen = new Set();
-  const deduped = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.length < 40) { deduped.push(line); continue; }
-    if (seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    deduped.push(line);
-  }
-  return deduped.join('\n');
-}
-
 // Safe evaluate with hard timeout — prevents hanging Promises inside page.evaluate
 async function safeEval(page, fn, arg, timeoutMs = 5000) {
   return Promise.race([
@@ -2382,23 +2365,8 @@ async function expandHiddenContent(page) {
       });
 
       // Dedupe and tag
-      // ✅ NEO FIX: Dedupe by text + DOM position. Buttons with same text (e.g. 3× "Вижте детайли")
-      // in different positions on the page open DIFFERENT dialogs and must be kept.
-      const seenTriggerKeys = new Set();
-      const deduped = [];
-      for (const el of triggers) {
-        const txt = (el.textContent || '').trim().slice(0, 60).toLowerCase();
-        if (!txt || txt.length < 2) continue;
-        // Use bounding rect Y position (rounded to 50px) as spatial key
-        const rect = el.getBoundingClientRect();
-        const posKey = `${Math.round(rect.top / 50)}`;
-        const key = `${txt}::${posKey}`;
-        if (seenTriggerKeys.has(key)) continue;
-        seenTriggerKeys.add(key);
-        deduped.push(el);
-        if (deduped.length >= 15) break;
-      }
-      return deduped.map((el, i) => {
+      const arr = Array.from(triggers).slice(0, 20);
+      return arr.map((el, i) => {
         el.setAttribute('data-crawler-trigger', String(i));
         return { idx: i, text: (el.textContent || '').trim().slice(0, 60) };
       });
@@ -2409,18 +2377,8 @@ async function expandHiddenContent(page) {
     }
 
     // Click each trigger, capture dialog/overlay content, close
-    // ✅ FIX: Time-budget the dialog loop — max 10s total, max 12 triggers, reduced waits
-    const DIALOG_BUDGET_MS = 10000;
-    const MAX_DIALOG_TRIGGERS = 12;
-    const dialogStartTime = Date.now();
     const collected = [];
-    const triggersToProcess = triggerTexts.slice(0, MAX_DIALOG_TRIGGERS);
-    for (const { idx, text: triggerText } of triggersToProcess) {
-      // ✅ FIX: Check time budget before each trigger
-      if (Date.now() - dialogStartTime > DIALOG_BUDGET_MS) {
-        console.log(`[DIALOG] Time budget exhausted (${DIALOG_BUDGET_MS}ms) — processed ${collected.length} dialogs, skipping remaining`);
-        break;
-      }
+    for (const { idx, text: triggerText } of triggerTexts) {
       try {
         // Remember DOM state before click
         const beforeDialogs = await page.evaluate(() => 
@@ -2432,7 +2390,7 @@ async function expandHiddenContent(page) {
           if (el) el.click();
         }, idx);
 
-        await page.waitForTimeout(350); // ✅ FIX: was 500ms → 350ms
+        await page.waitForTimeout(500); // Wait for React/Vue re-render + animation
 
         // Check if a new dialog/modal appeared
         const dialogText = await page.evaluate((beforeCount) => {
@@ -2489,7 +2447,7 @@ async function expandHiddenContent(page) {
           if (backdrop) backdrop.click();
         });
 
-        await page.waitForTimeout(200); // ✅ FIX: was 300ms → 200ms
+        await page.waitForTimeout(300);
       } catch {}
     }
 
@@ -3211,18 +3169,7 @@ await forceRenderEverything(page);
 
     // ── UI-AWARE: кликай accordions, tabs, "Виж детайли" + Radix dialogs ──
     // Skip on product_detail pages — saves 2-4s per page (no useful accordions, only contact forms)
-    // ✅ FIX: Wrap in withTimeout — expandHiddenContent must not exceed 15s,
-    // leaving room for the rest of processPage within the 25s budget.
-    let dialogTexts = '';
-    try {
-      dialogTexts = await withTimeout(
-        expandHiddenContent(page),
-        15000,
-        'expandHiddenContent'
-      );
-    } catch (e) {
-      console.log(`[DIALOG] expandHiddenContent timed out: ${e.message}`);
-    }
+    const dialogTexts = await expandHiddenContent(page);
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
@@ -3298,7 +3245,7 @@ getNetworkPayloads();
    // SINGLE-PASS EXTRACTION PIPELINE (merge everything once, no second parsing passes)
 const rawAll=[
 
-stripFooterAndDedup(data.rawContent),
+data.rawContent,
 
 shadowText
 ? `SHADOW_CONTENT\n${shadowText}`
@@ -3616,7 +3563,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
         try {
           result = await withTimeout(
             processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-            35000,
+            25000,
             `processPage(${item.url})`
           );
         } catch (e) {
@@ -3673,31 +3620,6 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     await saveSiteMapToSupabase(combinedSiteMap);
     await sendSiteMapToWorker(combinedSiteMap);
-  }
-
-  const portfolioRe = /\/(proekt\/|project\/|zavursheni-proekti\/|completed|portfolio\/|gallery\/)/i;
-  const portfolioPages = pages.filter(p => portfolioRe.test(p.url));
-  if (portfolioPages.length >= 5) {
-    const compactLines = portfolioPages.map(p => {
-      const slug = p.url.split('/').pop() || '';
-      const titleClean = (p.title || '').replace(/\|.*$/, '').trim();
-      const areaMatch = (p.content || '').match(/(\d+)\s*кв\.?\s*м/);
-      const area = areaMatch ? ` — ${areaMatch[1]} кв.м.` : '';
-      return `${titleClean || slug}${area}`;
-    });
-    const nonPortfolio = pages.filter(p => !portfolioRe.test(p.url));
-    pages.length = 0;
-    pages.push(...nonPortfolio);
-    pages.push({
-      url: base + '/projects-summary',
-      title: 'Проекти и завършени обекти (обобщено)',
-      pageType: 'general',
-      content: `ПРОЕКТИ И ЗАВЪРШЕНИ ОБЕКТИ (${portfolioPages.length} бр.):\n${compactLines.join('\n')}`,
-      structured: { pricing: null, contacts: { emails: [], phones: [] }, product_specs: null },
-      wordCount: compactLines.join(' ').split(/\s+/).length,
-      status: 'ok',
-    });
-    console.log(`[OPTIMIZE] Condensed ${portfolioPages.length} portfolio pages → 1 compact page`);
   }
 
   let combinedCapabilities = [];
