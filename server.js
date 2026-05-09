@@ -959,7 +959,8 @@ const pickFeatures = (root) => {
     if (hasCheck) prefix = "✓ ";
     if (hasX) prefix = "✗ ";
 
-    const t = prefix + getText(li);
+    const rawText = getText(li);
+const t = rawText;
 
     if (!t) return;
     if (t.length < 3 || t.length > 140) return;
@@ -967,7 +968,10 @@ const pickFeatures = (root) => {
     if (seen.has(t)) return;
     seen.add(t);
 
-    items.push(t.trim());
+    items.push({
+  text: rawText.trim(),
+  included: hasCheck ? true : hasX ? false : null
+});
   });
 
   return items.slice(0, 30);
@@ -1113,7 +1117,10 @@ features:[]
         price_text,
         period,
         badge,
-        features,
+        features: features.map(f => {
+  if (typeof f === "string") return f;
+  return `${f.included === true ? "✓" : f.included === false ? "✗" : ""} ${f.text}`.trim();
+}),
       });
     }
 
