@@ -940,16 +940,45 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-    const pickFeatures = (root) => {
-      const items = [];
-      root.querySelectorAll("li").forEach(li => {
-        const t = getText(li);
-        if (!t) return;
-        if (t.length < 3 || t.length > 140) return;
-        items.push(t);
-      });
-      return Array.from(new Set(items)).slice(0, 30);
-    };
+const pickFeatures = (root) => {
+  const items = [];
+
+  root.querySelectorAll("li").forEach(li => {
+    const t = getText(li);
+
+    if (!t) return;
+    if (t.length < 3 || t.length > 140) return;
+
+    // Detect disabled/excluded rows by white background
+    const row =
+      li.querySelector(".bg-background") ||
+      li.querySelector('[class*="bg-background"]') ||
+      li;
+
+    const style = window.getComputedStyle(row);
+    const bg = (style.backgroundColor || "").toLowerCase();
+
+    const isExcluded =
+      bg.includes("255, 255, 255") ||
+      bg.includes("ffffff") ||
+      /\(не е включено\)/i.test(t);
+
+    if (isExcluded) return;
+
+    // Remove accidental X/check chars
+    const cleaned = t
+      .replace(/^✗\s*/, "")
+      .replace(/^✓\s*/, "")
+      .replace(/\(не е включено\)/gi, "")
+      .trim();
+
+    if (!cleaned) return;
+
+    items.push(cleaned);
+  });
+
+  return Array.from(new Set(items)).slice(0, 30);
+};
 
     const pickPeriod = (root) => {
       const t = getText(root);
