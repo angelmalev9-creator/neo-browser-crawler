@@ -2612,11 +2612,91 @@ for (const el of triggers) {
           
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
           
-          // Get text from the newest overlay
+          // Get text from the newest overlay, with SVG icon status detection
           const texts = [];
           allOverlays.forEach(el => {
-            const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length > 20) texts.push(t);
+            // Instead of raw innerText, process elements to detect SVG icons
+            const parts = [];
+            const processNode = (node) => {
+              // Check if this node has an SVG icon indicating status
+              const svgs = node.querySelectorAll ? node.querySelectorAll("svg") : [];
+              let iconStatus = null;
+              for (const svg of svgs) {
+                const sc = (svg.getAttribute("class") || "").toLowerCase();
+                if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) { iconStatus = "excluded"; break; }
+                if (/\blucide-check\b/.test(sc)) { iconStatus = "included"; break; }
+                if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) { iconStatus = "excluded"; break; }
+                if (/\blucide-[a-z-]*check/.test(sc)) { iconStatus = "included"; break; }
+                const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+                const al = (svg.getAttribute("aria-label") || "").toLowerCase();
+                const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
+                const all = `${sc} ${spc} ${al} ${ti}`;
+                if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) { iconStatus = "excluded"; break; }
+                if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) { iconStatus = "included"; break; }
+                if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) { iconStatus = "excluded"; break; }
+                if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) { iconStatus = "included"; break; }
+              }
+              const t = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+              if (!t || t.length < 3) return;
+              if (iconStatus && t.length <= 200) {
+                const prefix = iconStatus === "included" ? "✓ " : "✗ ";
+                parts.push(prefix + t);
+              } else {
+                parts.push(t);
+              }
+            };
+
+            // Find icon-bearing elements (short items with SVGs) first
+            const iconItems = new Set();
+            el.querySelectorAll("svg").forEach(svg => {
+              const sc = (svg.getAttribute("class") || "").toLowerCase();
+              if (!/lucide|fa-|icon|check|close|times|tick/i.test(sc)) return;
+              // Walk up to container
+              let container = svg.parentElement;
+              for (let i = 0; i < 6 && container && container !== el; i++) {
+                const ct = (container.innerText || "").replace(/\s+/g, " ").trim();
+                if (ct && ct.length >= 3 && ct.length <= 200) {
+                  processNode(container);
+                  iconItems.add(container);
+                  // Mark descendants to skip
+                  container.querySelectorAll("*").forEach(ch => iconItems.add(ch));
+                  break;
+                }
+                container = container.parentElement;
+              }
+            });
+
+            // Get remaining text from elements not already processed
+            if (iconItems.size > 0) {
+              // Walk el's children, skipping icon items
+              const walkForText = (node) => {
+                if (iconItems.has(node)) return;
+                const children = node.children;
+                if (!children || children.length === 0) {
+                  const t = (node.textContent || "").trim();
+                  if (t && t.length >= 3) parts.push(t);
+                  return;
+                }
+                let hasIconChild = false;
+                for (const ch of node.querySelectorAll("*")) {
+                  if (iconItems.has(ch)) { hasIconChild = true; break; }
+                }
+                if (!hasIconChild) {
+                  const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+                  if (t && t.length >= 3) parts.push(t);
+                } else {
+                  for (const ch of children) walkForText(ch);
+                }
+              };
+              for (const ch of el.children) walkForText(ch);
+            } else {
+              // No icon items — just use innerText
+              const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (t && t.length > 20) parts.push(t);
+            }
+
+            const combined = parts.filter(Boolean).join(" ");
+            if (combined.length > 20) texts.push(combined);
           });
           
           return texts.join('\n\n');
