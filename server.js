@@ -951,20 +951,25 @@ const row =
   li.parentElement ||
   li;
 
-const sectionText = getText(root).toLowerCase();
+const rowText = getText(row).toLowerCase();
 
 const hasCheck =
-  sectionText.includes("включено");
+  rowText.includes("✓") ||
+  (
+    rowText.includes("включено") &&
+    !rowText.includes("не е включено")
+  );
 
 const hasX =
-  sectionText.includes("не е включено");
+  rowText.includes("✗") ||
+  rowText.includes("не е включено");
 
     
 
     if (hasCheck) prefix = "✓ ";
     if (hasX) prefix = "✗ ";
 
-    const rawText = getText(row);
+    const rawText = rowText;
 
 let prefix = "";
 
