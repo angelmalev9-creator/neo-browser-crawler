@@ -946,20 +946,25 @@ const pickFeatures = (root) => {
 
   root.querySelectorAll("li, div.flex.items-center.gap-3").forEach(li => {
 
-    const hasCheck =
-      li.querySelector(".lucide-check") ||
-      li.querySelector('[class*="lucide-check"]');
+const row =
+  li.closest("div.flex.items-center.gap-3") ||
+  li.parentElement ||
+  li;
 
-    const hasX =
-      li.querySelector(".lucide-x") ||
-      li.querySelector('[class*="lucide-x"]');
+const hasCheck =
+  row.querySelector(".lucide-check") ||
+  row.querySelector('[class*="lucide-check"]');
+
+const hasX =
+  row.querySelector(".lucide-x") ||
+  row.querySelector('[class*="lucide-x"]');
 
     let prefix = "";
 
     if (hasCheck) prefix = "✓ ";
     if (hasX) prefix = "✗ ";
 
-    const rawText = getText(li);
+    const rawText = getText(row);
 
 const t =
   (hasCheck ? "✓ " : hasX ? "✗ " : "") +
