@@ -951,13 +951,13 @@ const row =
   li.parentElement ||
   li;
 
+const sectionText = getText(root).toLowerCase();
+
 const hasCheck =
-  row.querySelector(".lucide-check") ||
-  row.querySelector('[class*="lucide-check"]');
+  sectionText.includes("включено");
 
 const hasX =
-  row.querySelector(".lucide-x") ||
-  row.querySelector('[class*="lucide-x"]');
+  sectionText.includes("не е включено");
 
     let prefix = "";
 
@@ -966,9 +966,12 @@ const hasX =
 
     const rawText = getText(row);
 
-const t =
-  (hasCheck ? "✓ " : hasX ? "✗ " : "") +
-  rawText;
+let prefix = "";
+
+if (hasCheck && !hasX) prefix = "✓ ";
+if (hasX) prefix = "✗ ";
+
+const t = prefix + rawText;
 
     if (!t) return;
     if (t.length < 3 || t.length > 140) return;
