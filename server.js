@@ -942,80 +942,154 @@ async function extractPricingFromPage(page) {
 
     const pickFeatures = (root) => {
       const items = [];
+
+      // Helper: detect SVG icon status (check/included vs cross/excluded)
+      const detectSvgIconStatus = (el) => {
+        const svgs = el.querySelectorAll("svg");
+        if (svgs.length === 0) return null;
+        // Check the first SVG found in the element
+        for (const svg of svgs) {
+          const svgClass = (svg.getAttribute("class") || "").toLowerCase();
+          const svgParentClass = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+          const ariaLabel = (svg.getAttribute("aria-label") || "").toLowerCase();
+          const title = (svg.querySelector("title")?.textContent || "").toLowerCase();
+
+          // Combine all searchable text
+          const searchText = `${svgClass} ${svgParentClass} ${ariaLabel} ${title}`;
+
+          // ── Priority 1: Lucide icons (class="lucide lucide-check ..." or "lucide lucide-x ...") ──
+          // lucide-x must be checked BEFORE lucide-check to avoid false positive
+          // lucide-x is exactly "lucide-x" not followed by another letter (but may be followed by . or space or end)
+          if (/\blucide-x\b/i.test(svgClass) && !/\blucide-x[a-z]/i.test(svgClass)) {
+            return "excluded";
+          }
+          if (/\blucide-check\b/i.test(svgClass)) {
+            return "included";
+          }
+          // Also catch lucide-circle-x, lucide-x-circle, lucide-circle-check etc.
+          if (/\blucide-[a-z-]*x(-|$)/i.test(svgClass) || /\blucide-x-/i.test(svgClass)) {
+            return "excluded";
+          }
+          if (/\blucide-[a-z-]*check/i.test(svgClass)) {
+            return "included";
+          }
+
+          // ── Priority 2: Common icon library class patterns ──
+          // Detect CROSS / EXCLUDED icons
+          if (/close|cross|x-mark|xmark|times|remove|cancel|minus|exclude|unavailable|not.?included|disabled|unchecked/i.test(searchText) ||
+              /fa-times|fa-xmark|fa-close|fa-remove|fa-minus|icon-x\b|icon-close|icon-cross|heroicon.*x-mark|bi-x\b/i.test(searchText)) {
+            return "excluded";
+          }
+          // Detect CHECK / INCLUDED icons
+          if (/\bcheck\b|tick|correct|done|success|verified|included|available|enabled|approved/i.test(searchText) ||
+              /fa-check|fa-tick|icon-check|icon-tick|heroicon.*check|bi-check/i.test(searchText)) {
+            return "included";
+          }
+
+          // ── Priority 3: CSS class color hints (text-primary = included, text-muted/text-destructive = excluded) ──
+          if (/text-muted|text-destructive|text-danger|text-gray|text-red|text-disabled|opacity-50|opacity-40/i.test(svgClass) ||
+              /text-muted|text-destructive|text-danger|text-red|text-disabled/i.test(svgParentClass)) {
+            return "excluded";
+          }
+          if (/text-primary|text-success|text-green|text-brand/i.test(svgClass) ||
+              /text-primary|text-success|text-green|text-brand/i.test(svgParentClass)) {
+            return "included";
+          }
+
+          // ── Priority 4: <use> href references ──
+          const paths = svg.querySelectorAll("path, polyline, line, circle, use");
+          for (const p of paths) {
+            const href = (p.getAttribute("href") || p.getAttribute("xlink:href") || "").toLowerCase();
+            if (/check|tick|success|done|correct|approved/i.test(href)) return "included";
+            if (/close|cross|times|xmark|remove|cancel|minus/i.test(href)) return "excluded";
+          }
+        }
+        return null;
+      };
+
+      // Also detect status from non-SVG icon elements (font icons, unicode, img)
+      const detectNonSvgIconStatus = (el) => {
+        // Check for icon fonts (FontAwesome, Material Icons, etc.)
+        const icons = el.querySelectorAll("i, span[class*='icon'], span[class*='fa-'], em[class*='icon']");
+        for (const icon of icons) {
+          const cls = (icon.getAttribute("class") || "").toLowerCase();
+          const content = (icon.textContent || "").trim();
+          
+          if (/fa-check|fa-tick|icon-check|icon-tick|material.*check|material.*done/i.test(cls) || /✓|✔|☑/i.test(content)) return "included";
+          if (/fa-times|fa-close|fa-xmark|fa-remove|fa-minus|icon-x|icon-close|icon-cross|material.*close|material.*clear/i.test(cls) || /✕|✗|✘|☒|✖/i.test(content)) return "excluded";
+        }
+
+        // Check for image-based icons
+        const imgs = el.querySelectorAll("img");
+        for (const img of imgs) {
+          const alt = (img.getAttribute("alt") || "").toLowerCase();
+          const src = (img.getAttribute("src") || "").toLowerCase();
+          if (/check|tick|yes|included|done/i.test(alt + src)) return "included";
+          if (/cross|no|excluded|close|remove/i.test(alt + src)) return "excluded";
+        }
+
+        // Check for unicode symbols in text
+        const firstChars = (el.textContent || "").trim().slice(0, 3);
+        if (/^[✓✔☑✅]/.test(firstChars)) return "included";
+        if (/^[✕✗✘☒✖❌]/.test(firstChars)) return "excluded";
+
+        // Check ::before pseudo-element content
+        try {
+          const firstChild = el.firstElementChild || el;
+          const before = window.getComputedStyle(firstChild, "::before").content;
+          if (before && before !== "none" && before !== '""') {
+            const cleaned = before.replace(/^["']|["']$/g, "");
+            if (/✓|✔|☑/.test(cleaned)) return "included";
+            if (/✕|✗|✘|☒|✖/.test(cleaned)) return "excluded";
+          }
+        } catch {}
+
+        return null;
+      };
+
       root.querySelectorAll("li").forEach(li => {
         const t = getText(li);
         if (!t) return;
         if (t.length < 3 || t.length > 140) return;
 
-        // ── NEO FIX: Detect included vs excluded items ──
-        // Check visual indicators: icon color, opacity, CSS class, Unicode marks
-        let status = '';
-        try {
-          const style = window.getComputedStyle(li);
+        // Detect icon status from SVG or non-SVG icons
+        let status = detectSvgIconStatus(li) || detectNonSvgIconStatus(li);
 
-          // 1. Check for SVG icon inside the li
-          const svg = li.querySelector('svg');
-          if (svg) {
-            const svgStyle = window.getComputedStyle(svg);
-            const svgColor = svgStyle.color || '';
-            const rgbMatch = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-            if (rgbMatch) {
-              const [, r, g, b] = rgbMatch.map(Number);
-              // Green icon = included
-              if (g > 100 && g > r * 1.2 && g > b * 1.2) status = 'included';
-              // Gray icon = excluded
-              else if (r > 140 && g > 140 && b > 140 && Math.abs(r - g) < 30 && Math.abs(g - b) < 30) status = 'excluded';
-              // Red icon = excluded
-              else if (r > 160 && g < 100 && b < 100) status = 'excluded';
-            }
-            // Also check SVG path: checkmark vs X
-            const pathD = (svg.querySelector('path')?.getAttribute('d') || '').toLowerCase();
-            if (!status && pathD) {
-              // Checkmark paths typically go down-right then up-right
-              if (/[ml].*[ml].*[ml]/i.test(pathD) && pathD.length < 60) {
-                // Short path with multiple segments - could be check or X
-              }
-            }
+        // If no icon found, check parent wrapper (some layouts wrap icon + text in a div)
+        if (!status) {
+          const wrapper = li.closest("[class*='feature'],[class*='item'],[class*='benefit'],[class*='list']");
+          if (wrapper && wrapper !== root) {
+            // Don't re-scan the whole wrapper, just check if the li's direct container has an icon sibling
           }
+        }
 
-          // 2. Check element opacity
-          if (!status && parseFloat(style.opacity) < 0.6) status = 'excluded';
-
-          // 3. Check line-through
-          if (!status && style.textDecoration && style.textDecoration.includes('line-through')) status = 'excluded';
-
-          // 4. Check text color (gray = excluded)
-          if (!status) {
-            const elColor = style.color || '';
-            const rgbMatch = elColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-            if (rgbMatch) {
-              const [, r, g, b] = rgbMatch.map(Number);
-              if (r > 160 && g > 160 && b > 160 && Math.abs(r - g) < 20) status = 'excluded';
-            }
-          }
-
-          // 5. Check CSS classes on li or parent
-          if (!status) {
-            const cls = ((li.className || '') + ' ' + (li.parentElement?.className || '')).toLowerCase();
-            if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) status = 'excluded';
-            if (/included|active|available|enabled/i.test(cls)) status = 'included';
-          }
-
-          // 6. Unicode check/cross in text
-          if (!status) {
-            if (/^[\s]*[✓✔☑✅]/u.test(t)) status = 'included';
-            if (/^[\s]*[✕✗✘☒❌×]/u.test(t)) status = 'excluded';
-          }
-        } catch (e) {}
-
-        if (status === 'excluded') {
-          items.push(`✗ ${t} (не е включено)`);
-        } else if (status === 'included') {
-          items.push(`✓ ${t}`);
+        if (status === "included") {
+          items.push("✓ " + t);
+        } else if (status === "excluded") {
+          items.push("✗ " + t);
         } else {
           items.push(t);
         }
       });
+
+      // Also scan non-li feature items (div-based feature lists)
+      root.querySelectorAll("[class*='feature'],[class*='item'],[class*='benefit'],[class*='includes'],[class*='option']").forEach(el => {
+        if (el.querySelector("li")) return; // Skip if it contains li (already handled)
+        if (el.closest("li")) return; // Skip if inside li (already handled)
+        const t = getText(el);
+        if (!t || t.length < 3 || t.length > 140) return;
+        if (items.some(existing => existing.replace(/^[✓✗]\s*/, '') === t)) return; // dedup
+
+        let status = detectSvgIconStatus(el) || detectNonSvgIconStatus(el);
+        if (status === "included") {
+          items.push("✓ " + t);
+        } else if (status === "excluded") {
+          items.push("✗ " + t);
+        } else {
+          items.push(t);
+        }
+      });
+
       return Array.from(new Set(items)).slice(0, 30);
     };
 
@@ -2539,199 +2613,10 @@ for (const el of triggers) {
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
           
           // Get text from the newest overlay
-          // ── NEO FIX: Structured extraction — section headers + badges separate from items ──
           const texts = [];
-          allOverlays.forEach(container => {
-            const lines = [];
-            
-            // Strategy: find all "section" blocks (each has a heading + badge + items)
-            // A section block is a container with a heading and list items inside
-            const sectionEls = container.querySelectorAll(
-              '[class*="section"], [class*="category"], [class*="group"], [class*="block"], [class*="spec-group"], [class*="feature-group"]'
-            );
-            
-            // Also grab the main dialog title (e.g. "Пакет Стандарт — €750/кв.м.")
-            const mainTitle = container.querySelector('h1, h2, [class*="dialog-title"], [class*="modal-title"], [class*="sheet-title"]');
-            if (mainTitle) {
-              const mt = (mainTitle.innerText || mainTitle.textContent || '').replace(/\s+/g, ' ').trim();
-              if (mt && mt.length >= 5) lines.push(mt);
-            }
-            const mainDesc = container.querySelector('[class*="description"], [class*="subtitle"]');
-            if (mainDesc) {
-              const md = (mainDesc.innerText || mainDesc.textContent || '').replace(/\s+/g, ' ').trim();
-              if (md && md.length >= 5 && md.length <= 120) lines.push(md);
-            }
-            
-            function getLeafItemStatus(item) {
-              try {
-                // ── NEO FIX: Check background color FIRST — most reliable signal ──
-                // Included items have a tinted/colored background (green, light-green, etc.)
-                // Excluded items have white/transparent background (no highlight)
-                const style = window.getComputedStyle(item);
-                const bg = style.backgroundColor || '';
-                const bgMatch = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-                if (bgMatch) {
-                  const [, r, g, b, a] = bgMatch;
-                  const ri = Number(r), gi = Number(g), bi = Number(b);
-                  const alpha = a !== undefined ? parseFloat(a) : 1;
-                  // Skip fully transparent backgrounds
-                  if (alpha > 0.01) {
-                    // Green-tinted background = included (e.g. rgba(122,179,53,0.05) → #7AB635)
-                    if (gi > ri && gi > bi && alpha > 0.01) return 'in';
-                    // Pure white or very light gray with no tint = no highlight = excluded
-                    if (ri > 250 && gi > 250 && bi > 250 && alpha > 0.5) return 'out';
-                  }
-                }
-                
-                // Check SVG icon color as secondary signal
-                const svg = item.querySelector('svg');
-                if (svg) {
-                  const svgColor = window.getComputedStyle(svg).color || '';
-                  const m = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-                  if (m) {
-                    const [, r, g, b] = m.map(Number);
-                    if (g > 100 && g > r * 1.2 && g > b * 1.2) return 'in';
-                    if (r > 140 && g > 140 && b > 140 && Math.abs(r-g) < 30) return 'out';
-                    if (r > 160 && g < 100) return 'out';
-                  }
-                }
-                
-                // Check element opacity
-                if (parseFloat(style.opacity) < 0.6) return 'out';
-                
-                // Check text color (very light gray = excluded)
-                const c = style.color || '';
-                const m2 = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-                if (m2) {
-                  const [, r, g, b] = m2.map(Number);
-                  if (r > 160 && g > 160 && b > 160 && Math.abs(r-g) < 20) return 'out';
-                }
-                
-                // CSS class indicators
-                const cls = ((item.className||'') + ' ' + (item.parentElement?.className||'')).toLowerCase();
-                if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) return 'out';
-                if (/included|active|available|enabled/i.test(cls)) return 'in';
-                
-                // Unicode marks in text
-                const t = (item.innerText || '').trim();
-                if (/^[✓✔☑✅]/u.test(t)) return 'in';
-                if (/^[✕✗✘☒❌×]/u.test(t)) return 'out';
-              } catch(e){}
-              return '';
-            }
-            
-            // Helper: detect if an element is a section header (not a leaf item)
-            function isSectionHeader(el) {
-              const tag = (el.tagName || '').toLowerCase();
-              if (['h1','h2','h3','h4','h5','h6','strong','b'].includes(tag)) return true;
-              const cls = (el.className || '').toLowerCase();
-              if (/title|heading|header|name|label|badge|tag|status/.test(cls)) return true;
-              // Has child heading
-              if (el.querySelector('h1,h2,h3,h4,h5,strong,b,[class*="title"],[class*="heading"]')) return true;
-              return false;
-            }
-            
-            // Helper: detect CTA buttons
-            function isCTAButton(el) {
-              const text = (el.innerText || el.textContent || '').trim().toLowerCase();
-              return /заяв|поръча|order|request|submit|buy|купи|изберете|get started|sign up|close/i.test(text);
-            }
-            
-            function processSection(sec) {
-              // Find section heading (h3/h4/h5 or bold/strong)
-              const heading = sec.querySelector('h3, h4, h5, strong, b, [class*="title"], [class*="heading"], [class*="name"]');
-              let headingText = '';
-              if (heading) {
-                headingText = (heading.innerText || heading.textContent || '').replace(/\s+/g, ' ').trim();
-                // Don't include if heading is actually a leaf item text
-                if (headingText && headingText.length >= 2 && headingText.length <= 80) {
-                  lines.push(headingText);
-                }
-              }
-              
-              // Find badge: "Включено" / "Не е включено"
-              const badge = sec.querySelector('[class*="badge"], [class*="tag"], [class*="status"], [class*="label"], p');
-              if (badge && badge !== heading) {
-                const bt = (badge.innerText || badge.textContent || '').trim();
-                const btLower = bt.toLowerCase();
-                if (btLower === 'включено' || btLower === 'included') {
-                  lines.push('Включено');
-                } else if (btLower.includes('не е включен') || btLower === 'not included') {
-                  lines.push('Не е включено');
-                }
-              }
-              
-              // Find leaf items — li elements, OR any div/span with an SVG icon child
-              // (many sites use div-based lists with check/cross SVG icons instead of li)
-              const itemSelector = 'li, div:has(> svg), div:has(> span > svg), [class*="item"]:not([class*="section"]):not([class*="group"]):not([class*="category"])';
-              let items;
-              try { items = sec.querySelectorAll(itemSelector); } catch(e) { items = sec.querySelectorAll('li'); }
-              const seenTexts = new Set();
-              items.forEach(item => {
-                // Skip containers that are themselves sections (have sub-items)
-                try { if (item.querySelectorAll('li, div:has(svg)').length > 2) return; } catch(e){}
-                const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!t || t.length < 3 || t.length > 200) return;
-                if (t === headingText) return;
-                if (seenTexts.has(t)) return;
-                // Skip badge texts and section headers
-                const tl = t.toLowerCase();
-                if (tl === 'включено' || tl === 'included' || tl.includes('не е включен') || tl === 'not included') return;
-                // Skip CTA buttons (ЗАЯВИ, Close, etc.)
-                if (isCTAButton(item)) return;
-                // Skip section headers that leaked into items
-                if (isSectionHeader(item) && t.length < 60) return;
-                seenTexts.add(t);
-                
-                const status = getLeafItemStatus(item);
-                if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
-                else if (status === 'in') lines.push(`✓ ${t}`);
-                else lines.push(t);
-              });
-            }
-            
-            if (sectionEls.length > 0) {
-              sectionEls.forEach(sec => processSection(sec));
-            } else {
-              // No explicit sections — try the whole container
-              // Look for repeating patterns: heading followed by list items
-              const fallbackSelector = 'li, div:has(> svg), div:has(> span > svg), [class*="item"]';
-              let allLi;
-              try { allLi = container.querySelectorAll(fallbackSelector); } catch(e) { allLi = container.querySelectorAll('li'); }
-              if (allLi.length > 0) {
-                const seenTexts = new Set();
-                allLi.forEach(item => {
-                  try { if (item.querySelectorAll('li, div:has(svg)').length > 2) return; } catch(e){}
-                  const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
-                  if (!t || t.length < 3 || t.length > 200) return;
-                  if (seenTexts.has(t)) return;
-                  const tl = t.toLowerCase();
-                  if (tl === 'включено' || tl === 'included' || tl.includes('не е включен')) return;
-                  if (isCTAButton(item)) return;
-                  if (isSectionHeader(item) && t.length < 60) return;
-                  seenTexts.add(t);
-                  const status = getLeafItemStatus(item);
-                  if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
-                  else if (status === 'in') lines.push(`✓ ${t}`);
-                  else lines.push(t);
-                });
-              } else {
-                // Pure fallback
-                const t = (container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
-                if (t && t.length > 20) lines.push(t);
-              }
-            }
-            
-            // Find CTA buttons at the end (e.g. "ЗАЯВИ ПАКЕТ СТАНДАРТ")
-            container.querySelectorAll('a[class*="btn"], a[class*="button"], button[class*="btn"], button[class*="cta"]').forEach(btn => {
-              const bt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
-              if (bt && /заяв|поръча|order|request|submit/i.test(bt)) {
-                lines.push(bt);
-              }
-            });
-            
-            const result = lines.join('\n');
-            if (result && result.length > 20) texts.push(result);
+          allOverlays.forEach(el => {
+            const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length > 20) texts.push(t);
           });
           
           return texts.join('\n\n');
@@ -2880,8 +2765,65 @@ async function extractStructured(page) {
           if (processedElements.has(parent)) return;
           parent = parent.parentElement;
         }
-        const text = el.innerText?.trim();
+        let text = el.innerText?.trim();
         if (!text) return;
+
+        // For li elements, detect SVG/icon status indicators
+        if (el.tagName === "LI") {
+          let iconStatus = null;
+          // Check SVG icons
+          const svgs = el.querySelectorAll("svg");
+          for (const svg of svgs) {
+            const svgClass = (svg.getAttribute("class") || "").toLowerCase();
+            const svgParentClass = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+            const ariaLabel = (svg.getAttribute("aria-label") || "").toLowerCase();
+            const titleEl = (svg.querySelector("title")?.textContent || "").toLowerCase();
+            const searchText = `${svgClass} ${svgParentClass} ${ariaLabel} ${titleEl}`;
+            const useHref = Array.from(svg.querySelectorAll("use")).map(u => (u.getAttribute("href") || u.getAttribute("xlink:href") || "").toLowerCase()).join(" ");
+            const combined = `${searchText} ${useHref}`;
+
+            // Lucide icons — exact match first
+            if (/\blucide-x\b/i.test(svgClass) && !/\blucide-x[a-z]/i.test(svgClass)) { iconStatus = "excluded"; break; }
+            if (/\blucide-check\b/i.test(svgClass)) { iconStatus = "included"; break; }
+            if (/\blucide-[a-z-]*x(-|$)/i.test(svgClass) || /\blucide-x-/i.test(svgClass)) { iconStatus = "excluded"; break; }
+            if (/\blucide-[a-z-]*check/i.test(svgClass)) { iconStatus = "included"; break; }
+
+            // General icon patterns
+            if (/close|cross|x-mark|xmark|times|remove|cancel|minus|exclude|unavailable|not.?included|disabled|unchecked|fa-times|fa-xmark|fa-close|fa-remove|fa-minus|icon-x\b|icon-close|icon-cross|heroicon.*x-mark|bi-x\b/i.test(combined)) {
+              iconStatus = "excluded"; break;
+            }
+            if (/\bcheck\b|tick|correct|done|success|verified|included|available|enabled|approved|fa-check|fa-tick|icon-check|icon-tick|heroicon.*check|bi-check/i.test(combined)) {
+              iconStatus = "included"; break;
+            }
+
+            // CSS class color hints
+            if (/text-muted|text-destructive|text-danger|text-gray|text-red|text-disabled|opacity-50|opacity-40/i.test(svgClass + " " + svgParentClass)) {
+              iconStatus = "excluded"; break;
+            }
+            if (/text-primary|text-success|text-green|text-brand/i.test(svgClass + " " + svgParentClass)) {
+              iconStatus = "included"; break;
+            }
+          }
+          // Check font icons
+          if (!iconStatus) {
+            const icons = el.querySelectorAll("i, span[class*='icon'], span[class*='fa-']");
+            for (const icon of icons) {
+              const cls = (icon.getAttribute("class") || "").toLowerCase();
+              const ct = (icon.textContent || "").trim();
+              if (/fa-check|icon-check|icon-tick|material.*check|material.*done/i.test(cls) || /[✓✔☑]/.test(ct)) { iconStatus = "included"; break; }
+              if (/fa-times|fa-close|fa-xmark|fa-remove|fa-minus|icon-x|icon-close|icon-cross|material.*close|material.*clear/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) { iconStatus = "excluded"; break; }
+            }
+          }
+          // Check unicode prefix
+          if (!iconStatus) {
+            const fc = text.slice(0, 3);
+            if (/^[✓✔☑✅]/.test(fc)) iconStatus = "included";
+            else if (/^[✕✗✘☒✖❌]/.test(fc)) iconStatus = "excluded";
+          }
+          if (iconStatus === "included") text = "✓ " + text;
+          else if (iconStatus === "excluded") text = "✗ " + text;
+        }
+
         const uniqueText = addUniqueText(text, 5);
         if (!uniqueText) return;
         if (el.tagName.startsWith("H")) {
