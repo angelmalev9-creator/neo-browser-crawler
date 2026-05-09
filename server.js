@@ -960,13 +960,16 @@ const pickFeatures = (root) => {
     if (hasX) prefix = "✗ ";
 
     const rawText = getText(li);
-const t = rawText;
+
+const t =
+  (hasCheck ? "✓ " : hasX ? "✗ " : "") +
+  rawText;
 
     if (!t) return;
     if (t.length < 3 || t.length > 140) return;
 
-    if (seen.has(t)) return;
-    seen.add(t);
+if (seen.has(rawText)) return;
+seen.add(rawText);
 
     items.push({
   text: rawText.trim(),
