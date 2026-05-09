@@ -2617,13 +2617,23 @@ for (const el of triggers) {
                 }
               }
               
-              // Find leaf items (li elements, or divs that look like list items)
-              const items = sec.querySelectorAll('li');
+              // Find leaf items — li elements, OR any div/span with an SVG icon child
+              // (many sites use div-based lists with check/cross SVG icons instead of li)
+              const itemSelector = 'li, div:has(> svg), div:has(> span > svg), [class*="item"]:not([class*="section"]):not([class*="group"]):not([class*="category"])';
+              let items;
+              try { items = sec.querySelectorAll(itemSelector); } catch(e) { items = sec.querySelectorAll('li'); }
+              const seenTexts = new Set();
               items.forEach(item => {
+                // Skip containers that are themselves sections (have sub-items)
+                if (item.querySelectorAll('li, div:has(svg)').length > 2) return;
                 const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
                 if (!t || t.length < 3 || t.length > 200) return;
-                // Skip if this is the heading or badge we already processed
                 if (t === headingText) return;
+                if (seenTexts.has(t)) return;
+                // Skip badge texts
+                const tl = t.toLowerCase();
+                if (tl === 'включено' || tl === 'included' || tl.includes('не е включен') || tl === 'not included') return;
+                seenTexts.add(t);
                 
                 const status = getLeafItemStatus(item);
                 if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
@@ -2637,11 +2647,19 @@ for (const el of triggers) {
             } else {
               // No explicit sections — try the whole container
               // Look for repeating patterns: heading followed by list items
-              const allLi = container.querySelectorAll('li');
+              const fallbackSelector = 'li, div:has(> svg), div:has(> span > svg), [class*="item"]';
+              let allLi;
+              try { allLi = container.querySelectorAll(fallbackSelector); } catch(e) { allLi = container.querySelectorAll('li'); }
               if (allLi.length > 0) {
+                const seenTexts = new Set();
                 allLi.forEach(item => {
+                  if (item.querySelectorAll('li, div:has(svg)').length > 2) return;
                   const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
                   if (!t || t.length < 3 || t.length > 200) return;
+                  if (seenTexts.has(t)) return;
+                  const tl = t.toLowerCase();
+                  if (tl === 'включено' || tl === 'included' || tl.includes('не е включен')) return;
+                  seenTexts.add(t);
                   const status = getLeafItemStatus(item);
                   if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
                   else if (status === 'in') lines.push(`✓ ${t}`);
