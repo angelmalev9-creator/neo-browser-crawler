@@ -2879,75 +2879,86 @@ async function extractStructured(page) {
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
-        // Instead of raw innerText (which misses SVG icon status),
-        // walk through child elements and apply icon detection to li elements
-        const mainParts = [];
-        const mainWalker = document.createTreeWalker(mainEl, NodeFilter.SHOW_ELEMENT, {
-          acceptNode: (node) => {
-            if (processedElements.has(node)) return NodeFilter.FILTER_REJECT;
-            const tag = node.tagName;
-            if (['H1','H2','H3','H4','H5','H6','P','LI','DIV','SECTION','ARTICLE','BLOCKQUOTE','FIGCAPTION','TD','TH','DT','DD','SUMMARY'].includes(tag)) {
-              return NodeFilter.FILTER_ACCEPT;
-            }
-            return NodeFilter.FILTER_SKIP;
+        // Shared helper: detect SVG icon status on any element
+        const detectIconStatus = (el) => {
+          // SVG icons
+          const svgs = el.querySelectorAll("svg");
+          for (const svg of svgs) {
+            const sc = (svg.getAttribute("class") || "").toLowerCase();
+            const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+            // Lucide icons
+            if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) return "excluded";
+            if (/\blucide-check\b/.test(sc)) return "included";
+            if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) return "excluded";
+            if (/\blucide-[a-z-]*check/.test(sc)) return "included";
+            // General icon classes
+            const al = (svg.getAttribute("aria-label") || "").toLowerCase();
+            const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
+            const all = `${sc} ${spc} ${al} ${ti}`;
+            if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) return "excluded";
+            if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) return "included";
+            // CSS class color hints
+            if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) return "excluded";
+            if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) return "included";
           }
-        });
-        let mainNode;
-        const mainSeen = new Set();
-        while (mainNode = mainWalker.nextNode()) {
-          let t = (mainNode.innerText || mainNode.textContent || "").trim();
-          if (!t || t.length < 3) continue;
-          // Skip very long blocks (likely containers)
-          if (t.length > 2000) continue;
-          const tNorm = t.replace(/\s+/g, ' ').trim();
-          if (mainSeen.has(tNorm)) continue;
-          mainSeen.add(tNorm);
+          // Font icons
+          const icons = el.querySelectorAll("i, span[class*='icon'], span[class*='fa-']");
+          for (const icon of icons) {
+            const cls = (icon.getAttribute("class") || "").toLowerCase();
+            const ct = (icon.textContent || "").trim();
+            if (/fa-check|icon-check|icon-tick/i.test(cls) || /[✓✔☑]/.test(ct)) return "included";
+            if (/fa-times|fa-close|fa-xmark|icon-x|icon-close/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) return "excluded";
+          }
+          return null;
+        };
 
-          // Apply SVG icon detection to li elements
-          if (mainNode.tagName === "LI") {
-            let liStatus = null;
-            const liSvgs = mainNode.querySelectorAll("svg");
-            for (const svg of liSvgs) {
-              const sc = (svg.getAttribute("class") || "").toLowerCase();
-              const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
-              // Lucide
-              if (/\blucide-x\b/i.test(sc) && !/\blucide-x[a-z]/i.test(sc)) { liStatus = "excluded"; break; }
-              if (/\blucide-check\b/i.test(sc)) { liStatus = "included"; break; }
-              if (/\blucide-[a-z-]*x(-|$)/i.test(sc) || /\blucide-x-/i.test(sc)) { liStatus = "excluded"; break; }
-              if (/\blucide-[a-z-]*check/i.test(sc)) { liStatus = "included"; break; }
-              // General
-              const al = (svg.getAttribute("aria-label") || "").toLowerCase();
-              const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
-              const all = `${sc} ${spc} ${al} ${ti}`;
-              if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) { liStatus = "excluded"; break; }
-              if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) { liStatus = "included"; break; }
-              // CSS class hints
-              if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) { liStatus = "excluded"; break; }
-              if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) { liStatus = "included"; break; }
-            }
-            // Font icons
-            if (!liStatus) {
-              const icons = mainNode.querySelectorAll("i, span[class*='icon'], span[class*='fa-']");
-              for (const icon of icons) {
-                const cls = (icon.getAttribute("class") || "").toLowerCase();
-                const ct = (icon.textContent || "").trim();
-                if (/fa-check|icon-check|icon-tick/i.test(cls) || /[✓✔☑]/.test(ct)) { liStatus = "included"; break; }
-                if (/fa-times|fa-close|fa-xmark|icon-x|icon-close/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) { liStatus = "excluded"; break; }
+        // STEP 1: Find all elements that contain an SVG icon (these are feature items).
+        // Mark their text with ✓/✗ prefix. Collect their text to dedup later.
+        const iconItemTexts = new Set();
+        const iconResults = [];
+        mainEl.querySelectorAll("svg.lucide, svg[class*='lucide'], svg[class*='fa-'], svg[class*='icon'], svg[class*='check'], svg[class*='close'], svg[class*='times']").forEach(svg => {
+          // Walk up to find the nearest meaningful container (the feature item row)
+          let container = svg.parentElement;
+          for (let i = 0; i < 5 && container && container !== mainEl; i++) {
+            const t = (container.innerText || container.textContent || "").trim();
+            // A good feature item is short (one line of text)
+            if (t && t.length >= 3 && t.length <= 200 && !t.includes("\n\n")) {
+              const status = detectIconStatus(container);
+              if (status) {
+                const norm = t.replace(/\s+/g, ' ').trim();
+                if (!iconItemTexts.has(norm)) {
+                  iconItemTexts.add(norm);
+                  const prefix = status === "included" ? "✓ " : "✗ ";
+                  iconResults.push(prefix + norm);
+                  processedElements.add(container);
+                }
+                break;
               }
             }
-            // Unicode
-            if (!liStatus) {
-              if (/^[✓✔☑✅]/.test(t)) liStatus = "included";
-              else if (/^[✕✗✘☒✖❌]/.test(t)) liStatus = "excluded";
-            }
-            if (liStatus === "included") t = "✓ " + t;
-            else if (liStatus === "excluded") t = "✗ " + t;
+            container = container.parentElement;
           }
+        });
 
-          const uniqueT = addUniqueText(t, 5);
-          if (uniqueT) mainParts.push(uniqueT);
+        // STEP 2: Get remaining mainContent text (non-icon parts)
+        const mainText = mainEl.innerText?.trim() || "";
+        // Remove icon item texts from the main text to avoid duplication
+        let cleanedMainText = mainText;
+        for (const itemText of iconItemTexts) {
+          // Remove each icon item text from the main text (they'll be re-added with prefix)
+          cleanedMainText = cleanedMainText.split(itemText).join("");
         }
-        mainContent = mainParts.join("\n");
+        cleanedMainText = cleanedMainText.replace(/\n{3,}/g, "\n\n").trim();
+
+        // STEP 3: Combine — insert icon results where they fit, or append
+        const parts = [];
+        if (cleanedMainText) {
+          const u = addUniqueText(cleanedMainText, 5);
+          if (u) parts.push(u);
+        }
+        if (iconResults.length > 0) {
+          parts.push(iconResults.join("\n"));
+        }
+        mainContent = parts.join("\n\n");
       }
 
       const isVisible = (el) => {
