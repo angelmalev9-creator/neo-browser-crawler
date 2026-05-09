@@ -2879,8 +2879,75 @@ async function extractStructured(page) {
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
-        const text = mainEl.innerText?.trim();
-        if (text) mainContent = addUniqueText(text) || "";
+        // Instead of raw innerText (which misses SVG icon status),
+        // walk through child elements and apply icon detection to li elements
+        const mainParts = [];
+        const mainWalker = document.createTreeWalker(mainEl, NodeFilter.SHOW_ELEMENT, {
+          acceptNode: (node) => {
+            if (processedElements.has(node)) return NodeFilter.FILTER_REJECT;
+            const tag = node.tagName;
+            if (['H1','H2','H3','H4','H5','H6','P','LI','DIV','SECTION','ARTICLE','BLOCKQUOTE','FIGCAPTION','TD','TH','DT','DD','SUMMARY'].includes(tag)) {
+              return NodeFilter.FILTER_ACCEPT;
+            }
+            return NodeFilter.FILTER_SKIP;
+          }
+        });
+        let mainNode;
+        const mainSeen = new Set();
+        while (mainNode = mainWalker.nextNode()) {
+          let t = (mainNode.innerText || mainNode.textContent || "").trim();
+          if (!t || t.length < 3) continue;
+          // Skip very long blocks (likely containers)
+          if (t.length > 2000) continue;
+          const tNorm = t.replace(/\s+/g, ' ').trim();
+          if (mainSeen.has(tNorm)) continue;
+          mainSeen.add(tNorm);
+
+          // Apply SVG icon detection to li elements
+          if (mainNode.tagName === "LI") {
+            let liStatus = null;
+            const liSvgs = mainNode.querySelectorAll("svg");
+            for (const svg of liSvgs) {
+              const sc = (svg.getAttribute("class") || "").toLowerCase();
+              const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+              // Lucide
+              if (/\blucide-x\b/i.test(sc) && !/\blucide-x[a-z]/i.test(sc)) { liStatus = "excluded"; break; }
+              if (/\blucide-check\b/i.test(sc)) { liStatus = "included"; break; }
+              if (/\blucide-[a-z-]*x(-|$)/i.test(sc) || /\blucide-x-/i.test(sc)) { liStatus = "excluded"; break; }
+              if (/\blucide-[a-z-]*check/i.test(sc)) { liStatus = "included"; break; }
+              // General
+              const al = (svg.getAttribute("aria-label") || "").toLowerCase();
+              const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
+              const all = `${sc} ${spc} ${al} ${ti}`;
+              if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) { liStatus = "excluded"; break; }
+              if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) { liStatus = "included"; break; }
+              // CSS class hints
+              if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) { liStatus = "excluded"; break; }
+              if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) { liStatus = "included"; break; }
+            }
+            // Font icons
+            if (!liStatus) {
+              const icons = mainNode.querySelectorAll("i, span[class*='icon'], span[class*='fa-']");
+              for (const icon of icons) {
+                const cls = (icon.getAttribute("class") || "").toLowerCase();
+                const ct = (icon.textContent || "").trim();
+                if (/fa-check|icon-check|icon-tick/i.test(cls) || /[✓✔☑]/.test(ct)) { liStatus = "included"; break; }
+                if (/fa-times|fa-close|fa-xmark|icon-x|icon-close/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) { liStatus = "excluded"; break; }
+              }
+            }
+            // Unicode
+            if (!liStatus) {
+              if (/^[✓✔☑✅]/.test(t)) liStatus = "included";
+              else if (/^[✕✗✘☒✖❌]/.test(t)) liStatus = "excluded";
+            }
+            if (liStatus === "included") t = "✓ " + t;
+            else if (liStatus === "excluded") t = "✗ " + t;
+          }
+
+          const uniqueT = addUniqueText(t, 5);
+          if (uniqueT) mainParts.push(uniqueT);
+        }
+        mainContent = mainParts.join("\n");
       }
 
       const isVisible = (el) => {
