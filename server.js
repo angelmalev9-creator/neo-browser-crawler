@@ -945,25 +945,7 @@ const pickFeatures = (root) => {
   const seen = new Set();
 
   root.querySelectorAll("li").forEach(li => {
-    const hasCheck =
-  li.querySelector(".lucide-check") ||
-  li.querySelector('[class*="lucide-check"]');
 
-const hasX =
-  li.querySelector(".lucide-x") ||
-  li.querySelector('[class*="lucide-x"]');
-
-let prefix = "";
-
-if (hasCheck) prefix = "✓ ";
-if (hasX) prefix = "✗ ";
-
-const t = prefix + getText(li);
-
-    if (!t) return;
-    if (t.length < 3 || t.length > 140) return;
-
-    // Detect lucide icons
     const hasCheck =
       li.querySelector(".lucide-check") ||
       li.querySelector('[class*="lucide-check"]');
@@ -972,28 +954,18 @@ const t = prefix + getText(li);
       li.querySelector(".lucide-x") ||
       li.querySelector('[class*="lucide-x"]');
 
-    let included = null;
+    let prefix = "";
 
-    if (hasCheck) included = true;
-    if (hasX) included = false;
+    if (hasCheck) prefix = "✓ ";
+    if (hasX) prefix = "✗ ";
 
-    // Fallback from text
-    if (included === null) {
-      if (/^✓/.test(t)) included = true;
-      if (/^✗/.test(t)) included = false;
-    }
+    const t = prefix + getText(li);
 
-    const cleaned = t
-      .replace(/^✓\s*/, "")
-      .replace(/^✗\s*/, "")
-      .trim();
+    if (!t) return;
+    if (t.length < 3 || t.length > 140) return;
 
-    if (!cleaned) return;
-
-    const key = cleaned + "|" + included;
-
-    if (seen.has(key)) return;
-    seen.add(key);
+    if (seen.has(t)) return;
+    seen.add(t);
 
     items.push(t.trim());
   });
