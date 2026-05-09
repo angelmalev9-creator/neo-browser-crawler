@@ -949,50 +949,21 @@ const pickFeatures = (root) => {
     if (!t) return;
     if (t.length < 3 || t.length > 140) return;
 
-    const style = window.getComputedStyle(li);
+    // Find actual visual row element
+    const row =
+      li.querySelector(".bg-background") ||
+      li.querySelector('[class*="bg-background"]') ||
+      li;
 
-    const opacity = parseFloat(style.opacity || "1");
-    const color = (style.color || "").toLowerCase();
+    const style = window.getComputedStyle(row);
+    const bg = (style.backgroundColor || "").toLowerCase();
 
-    const cls = (li.className || "").toLowerCase();
-    const html = (li.innerHTML || "").toLowerCase();
+    // White rows = excluded / disabled
+    const isExcluded =
+      bg.includes("255, 255, 255") ||
+      bg.includes("ffffff");
 
-    // Detect grey / disabled rows
-const childNodes = Array.from(li.querySelectorAll("*"));
-
-const hasGreyChild = childNodes.some(el => {
-  const s = window.getComputedStyle(el);
-
-  const op = parseFloat(s.opacity || "1");
-  const c = (s.color || "").toLowerCase();
-
-  return (
-    op < 0.85 ||
-    /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(c) ||
-    /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(c)
-  );
-});
-
-const isGrey =
-  opacity < 0.85 ||
-  hasGreyChild ||
-  /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(color) ||
-  /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(color);
-    // Detect X icons / disabled states
-    const excluded =
-      isGrey ||
-      /not included|не е включено|excluded|disabled|inactive|unavailable/i.test(t) ||
-      /line-through|disabled|excluded|inactive/i.test(cls) ||
-      /fa-times|fa-xmark|icon-x|icon-close|cross|cancel|times/i.test(html) ||
-      li.querySelector(`
-        [class*="x"],
-        [class*="close"],
-        [class*="times"],
-        [class*="cross"],
-        [data-state="unchecked"]
-      `);
-
-    if (excluded) return;
+    if (isExcluded) return;
 
     items.push(t);
   });
