@@ -940,16 +940,56 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-    const pickFeatures = (root) => {
-      const items = [];
-      root.querySelectorAll("li").forEach(li => {
-        const t = getText(li);
-        if (!t) return;
-        if (t.length < 3 || t.length > 140) return;
-        items.push(t);
-      });
-      return Array.from(new Set(items)).slice(0, 30);
-    };
+const pickFeatures = (root) => {
+  const items = [];
+  const seen = new Set();
+
+  root.querySelectorAll("li").forEach(li => {
+    const t = getText(li);
+
+    if (!t) return;
+    if (t.length < 3 || t.length > 140) return;
+
+    // Detect lucide icons
+    const hasCheck =
+      li.querySelector(".lucide-check") ||
+      li.querySelector('[class*="lucide-check"]');
+
+    const hasX =
+      li.querySelector(".lucide-x") ||
+      li.querySelector('[class*="lucide-x"]');
+
+    let included = null;
+
+    if (hasCheck) included = true;
+    if (hasX) included = false;
+
+    // Fallback from text
+    if (included === null) {
+      if (/^✓/.test(t)) included = true;
+      if (/^✗/.test(t)) included = false;
+    }
+
+    const cleaned = t
+      .replace(/^✓\s*/, "")
+      .replace(/^✗\s*/, "")
+      .trim();
+
+    if (!cleaned) return;
+
+    const key = cleaned + "|" + included;
+
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    items.push({
+      text: cleaned,
+      included
+    });
+  });
+
+  return items.slice(0, 30);
+};
 
     const pickPeriod = (root) => {
       const t = getText(root);
