@@ -959,7 +959,7 @@ const hasCheck =
 const hasX =
   sectionText.includes("не е включено");
 
-    let prefix = "";
+    
 
     if (hasCheck) prefix = "✓ ";
     if (hasX) prefix = "✗ ";
