@@ -2781,10 +2781,14 @@ async function extractStructured(page) {
       };
 
       try {
-        document.querySelectorAll("svg").forEach(svg => {
+        const allSvgs = document.querySelectorAll("svg");
+        console.log("[SVG-SCAN] Found " + allSvgs.length + " SVGs total");
+        let svgMatched = 0;
+        allSvgs.forEach(svg => {
           if (isInBoilerplate(svg)) return;
           const status = iconDetect(svg);
           if (!status) return;
+          svgMatched++;
 
           // Walk up to the nearest short-text container (the feature item row)
           let container = svg.parentElement;
@@ -2799,6 +2803,7 @@ async function extractStructured(page) {
             // Found a good container
             const prefix = status === "included" ? "✓ " : "✗ ";
             const prefixed = prefix + t;
+            console.log("[SVG-SCAN] " + prefixed);
             const uniqueText = addUniqueText(prefixed, 5);
             if (uniqueText) {
               iconFeatureTexts.push(uniqueText);
@@ -2809,7 +2814,8 @@ async function extractStructured(page) {
             break;
           }
         });
-      } catch {}
+        console.log("[SVG-SCAN] Matched " + svgMatched + " icon SVGs, captured " + iconFeatureTexts.length + " features");
+      } catch (e) { console.error("[SVG-SCAN] Error:", e.message); }
 
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
@@ -2934,86 +2940,44 @@ async function extractStructured(page) {
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
-        // Shared helper: detect SVG icon status on any element
-        const detectIconStatus = (el) => {
-          // SVG icons
-          const svgs = el.querySelectorAll("svg");
-          for (const svg of svgs) {
-            const sc = (svg.getAttribute("class") || "").toLowerCase();
-            const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
-            // Lucide icons
-            if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) return "excluded";
-            if (/\blucide-check\b/.test(sc)) return "included";
-            if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) return "excluded";
-            if (/\blucide-[a-z-]*check/.test(sc)) return "included";
-            // General icon classes
-            const al = (svg.getAttribute("aria-label") || "").toLowerCase();
-            const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
-            const all = `${sc} ${spc} ${al} ${ti}`;
-            if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) return "excluded";
-            if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) return "included";
-            // CSS class color hints
-            if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) return "excluded";
-            if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) return "included";
-          }
-          // Font icons
-          const icons = el.querySelectorAll("i, span[class*='icon'], span[class*='fa-']");
-          for (const icon of icons) {
-            const cls = (icon.getAttribute("class") || "").toLowerCase();
-            const ct = (icon.textContent || "").trim();
-            if (/fa-check|icon-check|icon-tick/i.test(cls) || /[✓✔☑]/.test(ct)) return "included";
-            if (/fa-times|fa-close|fa-xmark|icon-x|icon-close/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) return "excluded";
-          }
-          return null;
-        };
-
-        // STEP 1: Find all elements that contain an SVG icon (these are feature items).
-        // Mark their text with ✓/✗ prefix. Collect their text to dedup later.
-        const iconItemTexts = new Set();
-        const iconResults = [];
-        mainEl.querySelectorAll("svg.lucide, svg[class*='lucide'], svg[class*='fa-'], svg[class*='icon'], svg[class*='check'], svg[class*='close'], svg[class*='times']").forEach(svg => {
-          // Walk up to find the nearest meaningful container (the feature item row)
-          let container = svg.parentElement;
-          for (let i = 0; i < 5 && container && container !== mainEl; i++) {
-            const t = (container.innerText || container.textContent || "").trim();
-            // A good feature item is short (one line of text)
-            if (t && t.length >= 3 && t.length <= 200 && !t.includes("\n\n")) {
-              const status = detectIconStatus(container);
-              if (status) {
-                const norm = t.replace(/\s+/g, ' ').trim();
-                if (!iconItemTexts.has(norm)) {
-                  iconItemTexts.add(norm);
-                  const prefix = status === "included" ? "✓ " : "✗ ";
-                  iconResults.push(prefix + norm);
-                  processedElements.add(container);
-                }
-                break;
-              }
+        // Collect text from main, but skip elements already processed by SVG icon scan / sections loop.
+        // Walk leaf-ish text nodes and skip any that live inside a processedElements container.
+        const mainParts = [];
+        const collectText = (node) => {
+          if (processedElements.has(node)) return;
+          // If it's a text-bearing leaf element, grab text
+          const children = node.children;
+          if (!children || children.length === 0) {
+            const t = (node.textContent || "").trim();
+            if (t && t.length >= 3) {
+              const u = addUniqueText(t, 5);
+              if (u) mainParts.push(u);
             }
-            container = container.parentElement;
+            return;
           }
-        });
-
-        // STEP 2: Get remaining mainContent text (non-icon parts)
-        const mainText = mainEl.innerText?.trim() || "";
-        // Remove icon item texts from the main text to avoid duplication
-        let cleanedMainText = mainText;
-        for (const itemText of iconItemTexts) {
-          // Remove each icon item text from the main text (they'll be re-added with prefix)
-          cleanedMainText = cleanedMainText.split(itemText).join("");
+          // Check if any child is processed — if so walk children individually
+          let hasProcessedChild = false;
+          for (const ch of children) {
+            if (processedElements.has(ch)) { hasProcessedChild = true; break; }
+          }
+          if (!hasProcessedChild) {
+            // No processed children — safe to grab full innerText
+            const t = (node.innerText || "").trim();
+            if (t && t.length >= 3) {
+              const u = addUniqueText(t, 5);
+              if (u) mainParts.push(u);
+            }
+          } else {
+            // Has processed children — recurse to skip them
+            for (const ch of children) {
+              collectText(ch);
+            }
+          }
+        };
+        for (const child of mainEl.children) {
+          collectText(child);
         }
-        cleanedMainText = cleanedMainText.replace(/\n{3,}/g, "\n\n").trim();
-
-        // STEP 3: Combine — insert icon results where they fit, or append
-        const parts = [];
-        if (cleanedMainText) {
-          const u = addUniqueText(cleanedMainText, 5);
-          if (u) parts.push(u);
-        }
-        if (iconResults.length > 0) {
-          parts.push(iconResults.join("\n"));
-        }
-        mainContent = parts.join("\n\n");
+        mainContent = mainParts.join("\n");
       }
 
       const isVisible = (el) => {
