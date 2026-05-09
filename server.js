@@ -2756,6 +2756,61 @@ async function extractStructured(page) {
         } catch { return false; }
       };
 
+      // ── SVG ICON FEATURE SCAN (runs BEFORE sections loop) ─────────────
+      // Scan ALL elements in the page that contain SVG status icons (lucide-check, lucide-x, etc.)
+      // This catches feature lists regardless of tag type (div, li, span, etc.)
+      // Must run first so addUniqueText records the ✓/✗ prefixed text before sections grabs it plain.
+      const iconFeatureTexts = [];
+      const iconDetect = (svg) => {
+        const sc = (svg.getAttribute("class") || "").toLowerCase();
+        const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+        // Lucide
+        if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) return "excluded";
+        if (/\blucide-check\b/.test(sc)) return "included";
+        if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) return "excluded";
+        if (/\blucide-[a-z-]*check/.test(sc)) return "included";
+        // General
+        const al = (svg.getAttribute("aria-label") || "").toLowerCase();
+        const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
+        const all = `${sc} ${spc} ${al} ${ti}`;
+        if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) return "excluded";
+        if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) return "included";
+        if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) return "excluded";
+        if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) return "included";
+        return null;
+      };
+
+      try {
+        document.querySelectorAll("svg").forEach(svg => {
+          if (isInBoilerplate(svg)) return;
+          const status = iconDetect(svg);
+          if (!status) return;
+
+          // Walk up to the nearest short-text container (the feature item row)
+          let container = svg.parentElement;
+          for (let i = 0; i < 6 && container; i++) {
+            if (processedElements.has(container)) return;
+            if (container === document.body) return;
+            const t = (container.innerText || container.textContent || "").replace(/\s+/g, " ").trim();
+            if (!t || t.length < 3 || t.length > 200) {
+              container = container.parentElement;
+              continue;
+            }
+            // Found a good container
+            const prefix = status === "included" ? "✓ " : "✗ ";
+            const prefixed = prefix + t;
+            const uniqueText = addUniqueText(prefixed, 5);
+            if (uniqueText) {
+              iconFeatureTexts.push(uniqueText);
+              processedElements.add(container);
+              // Mark all child elements as processed to prevent sections loop from re-adding without markers
+              container.querySelectorAll("*").forEach(child => processedElements.add(child));
+            }
+            break;
+          }
+        });
+      } catch {}
+
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
         if (el.closest("details.wp-block-details, details")) return;
@@ -2834,63 +2889,6 @@ async function extractStructured(page) {
         }
         processedElements.add(el);
       });
-
-      // ── SVG ICON FEATURE SCAN ──────────────────────────────────────────
-      // Scan ALL elements in the page that contain SVG status icons (lucide-check, lucide-x, etc.)
-      // This catches feature lists regardless of tag type (div, li, span, etc.)
-      const iconFeatureTexts = [];
-      const iconDetect = (svg) => {
-        const sc = (svg.getAttribute("class") || "").toLowerCase();
-        const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
-        // Lucide
-        if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) return "excluded";
-        if (/\blucide-check\b/.test(sc)) return "included";
-        if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) return "excluded";
-        if (/\blucide-[a-z-]*check/.test(sc)) return "included";
-        // General
-        const al = (svg.getAttribute("aria-label") || "").toLowerCase();
-        const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
-        const all = `${sc} ${spc} ${al} ${ti}`;
-        if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) return "excluded";
-        if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) return "included";
-        if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) return "excluded";
-        if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) return "included";
-        return null;
-      };
-
-      try {
-        document.querySelectorAll("svg").forEach(svg => {
-          const status = iconDetect(svg);
-          if (!status) return;
-
-          // Walk up to the nearest short-text container (the feature item row)
-          let container = svg.parentElement;
-          for (let i = 0; i < 6 && container; i++) {
-            if (processedElements.has(container)) return;
-            if (container === document.body) return;
-            const t = (container.innerText || container.textContent || "").replace(/\s+/g, " ").trim();
-            if (!t || t.length < 3 || t.length > 200) {
-              container = container.parentElement;
-              continue;
-            }
-            // Found a good container — check it has the SVG as a direct/near descendant
-            if (!container.querySelector("svg")) {
-              container = container.parentElement;
-              continue;
-            }
-            const prefix = status === "included" ? "✓ " : "✗ ";
-            const prefixed = prefix + t;
-            const uniqueText = addUniqueText(prefixed, 5);
-            if (uniqueText) {
-              iconFeatureTexts.push(uniqueText);
-              processedElements.add(container);
-              // Also mark all child elements as processed to prevent duplication
-              container.querySelectorAll("*").forEach(child => processedElements.add(child));
-            }
-            break;
-          }
-        });
-      } catch {}
 
       const overlaySelectors = [
         '[class*="overlay"]', '[class*="modal"]', '[class*="popup"]',
