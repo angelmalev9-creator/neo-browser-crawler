@@ -3018,6 +3018,7 @@ async function extractStructured(page) {
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
           sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           iconFeatureTexts.length ? iconFeatureTexts.join("\n") : "",
+          `[DEBUG_SVG] totalSvgs=${document.querySelectorAll("svg").length} iconFeatures=${iconFeatureTexts.length} svgClasses=${Array.from(document.querySelectorAll("svg")).slice(0,5).map(s=>(s.getAttribute("class")||"").split(" ").slice(0,3).join(".")).join("|")}`,
           mainContent,
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
