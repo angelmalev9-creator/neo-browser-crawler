@@ -958,11 +958,26 @@ const pickFeatures = (root) => {
     const html = (li.innerHTML || "").toLowerCase();
 
     // Detect grey / disabled rows
-    const isGrey =
-      opacity < 0.85 ||
-      /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(color) ||
-      /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(color);
+const childNodes = Array.from(li.querySelectorAll("*"));
 
+const hasGreyChild = childNodes.some(el => {
+  const s = window.getComputedStyle(el);
+
+  const op = parseFloat(s.opacity || "1");
+  const c = (s.color || "").toLowerCase();
+
+  return (
+    op < 0.85 ||
+    /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(c) ||
+    /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(c)
+  );
+});
+
+const isGrey =
+  opacity < 0.85 ||
+  hasGreyChild ||
+  /rgb\(1[5-9]\d,\s*1[5-9]\d,\s*1[5-9]\d\)/i.test(color) ||
+  /rgb\(2\d\d,\s*2\d\d,\s*2\d\d\)/i.test(color);
     // Detect X icons / disabled states
     const excluded =
       isGrey ||
