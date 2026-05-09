@@ -940,45 +940,84 @@ async function extractPricingFromPage(page) {
       return "";
     };
 
-const pickFeatures = (root) => {
-  const items = [];
+    const pickFeatures = (root) => {
+      const items = [];
+      root.querySelectorAll("li").forEach(li => {
+        const t = getText(li);
+        if (!t) return;
+        if (t.length < 3 || t.length > 140) return;
 
-  root.querySelectorAll("li").forEach(li => {
-    const t = getText(li);
+        // ── NEO FIX: Detect included vs excluded items ──
+        // Check visual indicators: icon color, opacity, CSS class, Unicode marks
+        let status = '';
+        try {
+          const style = window.getComputedStyle(li);
 
-    if (!t) return;
-    if (t.length < 3 || t.length > 140) return;
+          // 1. Check for SVG icon inside the li
+          const svg = li.querySelector('svg');
+          if (svg) {
+            const svgStyle = window.getComputedStyle(svg);
+            const svgColor = svgStyle.color || '';
+            const rgbMatch = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (rgbMatch) {
+              const [, r, g, b] = rgbMatch.map(Number);
+              // Green icon = included
+              if (g > 100 && g > r * 1.2 && g > b * 1.2) status = 'included';
+              // Gray icon = excluded
+              else if (r > 140 && g > 140 && b > 140 && Math.abs(r - g) < 30 && Math.abs(g - b) < 30) status = 'excluded';
+              // Red icon = excluded
+              else if (r > 160 && g < 100 && b < 100) status = 'excluded';
+            }
+            // Also check SVG path: checkmark vs X
+            const pathD = (svg.querySelector('path')?.getAttribute('d') || '').toLowerCase();
+            if (!status && pathD) {
+              // Checkmark paths typically go down-right then up-right
+              if (/[ml].*[ml].*[ml]/i.test(pathD) && pathD.length < 60) {
+                // Short path with multiple segments - could be check or X
+              }
+            }
+          }
 
-    // Detect disabled/excluded rows by white background
-    const row =
-      li.querySelector(".bg-background") ||
-      li.querySelector('[class*="bg-background"]') ||
-      li;
+          // 2. Check element opacity
+          if (!status && parseFloat(style.opacity) < 0.6) status = 'excluded';
 
-    const style = window.getComputedStyle(row);
-    const bg = (style.backgroundColor || "").toLowerCase();
+          // 3. Check line-through
+          if (!status && style.textDecoration && style.textDecoration.includes('line-through')) status = 'excluded';
 
-    const isExcluded =
-      bg.includes("255, 255, 255") ||
-      bg.includes("ffffff") ||
-      /\(не е включено\)/i.test(t);
+          // 4. Check text color (gray = excluded)
+          if (!status) {
+            const elColor = style.color || '';
+            const rgbMatch = elColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (rgbMatch) {
+              const [, r, g, b] = rgbMatch.map(Number);
+              if (r > 160 && g > 160 && b > 160 && Math.abs(r - g) < 20) status = 'excluded';
+            }
+          }
 
-    if (isExcluded) return;
+          // 5. Check CSS classes on li or parent
+          if (!status) {
+            const cls = ((li.className || '') + ' ' + (li.parentElement?.className || '')).toLowerCase();
+            if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) status = 'excluded';
+            if (/included|active|available|enabled/i.test(cls)) status = 'included';
+          }
 
-    // Remove accidental X/check chars
-    const cleaned = t
-      .replace(/^✗\s*/, "")
-      .replace(/^✓\s*/, "")
-      .replace(/\(не е включено\)/gi, "")
-      .trim();
+          // 6. Unicode check/cross in text
+          if (!status) {
+            if (/^[\s]*[✓✔☑✅]/u.test(t)) status = 'included';
+            if (/^[\s]*[✕✗✘☒❌×]/u.test(t)) status = 'excluded';
+          }
+        } catch (e) {}
 
-    if (!cleaned) return;
-
-    items.push(cleaned);
-  });
-
-  return Array.from(new Set(items)).slice(0, 30);
-};
+        if (status === 'excluded') {
+          items.push(`✗ ${t} (не е включено)`);
+        } else if (status === 'included') {
+          items.push(`✓ ${t}`);
+        } else {
+          items.push(t);
+        }
+      });
+      return Array.from(new Set(items)).slice(0, 30);
+    };
 
     const pickPeriod = (root) => {
       const t = getText(root);
@@ -2500,10 +2539,88 @@ for (const el of triggers) {
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
           
           // Get text from the newest overlay
+          // ── NEO FIX: Structured extraction — detect included vs excluded items ──
           const texts = [];
-          allOverlays.forEach(el => {
-            const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length > 20) texts.push(t);
+          allOverlays.forEach(container => {
+            const lines = [];
+            // Walk all list items and check their visual status
+            const allItems = container.querySelectorAll('li, [class*="item"]:not([class*="section"]):not([class*="group"]), [class*="row"]');
+            const processed = new Set();
+            
+            // First grab section headings and badges
+            container.querySelectorAll('h2, h3, h4, h5, [class*="title"], [class*="heading"]').forEach(h => {
+              const ht = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim();
+              if (ht && ht.length >= 3 && ht.length <= 120) {
+                lines.push(ht);
+                processed.add(h);
+              }
+            });
+            // Badge: "Включено" / "Не е включено"
+            container.querySelectorAll('[class*="badge"], [class*="tag"], [class*="status"], [class*="label"]').forEach(b => {
+              const bt = (b.innerText || b.textContent || '').trim().toLowerCase();
+              if (bt === 'включено' || bt === 'included') lines.push('Включено');
+              else if (bt.includes('не е включен') || bt === 'not included') lines.push('Не е включено');
+            });
+            
+            if (allItems.length > 0) {
+              allItems.forEach(item => {
+                if (processed.has(item)) return;
+                const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length < 3 || t.length > 200) return;
+                processed.add(item);
+                
+                let status = '';
+                try {
+                  // Check SVG icon color
+                  const svg = item.querySelector('svg');
+                  if (svg) {
+                    const svgColor = window.getComputedStyle(svg).color || '';
+                    const m = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                    if (m) {
+                      const [, r, g, b] = m.map(Number);
+                      if (g > 100 && g > r * 1.2 && g > b * 1.2) status = 'in';
+                      else if (r > 140 && g > 140 && b > 140 && Math.abs(r-g) < 30) status = 'out';
+                      else if (r > 160 && g < 100) status = 'out';
+                    }
+                  }
+                  // Check opacity
+                  if (!status && parseFloat(window.getComputedStyle(item).opacity) < 0.6) status = 'out';
+                  // Check text color
+                  if (!status) {
+                    const c = window.getComputedStyle(item).color || '';
+                    const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                    if (m) {
+                      const [, r, g, b] = m.map(Number);
+                      if (r > 160 && g > 160 && b > 160 && Math.abs(r-g) < 20) status = 'out';
+                    }
+                  }
+                  // Check CSS class
+                  if (!status) {
+                    const cls = ((item.className||'') + ' ' + (item.parentElement?.className||'')).toLowerCase();
+                    if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) status = 'out';
+                    if (/included|active|available|enabled/i.test(cls)) status = 'in';
+                  }
+                  // Unicode marks
+                  if (!status) {
+                    if (/^[\s]*[✓✔☑✅]/u.test(t)) status = 'in';
+                    if (/^[\s]*[✕✗✘☒❌×]/u.test(t)) status = 'out';
+                  }
+                } catch(e){}
+                
+                if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
+                else if (status === 'in') lines.push(`✓ ${t}`);
+                else lines.push(t);
+              });
+            }
+            
+            // Fallback: if no structured items found, use plain text
+            if (lines.length === 0) {
+              const t = (container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+              if (t && t.length > 20) lines.push(t);
+            }
+            
+            const result = lines.join('\n');
+            if (result && result.length > 20) texts.push(result);
           });
           
           return texts.join('\n\n');
