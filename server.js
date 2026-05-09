@@ -968,8 +968,8 @@ const hasX =
 
 let prefix = "";
 
-if (hasCheck && !hasX) prefix = "✓ ";
-if (hasX) prefix = "✗ ";
+if (hasCheck && !hasX) prefix = "[INCLUDED] ";
+if (hasX) prefix = "[EXCLUDED] ";
 
 const t = prefix + rawText;
 
