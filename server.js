@@ -945,7 +945,20 @@ const pickFeatures = (root) => {
   const seen = new Set();
 
   root.querySelectorAll("li").forEach(li => {
-    const t = getText(li);
+    const hasCheck =
+  li.querySelector(".lucide-check") ||
+  li.querySelector('[class*="lucide-check"]');
+
+const hasX =
+  li.querySelector(".lucide-x") ||
+  li.querySelector('[class*="lucide-x"]');
+
+let prefix = "";
+
+if (hasCheck) prefix = "✓ ";
+if (hasX) prefix = "✗ ";
+
+const t = prefix + getText(li);
 
     if (!t) return;
     if (t.length < 3 || t.length > 140) return;
@@ -982,10 +995,7 @@ const pickFeatures = (root) => {
     if (seen.has(key)) return;
     seen.add(key);
 
-    items.push({
-      text: cleaned,
-      included
-    });
+    items.push(t.trim());
   });
 
   return items.slice(0, 30);
