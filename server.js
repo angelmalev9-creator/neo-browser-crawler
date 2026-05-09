@@ -953,23 +953,26 @@ const row =
 
 const rowText = getText(row).toLowerCase();
 
+const cardRoot =
+  row.closest("[class*='card']") ||
+  row.closest("section") ||
+  row.parentElement;
+
+const cardText = getText(cardRoot).toLowerCase();
+
 const hasCheck =
-  rowText.includes("✓") ||
-  (
-    rowText.includes("включено") &&
-    !rowText.includes("не е включено")
-  );
+  cardText.includes("включено") &&
+  !cardText.includes("не е включено");
 
 const hasX =
-  rowText.includes("✗") ||
-  rowText.includes("не е включено");
+  cardText.includes("не е включено");
 
     
 
     if (hasCheck) prefix = "✓ ";
     if (hasX) prefix = "✗ ";
 
-    const rawText = rowText;
+    const rawText = getText(row);
 
 let prefix = "";
 
