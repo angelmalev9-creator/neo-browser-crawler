@@ -944,7 +944,7 @@ const pickFeatures = (root) => {
   const items = [];
   const seen = new Set();
 
-  root.querySelectorAll("li").forEach(li => {
+  root.querySelectorAll("li, div.flex.items-center.gap-3").forEach(li => {
 
     const hasCheck =
       li.querySelector(".lucide-check") ||
