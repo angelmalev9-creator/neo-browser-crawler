@@ -2940,12 +2940,9 @@ async function extractStructured(page) {
       let mainContent = "";
       const mainEl = document.querySelector("main") || document.querySelector("article");
       if (mainEl && !processedElements.has(mainEl)) {
-        // Collect text from main, but skip elements already processed by SVG icon scan / sections loop.
-        // Walk leaf-ish text nodes and skip any that live inside a processedElements container.
         const mainParts = [];
         const collectText = (node) => {
           if (processedElements.has(node)) return;
-          // If it's a text-bearing leaf element, grab text
           const children = node.children;
           if (!children || children.length === 0) {
             const t = (node.textContent || "").trim();
@@ -2955,20 +2952,22 @@ async function extractStructured(page) {
             }
             return;
           }
-          // Check if any child is processed — if so walk children individually
-          let hasProcessedChild = false;
-          for (const ch of children) {
-            if (processedElements.has(ch)) { hasProcessedChild = true; break; }
-          }
-          if (!hasProcessedChild) {
-            // No processed children — safe to grab full innerText
+          // Check if ANY descendant (not just direct child) is processed
+          let hasProcessedDescendant = false;
+          try {
+            const allDesc = node.querySelectorAll("*");
+            for (const d of allDesc) {
+              if (processedElements.has(d)) { hasProcessedDescendant = true; break; }
+            }
+          } catch {}
+          if (!hasProcessedDescendant) {
             const t = (node.innerText || "").trim();
             if (t && t.length >= 3) {
               const u = addUniqueText(t, 5);
               if (u) mainParts.push(u);
             }
           } else {
-            // Has processed children — recurse to skip them
+            // Has processed descendants — recurse children to skip them
             for (const ch of children) {
               collectText(ch);
             }
@@ -3016,9 +3015,8 @@ async function extractStructured(page) {
       return {
         rawContent: [
           detailsTexts.length ? `DETAILS_CONTENT\n${detailsTexts.join("\n\n")}` : "",
-          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           iconFeatureTexts.length ? iconFeatureTexts.join("\n") : "",
-          `[DEBUG_SVG] totalSvgs=${document.querySelectorAll("svg").length} iconFeatures=${iconFeatureTexts.length} svgClasses=${Array.from(document.querySelectorAll("svg")).slice(0,5).map(s=>(s.getAttribute("class")||"").split(" ").slice(0,3).join(".")).join("|")}`,
+          sections.map(s => `${s.heading}\n${s.text}`).join("\n\n"),
           mainContent,
           overlayTexts.join("\n"),
           pseudoTexts.join(" "),
