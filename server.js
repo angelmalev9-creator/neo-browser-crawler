@@ -980,7 +980,7 @@ if (seen.has(rawText)) return;
 seen.add(rawText);
 
     items.push({
-  text: rawText.trim(),
+  text: t.trim(),
   included: hasCheck ? true : hasX ? false : null
 });
   });
