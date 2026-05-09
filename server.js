@@ -2563,8 +2563,27 @@ for (const el of triggers) {
             }
             
             function getLeafItemStatus(item) {
-              let status = '';
               try {
+                // ── NEO FIX: Check background color FIRST — most reliable signal ──
+                // Included items have a tinted/colored background (green, light-green, etc.)
+                // Excluded items have white/transparent background (no highlight)
+                const style = window.getComputedStyle(item);
+                const bg = style.backgroundColor || '';
+                const bgMatch = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+                if (bgMatch) {
+                  const [, r, g, b, a] = bgMatch;
+                  const ri = Number(r), gi = Number(g), bi = Number(b);
+                  const alpha = a !== undefined ? parseFloat(a) : 1;
+                  // Skip fully transparent backgrounds
+                  if (alpha > 0.01) {
+                    // Green-tinted background = included (e.g. rgba(122,179,53,0.05) → #7AB635)
+                    if (gi > ri && gi > bi && alpha > 0.01) return 'in';
+                    // Pure white or very light gray with no tint = no highlight = excluded
+                    if (ri > 250 && gi > 250 && bi > 250 && alpha > 0.5) return 'out';
+                  }
+                }
+                
+                // Check SVG icon color as secondary signal
                 const svg = item.querySelector('svg');
                 if (svg) {
                   const svgColor = window.getComputedStyle(svg).color || '';
@@ -2576,21 +2595,46 @@ for (const el of triggers) {
                     if (r > 160 && g < 100) return 'out';
                   }
                 }
-                if (parseFloat(window.getComputedStyle(item).opacity) < 0.6) return 'out';
-                const c = window.getComputedStyle(item).color || '';
+                
+                // Check element opacity
+                if (parseFloat(style.opacity) < 0.6) return 'out';
+                
+                // Check text color (very light gray = excluded)
+                const c = style.color || '';
                 const m2 = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
                 if (m2) {
                   const [, r, g, b] = m2.map(Number);
                   if (r > 160 && g > 160 && b > 160 && Math.abs(r-g) < 20) return 'out';
                 }
+                
+                // CSS class indicators
                 const cls = ((item.className||'') + ' ' + (item.parentElement?.className||'')).toLowerCase();
                 if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) return 'out';
                 if (/included|active|available|enabled/i.test(cls)) return 'in';
+                
+                // Unicode marks in text
                 const t = (item.innerText || '').trim();
                 if (/^[✓✔☑✅]/u.test(t)) return 'in';
                 if (/^[✕✗✘☒❌×]/u.test(t)) return 'out';
               } catch(e){}
-              return status;
+              return '';
+            }
+            
+            // Helper: detect if an element is a section header (not a leaf item)
+            function isSectionHeader(el) {
+              const tag = (el.tagName || '').toLowerCase();
+              if (['h1','h2','h3','h4','h5','h6','strong','b'].includes(tag)) return true;
+              const cls = (el.className || '').toLowerCase();
+              if (/title|heading|header|name|label|badge|tag|status/.test(cls)) return true;
+              // Has child heading
+              if (el.querySelector('h1,h2,h3,h4,h5,strong,b,[class*="title"],[class*="heading"]')) return true;
+              return false;
+            }
+            
+            // Helper: detect CTA buttons
+            function isCTAButton(el) {
+              const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+              return /заяв|поръча|order|request|submit|buy|купи|изберете|get started|sign up|close/i.test(text);
             }
             
             function processSection(sec) {
@@ -2625,14 +2669,18 @@ for (const el of triggers) {
               const seenTexts = new Set();
               items.forEach(item => {
                 // Skip containers that are themselves sections (have sub-items)
-                if (item.querySelectorAll('li, div:has(svg)').length > 2) return;
+                try { if (item.querySelectorAll('li, div:has(svg)').length > 2) return; } catch(e){}
                 const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
                 if (!t || t.length < 3 || t.length > 200) return;
                 if (t === headingText) return;
                 if (seenTexts.has(t)) return;
-                // Skip badge texts
+                // Skip badge texts and section headers
                 const tl = t.toLowerCase();
                 if (tl === 'включено' || tl === 'included' || tl.includes('не е включен') || tl === 'not included') return;
+                // Skip CTA buttons (ЗАЯВИ, Close, etc.)
+                if (isCTAButton(item)) return;
+                // Skip section headers that leaked into items
+                if (isSectionHeader(item) && t.length < 60) return;
                 seenTexts.add(t);
                 
                 const status = getLeafItemStatus(item);
@@ -2653,12 +2701,14 @@ for (const el of triggers) {
               if (allLi.length > 0) {
                 const seenTexts = new Set();
                 allLi.forEach(item => {
-                  if (item.querySelectorAll('li, div:has(svg)').length > 2) return;
+                  try { if (item.querySelectorAll('li, div:has(svg)').length > 2) return; } catch(e){}
                   const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
                   if (!t || t.length < 3 || t.length > 200) return;
                   if (seenTexts.has(t)) return;
                   const tl = t.toLowerCase();
                   if (tl === 'включено' || tl === 'included' || tl.includes('не е включен')) return;
+                  if (isCTAButton(item)) return;
+                  if (isSectionHeader(item) && t.length < 60) return;
                   seenTexts.add(t);
                   const status = getLeafItemStatus(item);
                   if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
