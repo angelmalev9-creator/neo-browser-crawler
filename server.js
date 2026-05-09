@@ -1110,7 +1110,16 @@ features:[]
       const title = pickTitle(root);
       if (!title) continue;
 
-      const rootText = getText(root);
+      const rootText = [
+  pickTitle(root),
+
+  ...pickFeatures(root).map(f => {
+    if (typeof f === "string") return f;
+
+    return `${f.included === true ? "[INCLUDED]" : f.included === false ? "[EXCLUDED]" : ""} ${f.text}`;
+  })
+
+].join("\n");
       const moneyMatch = rootText.match(moneyRe);
       const price_text = moneyMatch ? norm(moneyMatch[0]) : (/по договаряне|on request|auf anfrage|sur demande|a consultar|price on request|call for price/i.test(rootText) ? "On request" : "");
 
