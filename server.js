@@ -958,14 +958,17 @@ const cardRoot =
   row.closest("section") ||
   row.parentElement;
 
-const cardText = getText(cardRoot).toLowerCase();
+const statusEl = Array.from(
+  cardRoot.querySelectorAll("*")
+).find(el => {
+  const t = getText(el).toLowerCase();
+  return t === "включено" || t === "не е включено";
+});
 
-const hasCheck =
-  cardText.includes("включено") &&
-  !cardText.includes("не е включено");
+const statusText = getText(statusEl).toLowerCase();
 
-const hasX =
-  cardText.includes("не е включено");
+const hasCheck = statusText === "включено";
+const hasX = statusText === "не е включено";
 
     
 
