@@ -944,7 +944,18 @@ const pickFeatures = (root) => {
   const items = [];
   const seen = new Set();
 
-  root.querySelectorAll("li, div.flex.items-center.gap-3").forEach(li => {
+  root.querySelectorAll("li, div").forEach(li => {
+const cls = li.className || "";
+
+if (
+  typeof cls !== "string" ||
+  (
+    !cls.includes("items-center") ||
+    !cls.includes("gap-3")
+  )
+) {
+  return;
+}
 
 const row =
   li.closest("div.flex.items-center.gap-3") ||
