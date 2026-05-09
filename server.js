@@ -2539,85 +2539,128 @@ for (const el of triggers) {
           if (allOverlays.length <= beforeCount && allOverlays.length === 0) return '';
           
           // Get text from the newest overlay
-          // ── NEO FIX: Structured extraction — detect included vs excluded items ──
+          // ── NEO FIX: Structured extraction — section headers + badges separate from items ──
           const texts = [];
           allOverlays.forEach(container => {
             const lines = [];
-            // Walk all list items and check their visual status
-            const allItems = container.querySelectorAll('li, [class*="item"]:not([class*="section"]):not([class*="group"]), [class*="row"]');
-            const processed = new Set();
             
-            // First grab section headings and badges
-            container.querySelectorAll('h2, h3, h4, h5, [class*="title"], [class*="heading"]').forEach(h => {
-              const ht = (h.innerText || h.textContent || '').replace(/\s+/g, ' ').trim();
-              if (ht && ht.length >= 3 && ht.length <= 120) {
-                lines.push(ht);
-                processed.add(h);
+            // Strategy: find all "section" blocks (each has a heading + badge + items)
+            // A section block is a container with a heading and list items inside
+            const sectionEls = container.querySelectorAll(
+              '[class*="section"], [class*="category"], [class*="group"], [class*="block"], [class*="spec-group"], [class*="feature-group"]'
+            );
+            
+            // Also grab the main dialog title (e.g. "Пакет Стандарт — €750/кв.м.")
+            const mainTitle = container.querySelector('h1, h2, [class*="dialog-title"], [class*="modal-title"], [class*="sheet-title"]');
+            if (mainTitle) {
+              const mt = (mainTitle.innerText || mainTitle.textContent || '').replace(/\s+/g, ' ').trim();
+              if (mt && mt.length >= 5) lines.push(mt);
+            }
+            const mainDesc = container.querySelector('[class*="description"], [class*="subtitle"]');
+            if (mainDesc) {
+              const md = (mainDesc.innerText || mainDesc.textContent || '').replace(/\s+/g, ' ').trim();
+              if (md && md.length >= 5 && md.length <= 120) lines.push(md);
+            }
+            
+            function getLeafItemStatus(item) {
+              let status = '';
+              try {
+                const svg = item.querySelector('svg');
+                if (svg) {
+                  const svgColor = window.getComputedStyle(svg).color || '';
+                  const m = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                  if (m) {
+                    const [, r, g, b] = m.map(Number);
+                    if (g > 100 && g > r * 1.2 && g > b * 1.2) return 'in';
+                    if (r > 140 && g > 140 && b > 140 && Math.abs(r-g) < 30) return 'out';
+                    if (r > 160 && g < 100) return 'out';
+                  }
+                }
+                if (parseFloat(window.getComputedStyle(item).opacity) < 0.6) return 'out';
+                const c = window.getComputedStyle(item).color || '';
+                const m2 = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                if (m2) {
+                  const [, r, g, b] = m2.map(Number);
+                  if (r > 160 && g > 160 && b > 160 && Math.abs(r-g) < 20) return 'out';
+                }
+                const cls = ((item.className||'') + ' ' + (item.parentElement?.className||'')).toLowerCase();
+                if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) return 'out';
+                if (/included|active|available|enabled/i.test(cls)) return 'in';
+                const t = (item.innerText || '').trim();
+                if (/^[✓✔☑✅]/u.test(t)) return 'in';
+                if (/^[✕✗✘☒❌×]/u.test(t)) return 'out';
+              } catch(e){}
+              return status;
+            }
+            
+            function processSection(sec) {
+              // Find section heading (h3/h4/h5 or bold/strong)
+              const heading = sec.querySelector('h3, h4, h5, strong, b, [class*="title"], [class*="heading"], [class*="name"]');
+              let headingText = '';
+              if (heading) {
+                headingText = (heading.innerText || heading.textContent || '').replace(/\s+/g, ' ').trim();
+                // Don't include if heading is actually a leaf item text
+                if (headingText && headingText.length >= 2 && headingText.length <= 80) {
+                  lines.push(headingText);
+                }
               }
-            });
-            // Badge: "Включено" / "Не е включено"
-            container.querySelectorAll('[class*="badge"], [class*="tag"], [class*="status"], [class*="label"]').forEach(b => {
-              const bt = (b.innerText || b.textContent || '').trim().toLowerCase();
-              if (bt === 'включено' || bt === 'included') lines.push('Включено');
-              else if (bt.includes('не е включен') || bt === 'not included') lines.push('Не е включено');
-            });
-            
-            if (allItems.length > 0) {
-              allItems.forEach(item => {
-                if (processed.has(item)) return;
+              
+              // Find badge: "Включено" / "Не е включено"
+              const badge = sec.querySelector('[class*="badge"], [class*="tag"], [class*="status"], [class*="label"], p');
+              if (badge && badge !== heading) {
+                const bt = (badge.innerText || badge.textContent || '').trim();
+                const btLower = bt.toLowerCase();
+                if (btLower === 'включено' || btLower === 'included') {
+                  lines.push('Включено');
+                } else if (btLower.includes('не е включен') || btLower === 'not included') {
+                  lines.push('Не е включено');
+                }
+              }
+              
+              // Find leaf items (li elements, or divs that look like list items)
+              const items = sec.querySelectorAll('li');
+              items.forEach(item => {
                 const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
                 if (!t || t.length < 3 || t.length > 200) return;
-                processed.add(item);
+                // Skip if this is the heading or badge we already processed
+                if (t === headingText) return;
                 
-                let status = '';
-                try {
-                  // Check SVG icon color
-                  const svg = item.querySelector('svg');
-                  if (svg) {
-                    const svgColor = window.getComputedStyle(svg).color || '';
-                    const m = svgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-                    if (m) {
-                      const [, r, g, b] = m.map(Number);
-                      if (g > 100 && g > r * 1.2 && g > b * 1.2) status = 'in';
-                      else if (r > 140 && g > 140 && b > 140 && Math.abs(r-g) < 30) status = 'out';
-                      else if (r > 160 && g < 100) status = 'out';
-                    }
-                  }
-                  // Check opacity
-                  if (!status && parseFloat(window.getComputedStyle(item).opacity) < 0.6) status = 'out';
-                  // Check text color
-                  if (!status) {
-                    const c = window.getComputedStyle(item).color || '';
-                    const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-                    if (m) {
-                      const [, r, g, b] = m.map(Number);
-                      if (r > 160 && g > 160 && b > 160 && Math.abs(r-g) < 20) status = 'out';
-                    }
-                  }
-                  // Check CSS class
-                  if (!status) {
-                    const cls = ((item.className||'') + ' ' + (item.parentElement?.className||'')).toLowerCase();
-                    if (/excluded|disabled|unavailable|not-included|inactive|muted/i.test(cls)) status = 'out';
-                    if (/included|active|available|enabled/i.test(cls)) status = 'in';
-                  }
-                  // Unicode marks
-                  if (!status) {
-                    if (/^[\s]*[✓✔☑✅]/u.test(t)) status = 'in';
-                    if (/^[\s]*[✕✗✘☒❌×]/u.test(t)) status = 'out';
-                  }
-                } catch(e){}
-                
+                const status = getLeafItemStatus(item);
                 if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
                 else if (status === 'in') lines.push(`✓ ${t}`);
                 else lines.push(t);
               });
             }
             
-            // Fallback: if no structured items found, use plain text
-            if (lines.length === 0) {
-              const t = (container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
-              if (t && t.length > 20) lines.push(t);
+            if (sectionEls.length > 0) {
+              sectionEls.forEach(sec => processSection(sec));
+            } else {
+              // No explicit sections — try the whole container
+              // Look for repeating patterns: heading followed by list items
+              const allLi = container.querySelectorAll('li');
+              if (allLi.length > 0) {
+                allLi.forEach(item => {
+                  const t = (item.innerText || item.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (!t || t.length < 3 || t.length > 200) return;
+                  const status = getLeafItemStatus(item);
+                  if (status === 'out') lines.push(`✗ ${t} (не е включено)`);
+                  else if (status === 'in') lines.push(`✓ ${t}`);
+                  else lines.push(t);
+                });
+              } else {
+                // Pure fallback
+                const t = (container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t && t.length > 20) lines.push(t);
+              }
             }
+            
+            // Find CTA buttons at the end (e.g. "ЗАЯВИ ПАКЕТ СТАНДАРТ")
+            container.querySelectorAll('a[class*="btn"], a[class*="button"], button[class*="btn"], button[class*="cta"]').forEach(btn => {
+              const bt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+              if (bt && /заяв|поръча|order|request|submit/i.test(bt)) {
+                lines.push(bt);
+              }
+            });
             
             const result = lines.join('\n');
             if (result && result.length > 20) texts.push(result);
