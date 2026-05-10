@@ -1107,14 +1107,17 @@ async function extractPricingFromPage(page) {
         const cls = (el.className && typeof el.className === "string") ? el.className : "";
         const tag = (el.tagName || "").toLowerCase();
         const looksCard =
-          /card|pricing|package|plan|tier|column/i.test(cls) ||
+          /card|pricing|package|plan|tier|column|tarif|пакет|offer|bundle|price-?box|price-?card|price-?table|price-?item/i.test(cls) ||
+          // Tailwind/shadcn patterns: look for rounded + shadow/border combos typical of cards
+          (/rounded/i.test(cls) && /shadow|border/i.test(cls)) ||
           ["article","section"].includes(tag);
 
         const txt = getText(el);
         const hasTitle = !!pickTitle(el);
         const hasFeatures = el.querySelectorAll("li").length >= 3;
+        const hasMoney = moneyRe.test(txt);
 
-        if((looksCard||(moneyRe.test(txt)))&&(hasTitle||hasFeatures||moneyRe.test(txt))&&txt.length>=20)return el;
+        if((looksCard || hasMoney) && (hasTitle || hasFeatures || hasMoney) && txt.length >= 20) return el;
         el = el.parentElement;
       }
       return null;
@@ -1204,7 +1207,27 @@ features:[]
     while (node = walker.nextNode()) {
       const txt = norm(node.textContent || "");
       if (!txt) continue;
-      if (!moneyRe.test(txt) && !/по договаряне|on request|auf anfrage|sur demande|a consultar|su richiesta|price on request|call for price|contact for price/i.test(txt)) continue;
+
+      // Check text node directly for money pattern
+      let hasMoney = moneyRe.test(txt);
+      let hasOnRequest = /по договаряне|on request|auf anfrage|sur demande|a consultar|su richiesta|price on request|call for price|contact for price/i.test(txt);
+
+      // If text node is just a number (e.g. "210"), check parent's innerText for money pattern
+      // This handles cases where price number and currency symbol are in separate DOM elements
+      if (!hasMoney && !hasOnRequest && /^\d{1,6}(?:[.,]\d{1,2})?$/.test(txt.trim())) {
+        const parentText = norm(node.parentElement?.innerText || "");
+        if (moneyRe.test(parentText)) {
+          hasMoney = true;
+        } else {
+          // Check grandparent too (number in <span> inside <div> with € in sibling <span>)
+          const gpText = norm(node.parentElement?.parentElement?.innerText || "");
+          if (moneyRe.test(gpText)) {
+            hasMoney = true;
+          }
+        }
+      }
+
+      if (!hasMoney && !hasOnRequest) continue;
 
       const parent = node.parentElement;
       if (!parent || !isVisible(parent)) continue;
