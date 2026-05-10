@@ -2837,9 +2837,8 @@ async function extractStructured(page) {
       };
 
       // ── SVG ICON FEATURE SCAN (runs BEFORE sections loop) ─────────────
-      // Scan ALL elements in the page that contain SVG status icons (lucide-check, lucide-x, etc.)
-      // This catches feature lists regardless of tag type (div, li, span, etc.)
-      // Must run first so addUniqueText records the ✓/✗ prefixed text before sections grabs it plain.
+      // Scan elements that contain SVG status icons (lucide-check, lucide-x, etc.)
+      // ONLY in pricing/feature list context — NOT navigation, testimonials, buttons, etc.
       const iconFeatureTexts = [];
       const iconDetect = (svg) => {
         const sc = (svg.getAttribute("class") || "").toLowerCase();
@@ -2860,42 +2859,64 @@ async function extractStructured(page) {
         return null;
       };
 
+      // Check if an element is in a pricing/feature list context
+      const isInFeatureContext = (el) => {
+        let node = el;
+        for (let i = 0; i < 10 && node; i++) {
+          if (node === document.body) return false;
+          const cls = (node.getAttribute?.("class") || "").toLowerCase();
+          const id = (node.getAttribute?.("id") || "").toLowerCase();
+          const tag = (node.tagName || "").toLowerCase();
+          const combined = `${cls} ${id} ${tag}`;
+          // Must be inside a pricing/feature/package/plan section
+          if (/pricing|feature|package|plan|pricelist|price-list|includ|benefit|amenit|checklist|spec|detail|what.*includ|пакет|цен|включ|характеристик/i.test(combined)) {
+            return true;
+          }
+          // Stop if we hit a known non-feature section
+          if (/testimonial|review|client|footer|header|nav|menu|hero|banner|cta|contact|faq|accordion/i.test(combined)) {
+            return false;
+          }
+          node = node.parentElement;
+        }
+        return false;
+      };
+
       try {
-        const allSvgs = document.querySelectorAll("svg");
-        console.log("[SVG-SCAN] Found " + allSvgs.length + " SVGs total");
-        let svgMatched = 0;
-        allSvgs.forEach(svg => {
+        document.querySelectorAll("svg").forEach(svg => {
           if (isInBoilerplate(svg)) return;
           const status = iconDetect(svg);
           if (!status) return;
-          svgMatched++;
 
-          // Walk up to the nearest short-text container (the feature item row)
+          // CONTEXT CHECK: only apply in pricing/feature sections
+          if (!isInFeatureContext(svg)) return;
+
+          // Walk up to the nearest short-text container (max 4 levels)
           let container = svg.parentElement;
-          for (let i = 0; i < 6 && container; i++) {
+          for (let i = 0; i < 4 && container; i++) {
             if (processedElements.has(container)) return;
             if (container === document.body) return;
             const t = (container.innerText || container.textContent || "").replace(/\s+/g, " ").trim();
-            if (!t || t.length < 3 || t.length > 200) {
+            // Feature items are typically 10-150 chars, single-line
+            if (!t || t.length < 5 || t.length > 150 || t.includes("\n")) {
               container = container.parentElement;
               continue;
             }
-            // Found a good container
+            // Skip if text looks like a button, link, or heading
+            if (/^(поръчай|купи|свържи|изпрати|научи|виж|изберете|started|buy|order|contact|submit|learn|view|select)/i.test(t)) {
+              break;
+            }
             const prefix = status === "included" ? "✓ " : "✗ ";
             const prefixed = prefix + t;
-            console.log("[SVG-SCAN] " + prefixed);
             const uniqueText = addUniqueText(prefixed, 5);
             if (uniqueText) {
               iconFeatureTexts.push(uniqueText);
               processedElements.add(container);
-              // Mark all child elements as processed to prevent sections loop from re-adding without markers
               container.querySelectorAll("*").forEach(child => processedElements.add(child));
             }
             break;
           }
         });
-        console.log("[SVG-SCAN] Matched " + svgMatched + " icon SVGs, captured " + iconFeatureTexts.length + " features");
-      } catch (e) { console.error("[SVG-SCAN] Error:", e.message); }
+      } catch {}
 
       document.querySelectorAll("h1,h2,h3,p,li").forEach(el => {
         if (processedElements.has(el)) return;
@@ -2909,8 +2930,8 @@ async function extractStructured(page) {
         let text = el.innerText?.trim();
         if (!text) return;
 
-        // For li elements, detect SVG/icon status indicators
-        if (el.tagName === "LI") {
+        // For li elements in pricing/feature context, detect SVG/icon status indicators
+        if (el.tagName === "LI" && isInFeatureContext(el)) {
           let iconStatus = null;
           // Check SVG icons
           const svgs = el.querySelectorAll("svg");
