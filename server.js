@@ -2901,43 +2901,50 @@ async function extractStructured(page) {
 
       // Check if an element is in a pricing/feature list context
       const isInFeatureContext = (el) => {
-        // Additional structural check: the element should be inside a list-like structure
-        // (ul, ol, or a repeated-item container) to look like a feature list
-        const isInList = el.closest("ul, ol") !== null;
-        const isInRepeatedContainer = (() => {
-          const parent = el.parentElement;
-          if (!parent) return false;
-          // Check if parent has 3+ similar children (feature list pattern)
-          const siblings = parent.children;
-          if (siblings.length >= 3) {
-            const firstTag = siblings[0]?.tagName;
-            let sameTag = 0;
-            for (const s of siblings) { if (s.tagName === firstTag) sameTag++; }
-            if (sameTag >= 3) return true;
-          }
-          return false;
-        })();
-        // Must be in a list-like structure to even consider icon markers
-        if (!isInList && !isInRepeatedContainer) return false;
-
         let node = el;
         for (let i = 0; i < 8 && node; i++) {
           if (node === document.body) return false;
           const cls = (node.getAttribute?.("class") || "").toLowerCase();
           const id = (node.getAttribute?.("id") || "").toLowerCase();
+          const tag = (node.tagName || "").toLowerCase();
           const combined = `${cls} ${id}`;
-          // Strong signals: actual pricing/feature section classes/IDs
-          if (/pricing|price-list|pricelist|feature-list|featurelist|plan-feature|package-feature|checklist|benefits-list|what-s-included|whats-included|inclusions/i.test(combined)) {
-            return true;
-          }
-          // Medium signals: pricing/package section wrapper (but NOT navigation/button/link contexts)
-          if (/\bplan\b|price|package|пакет/i.test(combined) && !/nav|menu|header|footer|button|btn|link|card-action/i.test(combined)) {
-            return true;
-          }
-          // Stop if we hit a known non-feature section
-          if (/testimonial|review|client|footer|header|^nav|menu|hero|banner|cta|contact|faq|accordion|carousel|slider|swiper|project|portfolio|blog/i.test(combined)) {
+
+          // Stop early if we hit a known non-feature section
+          if (/testimonial|review|client|footer|header|^nav\b|navbar|menu|hero|banner|cta|contact|faq|accordion|carousel|slider|swiper|project|portfolio|blog/i.test(combined)) {
             return false;
           }
+
+          // Strong signals: actual pricing/feature section classes/IDs
+          const isStrongMatch = /pricing|price-list|pricelist|feature-list|featurelist|plan-feature|package-feature|checklist|benefits-list|what-s-included|whats-included|inclusions/i.test(combined);
+          // Medium signals: pricing/package wrapper (but NOT nav/button contexts)
+          const isMediumMatch = /\bplan\b|price|package|пакет/i.test(combined) && !/nav|menu|header|footer|button|btn|link|card-action/i.test(combined);
+
+          if (isStrongMatch || isMediumMatch) {
+            // Found a pricing/feature ancestor — now verify structural context:
+            // The element (or an ancestor below this node) should be in a list-like structure
+            // Check if el is inside a ul/ol anywhere below this pricing section
+            if (el.closest("ul, ol")) return true;
+            // Check if any ancestor between el and this node is a repeated-item container
+            let check = el;
+            while (check && check !== node) {
+              const parent = check.parentElement;
+              if (parent) {
+                const siblings = parent.children;
+                if (siblings.length >= 3) {
+                  const firstTag = siblings[0]?.tagName;
+                  let sameTag = 0;
+                  for (const s of siblings) { if (s.tagName === firstTag) sameTag++; }
+                  if (sameTag >= 3) return true;
+                }
+              }
+              check = parent;
+            }
+            // Even without list structure, if strong match found (explicit pricing class), allow it
+            if (isStrongMatch) return true;
+            // Medium match without list structure — don't mark (could be a nav item mentioning "plan")
+            return false;
+          }
+
           node = node.parentElement;
         }
         return false;
