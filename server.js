@@ -2640,28 +2640,30 @@ for (const el of triggers) {
           allOverlays.forEach(el => {
             // Instead of raw innerText, process elements to detect SVG icons
             const parts = [];
-            const processNode = (node) => {
+            const processNode = (node, forceNoIcon) => {
               // Check if this node has an SVG icon indicating status
-              const svgs = node.querySelectorAll ? node.querySelectorAll("svg") : [];
               let iconStatus = null;
-              for (const svg of svgs) {
-                const sc = (svg.getAttribute("class") || "").toLowerCase();
-                if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) { iconStatus = "excluded"; break; }
-                if (/\blucide-check\b/.test(sc)) { iconStatus = "included"; break; }
-                if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) { iconStatus = "excluded"; break; }
-                if (/\blucide-[a-z-]*check/.test(sc)) { iconStatus = "included"; break; }
-                const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
-                const al = (svg.getAttribute("aria-label") || "").toLowerCase();
-                const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
-                const all = `${sc} ${spc} ${al} ${ti}`;
-                if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) { iconStatus = "excluded"; break; }
-                if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) { iconStatus = "included"; break; }
-                if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) { iconStatus = "excluded"; break; }
-                if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) { iconStatus = "included"; break; }
+              if (!forceNoIcon) {
+                const svgs = node.querySelectorAll ? node.querySelectorAll("svg") : [];
+                for (const svg of svgs) {
+                  const sc = (svg.getAttribute("class") || "").toLowerCase();
+                  if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) { iconStatus = "excluded"; break; }
+                  if (/\blucide-check\b/.test(sc)) { iconStatus = "included"; break; }
+                  if (/\blucide-[a-z-]*x(-|$)/.test(sc) || /\blucide-x-/.test(sc)) { iconStatus = "excluded"; break; }
+                  if (/\blucide-[a-z-]*check/.test(sc)) { iconStatus = "included"; break; }
+                  const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+                  const al = (svg.getAttribute("aria-label") || "").toLowerCase();
+                  const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
+                  const all = `${sc} ${spc} ${al} ${ti}`;
+                  if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) { iconStatus = "excluded"; break; }
+                  if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) { iconStatus = "included"; break; }
+                  if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) { iconStatus = "excluded"; break; }
+                  if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) { iconStatus = "included"; break; }
+                }
               }
               const t = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
               if (!t || t.length < 3) return;
-              if (iconStatus && t.length <= 200) {
+              if (iconStatus && t.length <= 150) {
                 const prefix = iconStatus === "included" ? "✓ " : "✗ ";
                 parts.push(prefix + t);
               } else {
@@ -2669,20 +2671,35 @@ for (const el of triggers) {
               }
             };
 
-            // Find icon-bearing elements (short items with SVGs) first
+            // Find icon-bearing elements — but only those that look like feature list items
             const iconItems = new Set();
             el.querySelectorAll("svg").forEach(svg => {
               const sc = (svg.getAttribute("class") || "").toLowerCase();
               if (!/lucide|fa-|icon|check|close|times|tick/i.test(sc)) return;
-              // Walk up to container
+              // Skip SVGs that are dialog close buttons (usually direct child of dialog header or top-right positioned)
+              const svgParent = svg.parentElement;
+              if (svgParent) {
+                const pcls = (svgParent.getAttribute("class") || "").toLowerCase();
+                const ptag = (svgParent.tagName || "").toLowerCase();
+                // Skip close/dismiss buttons
+                if (/close|dismiss|dialog-close|modal-close/i.test(pcls) || (ptag === "button" && /\blucide-x\b/.test(sc))) return;
+              }
+              // Walk up to container — but only accept if it looks like a list item
               let container = svg.parentElement;
-              for (let i = 0; i < 6 && container && container !== el; i++) {
+              for (let i = 0; i < 4 && container && container !== el; i++) {
                 const ct = (container.innerText || "").replace(/\s+/g, " ").trim();
-                if (ct && ct.length >= 3 && ct.length <= 200) {
-                  processNode(container);
-                  iconItems.add(container);
-                  // Mark descendants to skip
-                  container.querySelectorAll("*").forEach(ch => iconItems.add(ch));
+                if (ct && ct.length >= 3 && ct.length <= 150) {
+                  // Structural check: must be in a li, or have 2+ siblings (repeated items = feature list)
+                  const tag = (container.tagName || "").toLowerCase();
+                  const parent = container.parentElement;
+                  const siblingCount = parent ? parent.children.length : 0;
+                  const isListItem = tag === "li" || container.closest("li") !== null;
+                  const isRepeatedItem = siblingCount >= 3;
+                  if (isListItem || isRepeatedItem) {
+                    processNode(container);
+                    iconItems.add(container);
+                    container.querySelectorAll("*").forEach(ch => iconItems.add(ch));
+                  }
                   break;
                 }
                 container = container.parentElement;
@@ -2884,19 +2901,41 @@ async function extractStructured(page) {
 
       // Check if an element is in a pricing/feature list context
       const isInFeatureContext = (el) => {
+        // Additional structural check: the element should be inside a list-like structure
+        // (ul, ol, or a repeated-item container) to look like a feature list
+        const isInList = el.closest("ul, ol") !== null;
+        const isInRepeatedContainer = (() => {
+          const parent = el.parentElement;
+          if (!parent) return false;
+          // Check if parent has 3+ similar children (feature list pattern)
+          const siblings = parent.children;
+          if (siblings.length >= 3) {
+            const firstTag = siblings[0]?.tagName;
+            let sameTag = 0;
+            for (const s of siblings) { if (s.tagName === firstTag) sameTag++; }
+            if (sameTag >= 3) return true;
+          }
+          return false;
+        })();
+        // Must be in a list-like structure to even consider icon markers
+        if (!isInList && !isInRepeatedContainer) return false;
+
         let node = el;
-        for (let i = 0; i < 10 && node; i++) {
+        for (let i = 0; i < 8 && node; i++) {
           if (node === document.body) return false;
           const cls = (node.getAttribute?.("class") || "").toLowerCase();
           const id = (node.getAttribute?.("id") || "").toLowerCase();
-          const tag = (node.tagName || "").toLowerCase();
-          const combined = `${cls} ${id} ${tag}`;
-          // Must be inside a pricing/feature/package/plan section
-          if (/pricing|feature|package|plan|pricelist|price-list|includ|benefit|amenit|checklist|spec|detail|what.*includ|пакет|цен|включ|характеристик/i.test(combined)) {
+          const combined = `${cls} ${id}`;
+          // Strong signals: actual pricing/feature section classes/IDs
+          if (/pricing|price-list|pricelist|feature-list|featurelist|plan-feature|package-feature|checklist|benefits-list|what-s-included|whats-included|inclusions/i.test(combined)) {
+            return true;
+          }
+          // Medium signals: pricing/package section wrapper (but NOT navigation/button/link contexts)
+          if (/\bplan\b|price|package|пакет/i.test(combined) && !/nav|menu|header|footer|button|btn|link|card-action/i.test(combined)) {
             return true;
           }
           // Stop if we hit a known non-feature section
-          if (/testimonial|review|client|footer|header|nav|menu|hero|banner|cta|contact|faq|accordion/i.test(combined)) {
+          if (/testimonial|review|client|footer|header|^nav|menu|hero|banner|cta|contact|faq|accordion|carousel|slider|swiper|project|portfolio|blog/i.test(combined)) {
             return false;
           }
           node = node.parentElement;
