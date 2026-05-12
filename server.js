@@ -214,47 +214,60 @@ headingText.length < 120
 push(`\n## ${headingText}\n`);
 }
 
-const contentNodes = Array.from(
-sec.querySelectorAll(
-'p,li,span,h3,h4,h5,h6'
+const headingEl = sec.querySelector('h1,h2,h3');
+
+const heading = (
+headingEl?.innerText ||
+headingEl?.textContent ||
+''
 )
-);
+.replace(/\s+/g,' ')
+.trim();
 
-const localSeen = new Set();
-
-for(const node of contentNodes){
-
-const txt = (
-node.innerText ||
-node.textContent ||
+const content = (
+sec.innerText ||
+sec.textContent ||
 ''
 )
 .replace(/\s+/g,' ')
 .trim();
 
 if(
-!txt ||
-txt.length < 3 ||
-txt.length > 400
+!content ||
+content.length < 30
 ){
-continue;
+return;
 }
 
 if(
-txt.includes('DIALOG_CONTENT') ||
-txt.includes('---DIALOG---')
+content.includes('DIALOG_CONTENT') ||
+content.includes('---DIALOG---')
 ){
-continue;
+return;
 }
 
-if(localSeen.has(txt)){
-continue;
-}
+const cleaned = content
+.split('\n')
+.map(t=>t.trim())
+.filter(Boolean)
+.filter(t=>t.length > 2)
+.filter(t=>t.length < 500)
+.filter(t=>
+!t.includes('DIALOG_CONTENT') &&
+!t.includes('---DIALOG---')
+)
+.filter((v,i,a)=>a.indexOf(v)===i)
+.join('\n');
 
-localSeen.add(txt);
-
-push(txt);
-
+if(
+heading &&
+heading.length < 120
+){
+push(
+`\n## ${heading}\n${cleaned}\n`
+);
+}else{
+push(cleaned);
 }
 
 }catch{}
