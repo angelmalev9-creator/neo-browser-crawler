@@ -161,9 +161,32 @@ if(n.shadowRoot){
 walk(n.shadowRoot);
 }
 
-push(
-n.innerText||n.textContent
-);
+const txt = (
+n.innerText ||
+n.textContent ||
+''
+)
+.replace(/\s+/g,' ')
+.trim();
+
+if(
+txt &&
+txt.length > 2 &&
+txt.length < 1200 &&
+!/^(menu|close|open|search)$/i.test(txt) &&
+!txt.includes('DIALOG_CONTENT') &&
+!txt.includes('TOP_CONTROLS') &&
+!txt.includes('---DIALOG---') &&
+!txt.includes('window.__') &&
+!txt.includes('__NEXT_DATA__') &&
+!txt.includes('webpack') &&
+!txt.includes('chunk') &&
+!txt.includes('hydration') &&
+!txt.includes('javascript') &&
+countWordsExact(txt) >= 3
+){
+push(txt);
+}
 
 }catch{}
 }
