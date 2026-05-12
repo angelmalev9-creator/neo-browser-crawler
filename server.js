@@ -161,118 +161,15 @@ if(n.shadowRoot){
 walk(n.shadowRoot);
 }
 
-const txt = (
-n.innerText ||
-n.textContent ||
-''
-)
-.replace(/\s+/g,' ')
-.trim();
-
-if(
-txt &&
-txt.length > 2 &&
-txt.length < 1200 &&
-!/^(menu|close|open|search)$/i.test(txt) &&
-!txt.includes('DIALOG_CONTENT') &&
-!txt.includes('TOP_CONTROLS') &&
-!txt.includes('---DIALOG---') &&
-!txt.includes('window.__') &&
-!txt.includes('__NEXT_DATA__') &&
-!txt.includes('webpack') &&
-!txt.includes('chunk') &&
-!txt.includes('hydration') &&
-!txt.includes('javascript') &&
-countWordsExact(txt) >= 3
-){
-push(txt);
-}
-
-}catch{}
-}
-}
-
-document.querySelectorAll('section, main > div, [class*="section"], [class*="container"]').forEach(sec => {
-
-try{
-
-const heading = sec.querySelector('h1,h2,h3,h4');
-
-const headingText = (
-heading?.innerText ||
-heading?.textContent ||
-''
-)
-.replace(/\s+/g,' ')
-.trim();
-
-if(
-headingText &&
-headingText.length > 2 &&
-headingText.length < 120
-){
-push(`\n## ${headingText}\n`);
-}
-
-const headingEl = sec.querySelector('h1,h2,h3');
-
-const sectionHeading = (
-headingEl?.innerText ||
-headingEl?.textContent ||
-''
-)
-.replace(/\s+/g,' ')
-.trim();
-
-const content = (
-sec.innerText ||
-sec.textContent ||
-''
-)
-.replace(/\s+/g,' ')
-.trim();
-
-if(
-!content ||
-content.length < 30
-){
-return;
-}
-
-if(
-content.includes('DIALOG_CONTENT') ||
-content.includes('---DIALOG---')
-){
-return;
-}
-
-const cleaned = content
-.split('\n')
-.map(t=>t.trim())
-.filter(Boolean)
-.filter(t=>t.length > 2)
-.filter(t=>t.length < 500)
-.filter(t=>
-!t.includes('DIALOG_CONTENT') &&
-!t.includes('---DIALOG---')
-)
-.filter((v,i,a)=>a.indexOf(v)===i)
-.join('\n');
-
-if(
-heading &&
-heading.length < 120
-){
 push(
-`\n## ${heading}\n${cleaned}\n`
+n.innerText||n.textContent
 );
-}else{
-push(cleaned);
-}
 
 }catch{}
+}
+}
 
-});
+walk(document);
 
 document.querySelectorAll(
 '[role="dialog"],[data-radix-portal],body > div'
