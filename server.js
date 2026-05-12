@@ -214,7 +214,48 @@ headingText.length < 120
 push(`\n## ${headingText}\n`);
 }
 
-walk(sec);
+const contentNodes = Array.from(
+sec.querySelectorAll(
+'p,li,span,h3,h4,h5,h6'
+)
+);
+
+const localSeen = new Set();
+
+for(const node of contentNodes){
+
+const txt = (
+node.innerText ||
+node.textContent ||
+''
+)
+.replace(/\s+/g,' ')
+.trim();
+
+if(
+!txt ||
+txt.length < 3 ||
+txt.length > 400
+){
+continue;
+}
+
+if(
+txt.includes('DIALOG_CONTENT') ||
+txt.includes('---DIALOG---')
+){
+continue;
+}
+
+if(localSeen.has(txt)){
+continue;
+}
+
+localSeen.add(txt);
+
+push(txt);
+
+}
 
 }catch{}
 
