@@ -192,7 +192,33 @@ push(txt);
 }
 }
 
-walk(document);
+document.querySelectorAll('section, main > div, [class*="section"], [class*="container"]').forEach(sec => {
+
+try{
+
+const heading = sec.querySelector('h1,h2,h3,h4');
+
+const headingText = (
+heading?.innerText ||
+heading?.textContent ||
+''
+)
+.replace(/\s+/g,' ')
+.trim();
+
+if(
+headingText &&
+headingText.length > 2 &&
+headingText.length < 120
+){
+push(`\n## ${headingText}\n`);
+}
+
+walk(sec);
+
+}catch{}
+
+});
 
 document.querySelectorAll(
 '[role="dialog"],[data-radix-portal],body > div'
