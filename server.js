@@ -216,7 +216,7 @@ push(`\n## ${headingText}\n`);
 
 const headingEl = sec.querySelector('h1,h2,h3');
 
-const heading = (
+const sectionHeading = (
 headingEl?.innerText ||
 headingEl?.textContent ||
 ''
