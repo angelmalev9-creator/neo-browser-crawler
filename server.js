@@ -24,8 +24,10 @@ let crawlFinished = false;
 let lastResult = null;
 let lastCrawlUrl = null;
 let lastCrawlTime = 0;
+let currentCrawlStartedAt = null;
+let currentCrawlToken = null;
 const RESULT_TTL_MS = 120 * 1000;
-const visited = new Set();
+const activeBrowsers = new Set();
 
 // ================= LIMITS =================
 const MAX_SECONDS = 120;             // fits within scrape-website's 120s fetch timeout
@@ -37,11 +39,18 @@ const HYDRATION_WAIT_MS = 1800;
 const MUTATION_IDLE_MS = 2200;
 const MAX_PAGES = 40;                // max pages to crawl
 const MAX_DEPTH = 5;                 // max link-following depth
+const PAGE_TIMEOUT_MS = readPositiveIntEnv("CRAWLER_PAGE_TIMEOUT_MS", 35000);
+const GLOBAL_CRAWL_TIMEOUT_MS = readPositiveIntEnv("CRAWLER_GLOBAL_TIMEOUT_MS", MAX_SECONDS * 1000 + 5000);
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|wp-json|\/feed\/?$|\/rss\/?$|sitemap\.xml|\/attachment\/|\/author\/|\/tag\/|\/category\/|\/comment|\/trackback|\/xmlrpc|\/wp-admin|\/wp-login|privacy|terms|cookies|gdpr|impressum|datenschutz|disclaimer|legal|politica|politique|blog\/|news\/|article\/|archive\/|login|register|signup|sign-up|sign-in|cart|checkout|wishlist|basket|warenkorb|panier)/i;
 
 // ================= UTILS =================
+function readPositiveIntEnv(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 const clean = (t = "") =>
   t.replace(/\r/g, "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
@@ -66,18 +75,83 @@ function stripFooterAndDedup(rawText) {
 
 // Safe evaluate with hard timeout — prevents hanging Promises inside page.evaluate
 async function safeEval(page, fn, arg, timeoutMs = 5000) {
-  return Promise.race([
+  return withTimeout(
     typeof arg !== 'undefined' ? page.evaluate(fn, arg) : page.evaluate(fn),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('safeEval timeout')), timeoutMs))
-  ]);
+    timeoutMs,
+    'safeEval'
+  );
 }
 
 // Safe page operation with timeout — wraps any async page call
 function withTimeout(promise, ms = 10000, label = 'operation') {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms))
-  ]);
+  let timer = null;
+  let settled = false;
+
+  return new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} timeout after ${ms}ms`));
+    }, ms);
+
+    Promise.resolve(promise).then(
+      value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function closeQuietly(resource, label = "resource") {
+  if (!resource) return;
+  if (Array.isArray(resource) || resource instanceof Set) {
+    await Promise.all(Array.from(resource).map((item, i) => closeQuietly(item, `${label}[${i}]`)));
+    return;
+  }
+
+  try {
+    if (typeof resource.close === "function") {
+      await resource.close();
+    }
+  } catch (e) {
+    console.error(`[CLEANUP] Failed closing ${label}:`, e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function closeAllActiveBrowsers(reason = "cleanup") {
+  const browsers = Array.from(activeBrowsers);
+  if (!browsers.length) return;
+  console.error(`[CLEANUP] Closing ${browsers.length} active browser(s): ${reason}`);
+  await Promise.all(browsers.map(async (browser) => {
+    try {
+      await closeQuietly(browser, "active browser");
+    } finally {
+      activeBrowsers.delete(browser);
+    }
+  }));
+}
+
+async function resetStaleCrawlLock(now = Date.now()) {
+  if (!crawlInProgress) return false;
+  const ageMs = currentCrawlStartedAt ? now - currentCrawlStartedAt : Number.POSITIVE_INFINITY;
+  if (ageMs <= GLOBAL_CRAWL_TIMEOUT_MS + 5000) return false;
+
+  console.error(`[CRAWL WATCHDOG] Stale crawl lock (${ageMs}ms) - resetting`);
+  crawlInProgress = false;
+  crawlFinished = !!lastResult;
+  currentCrawlStartedAt = null;
+  currentCrawlToken = null;
+  await closeAllActiveBrowsers("stale crawl lock");
+  return true;
 }
 
 
@@ -579,27 +653,85 @@ function generateFieldKeywords(name, placeholder, label) {
 // Extract SiteMap from a page
 async function extractSiteMapFromPage(page) {
   return await page.evaluate(() => {
-    const getSelector = (el, idx) => {
-      if (el.id) return `#${el.id}`;
-      if (el.className && typeof el.className === "string") {
-        const cls = el.className.trim().split(/\s+/)[0];
-        if (cls && !cls.includes(":") && !cls.includes("[")) {
-          const matches = document.querySelectorAll(`.${cls}`);
-          if (matches.length === 1) return `.${cls}`;
+    const fallbackCssEscape = (value) => {
+      const str = String(value || "");
+      let out = "";
+      for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        const code = ch.charCodeAt(0);
+        const first = i === 0;
+        const second = i === 1;
+        const startsWithDash = str[0] === "-";
+
+        if (ch === "\0") {
+          out += "\uFFFD";
+        } else if (
+          (code >= 1 && code <= 31) ||
+          code === 127 ||
+          (first && code >= 48 && code <= 57) ||
+          (second && startsWithDash && code >= 48 && code <= 57)
+        ) {
+          out += `\\${code.toString(16)} `;
+        } else if (first && ch === "-" && str.length === 1) {
+          out += "\\-";
+        } else if (code >= 128 || ch === "-" || ch === "_" || /[a-zA-Z0-9]/.test(ch)) {
+          out += ch;
+        } else {
+          out += `\\${ch}`;
         }
       }
+      return out;
+    };
+
+    const cssEscape = (value) => {
+      const str = String(value || "");
+      if (!str) return "";
+      try {
+        if (window.CSS && typeof window.CSS.escape === "function") {
+          return window.CSS.escape(str);
+        }
+      } catch {}
+      return fallbackCssEscape(str);
+    };
+
+    const attrEscape = (value) => String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+    const safeQueryAll = (selector, root = document) => {
+      try {
+        return Array.from(root.querySelectorAll(selector));
+      } catch {
+        return [];
+      }
+    };
+
+    const nthOfTypeSelector = (el, idx) => {
       const tag = el.tagName.toLowerCase();
       const parent = el.parentElement;
       if (parent) {
         const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
         const index = siblings.indexOf(el) + 1;
-        if (el.className) {
-          const cls = el.className.split(/\s+/)[0];
-          if (cls) return `${tag}.${cls}`;
-        }
         return `${tag}:nth-of-type(${index})`;
       }
       return `${tag}:nth-of-type(${idx + 1})`;
+    };
+
+    const getSelector = (el, idx) => {
+      if (el.id) {
+        const selector = `#${cssEscape(el.id)}`;
+        if (safeQueryAll(selector).length === 1) return selector;
+      }
+
+      if (el.className && typeof el.className === "string") {
+        const classes = el.className.trim().split(/\s+/).filter(Boolean);
+        for (const rawCls of classes) {
+          const cls = cssEscape(rawCls);
+          if (!cls) continue;
+          const selector = `.${cls}`;
+          if (safeQueryAll(selector).length === 1) return selector;
+        }
+      }
+
+      return nthOfTypeSelector(el, idx);
     };
 
     const isVisible = (el) => {
@@ -613,7 +745,7 @@ async function extractSiteMapFromPage(page) {
     const getLabel = (el) => {
       const id = el.id;
       if (id) {
-        const label = document.querySelector(`label[for="${id}"]`);
+        const label = safeQueryAll(`label[for="${attrEscape(id)}"]`)[0];
         if (label) return label.textContent?.trim();
       }
       const parent = el.closest("label");
@@ -3938,6 +4070,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
       "--lang=bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
     ],
   });
+  activeBrowsers.add(browser);
 
   const stats = {
     visited: 0,
@@ -3951,6 +4084,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   const lowPriorityQueue = [];
   const siteMaps = [];
   const capabilitiesMaps = [];
+  const visited = new Set();
   let base = "";
   let headerFooterText = ""; // captured once from homepage
 
@@ -4024,84 +4158,111 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     });
     console.log(`[INIT] Queued ${initCount} nav URLs (priority: ${queue.length}, low: ${lowPriorityQueue.length})`);
 
-    await initPage.close();
-    await initContext.close();
+    await closeQuietly(initPage, "init page");
+    await closeQuietly(initContext, "init context");
 
     const createWorker = async () => {
-      const ctx = await makeStealthContext(browser);
-      const pg = await ctx.newPage();
-      await applyStealthScripts(pg);
+      let ctx = null;
+      let pg = null;
 
-      while (Date.now() < deadline && stats.saved < MAX_PAGES) {
-        let item = null;
-        if (queue.length) {
-          item = queue.shift();
-        } else if (lowPriorityQueue.length) {
-          item = lowPriorityQueue.shift();
-        }
+      const browserConnected = () =>
+        typeof browser.isConnected !== "function" || browser.isConnected();
 
-        if (!item) {
-          await new Promise(r => setTimeout(r, 30));
-          if (queue.length === 0 && lowPriorityQueue.length === 0) break;
-          continue;
-        }
+      const recreatePage = async () => {
+        ctx = await makeStealthContext(browser);
+        pg = await ctx.newPage();
+        await applyStealthScripts(pg);
+      };
 
-        // Enforce depth limit
-        if (item.depth > MAX_DEPTH) continue;
-        // Enforce page limit
-        if (stats.saved >= MAX_PAGES) break;
+      try {
+        await recreatePage();
 
-        stats.visited++;
+        while (Date.now() < deadline && stats.saved < MAX_PAGES && browserConnected()) {
+          let item = null;
+          if (queue.length) {
+            item = queue.shift();
+          } else if (lowPriorityQueue.length) {
+            item = lowPriorityQueue.shift();
+          }
 
-        let result;
-        try {
-          result = await withTimeout(
-            processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-            35000,
-            `processPage(${item.url})`
-          );
-        } catch (e) {
-          console.error(`[PAGE] ✗ TIMEOUT ${item.url}: ${e.message}`);
-          // Page timed out — skip it and continue with next
-          continue;
-        }
+          if (!item) {
+            await new Promise(r => setTimeout(r, 30));
+            if (queue.length === 0 && lowPriorityQueue.length === 0) break;
+            continue;
+          }
 
-        if (result.page) {
-          // Collect contacts
-          const c = result.page?.structured?.contacts;
-          if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
-          if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
+          // Enforce depth limit
+          if (item.depth > MAX_DEPTH) continue;
+          // Enforce page limit
+          if (stats.saved >= MAX_PAGES) break;
 
-          pages.push(result.page);
-          stats.saved++;
-        }
+          stats.visited++;
 
-        // Only follow links from pages within depth limit, and only relevant internal links
-        if (item.depth < MAX_DEPTH) {
-          let newLinksAdded = 0;
-          result.links.forEach(l => {
-            const nl = normalizeUrl(l);
-            if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
-              visited.add(nl);
-              // Inner page links go to low priority
-              lowPriorityQueue.push({ url: nl, depth: item.depth + 1 });
-              newLinksAdded++;
+          let result;
+          try {
+            result = await withTimeout(
+              processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
+              PAGE_TIMEOUT_MS,
+              `processPage(${item.url})`
+            );
+          } catch (e) {
+            stats.errors++;
+            console.error(`[PAGE] ✗ TIMEOUT ${item.url}: ${e.message}`);
+            await closeQuietly(pg, "timed out page");
+            await closeQuietly(ctx, "timed out context");
+            pg = null;
+            ctx = null;
+
+            if (!browserConnected()) break;
+
+            try {
+              await recreatePage();
+            } catch (reopenErr) {
+              stats.errors++;
+              console.error(`[PAGE] ✗ Failed to create fresh page:`, reopenErr instanceof Error ? reopenErr.message : String(reopenErr));
+              break;
             }
-          });
-          if (newLinksAdded > 0) {
-            console.log(`[QUEUE] +${newLinksAdded} new URLs (depth ${item.depth + 1}) → total: ${queue.length + lowPriorityQueue.length}`);
+            continue;
+          }
+
+          if (result.page) {
+            // Collect contacts
+            const c = result.page?.structured?.contacts;
+            if (c?.emails?.length) c.emails.forEach(e => contactAgg.emails.add(String(e).trim()));
+            if (c?.phones?.length) c.phones.forEach(p => contactAgg.phones.add(String(p).trim()));
+
+            pages.push(result.page);
+            stats.saved++;
+          }
+
+          // Only follow links from pages within depth limit, and only relevant internal links
+          if (item.depth < MAX_DEPTH) {
+            let newLinksAdded = 0;
+            result.links.forEach(l => {
+              const nl = normalizeUrl(l);
+              if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
+                visited.add(nl);
+                // Inner page links go to low priority
+                lowPriorityQueue.push({ url: nl, depth: item.depth + 1 });
+                newLinksAdded++;
+              }
+            });
+            if (newLinksAdded > 0) {
+              console.log(`[QUEUE] +${newLinksAdded} new URLs (depth ${item.depth + 1}) → total: ${queue.length + lowPriorityQueue.length}`);
+            }
           }
         }
+      } finally {
+        await closeQuietly(pg, "worker page");
+        await closeQuietly(ctx, "worker context");
       }
-
-      await pg.close();
-      await ctx.close();
     };
 
     await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
 
   } finally {
-    await browser.close();
+    await closeQuietly(browser, "crawl browser");
+    activeBrowsers.delete(browser);
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages (max ${MAX_PAGES})`);
   }
 
@@ -4159,22 +4320,38 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
 }
 
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  console.error("[UNHANDLED REJECTION]", msg);
+});
+
+process.on("uncaughtException", (err) => {
+  const msg = err instanceof Error ? (err.stack || err.message) : String(err);
+  console.error("[UNCAUGHT EXCEPTION]", msg);
+});
+
 // ================= HTTP SERVER =================
 http
   .createServer((req, res) => {
     if (req.method === "GET") {
+      const currentCrawlAgeMs = currentCrawlStartedAt ? Date.now() - currentCrawlStartedAt : null;
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         status: crawlInProgress ? "crawling" : (crawlFinished ? "ready" : "idle"),
         crawlInProgress,
         crawlFinished,
+        currentCrawlStartedAt: currentCrawlStartedAt ? new Date(currentCrawlStartedAt).toISOString() : null,
+        currentCrawlAgeMs,
+        activeBrowsers: activeBrowsers.size,
+        PAGE_TIMEOUT_MS,
+        GLOBAL_CRAWL_TIMEOUT_MS,
         lastCrawlUrl,
         lastCrawlTime: lastCrawlTime ? new Date(lastCrawlTime).toISOString() : null,
         resultAvailable: !!lastResult,
         pagesCount: lastResult?.pages?.length || 0,
         capabilitiesCount: lastResult?.capabilities?.length || 0,
         contacts: lastResult?.contacts || null,
-        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS }
+        config: { PARALLEL_TABS, MAX_SECONDS, MIN_WORDS, PAGE_TIMEOUT_MS, GLOBAL_CRAWL_TIMEOUT_MS }
       }));
     }
 
@@ -4191,6 +4368,7 @@ http
     });
 
     req.on("end", async () => {
+      let crawlToken = null;
       try {
         const parsed = JSON.parse(body || "{}");
 
@@ -4218,6 +4396,8 @@ http
           }
         }
 
+        await resetStaleCrawlLock(now);
+
         if (crawlInProgress) {
           if (lastCrawlUrl === requestedUrl) {
             res.writeHead(202, { "Content-Type": "application/json" });
@@ -4235,21 +4415,37 @@ http
           }
         }
 
+        crawlToken = crypto.randomUUID();
         crawlInProgress = true;
         crawlFinished = false;
+        currentCrawlStartedAt = Date.now();
+        currentCrawlToken = crawlToken;
         lastCrawlUrl = requestedUrl;
-        visited.clear();
 
         console.log("[CRAWL START] New crawl for:", requestedUrl);
         if (siteId) console.log("[SITE ID]", siteId);
         if (deadlineMs) console.log(`[DEADLINE] ${Math.round(deadlineMs / 1000)}s (from caller)`);
 
-        const result = await crawlSmart(parsed.url, siteId, deadlineMs);
+        const watchdogMs = deadlineMs
+          ? Math.min(deadlineMs, GLOBAL_CRAWL_TIMEOUT_MS)
+          : GLOBAL_CRAWL_TIMEOUT_MS;
 
-        crawlInProgress = false;
-        crawlFinished = true;
-        lastResult = result;
-        lastCrawlTime = Date.now();
+        const result = await withTimeout(
+          crawlSmart(parsed.url, siteId, deadlineMs),
+          watchdogMs,
+          `crawlSmart(${requestedUrl})`
+        );
+
+        if (currentCrawlToken === crawlToken) {
+          crawlInProgress = false;
+          crawlFinished = true;
+          currentCrawlStartedAt = null;
+          currentCrawlToken = null;
+          lastResult = result;
+          lastCrawlTime = Date.now();
+        } else {
+          console.error("[CRAWL WARN] Finished crawl no longer owns crawler state:", requestedUrl);
+        }
 
         console.log("[CRAWL DONE] Result ready for:", requestedUrl);
 
@@ -4264,13 +4460,22 @@ http
 
         res.end(gz);
       } catch (e) {
-        crawlInProgress = false;
+        if (crawlToken && currentCrawlToken === crawlToken) {
+          crawlInProgress = false;
+          crawlFinished = !!lastResult;
+          currentCrawlStartedAt = null;
+          currentCrawlToken = null;
+          await closeAllActiveBrowsers("crawl error or watchdog timeout");
+        }
+
         console.error("[CRAWL ERROR]", e.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          success: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            success: false,
+            error: e instanceof Error ? e.message : String(e),
+          }));
+        }
       }
     });
   })
