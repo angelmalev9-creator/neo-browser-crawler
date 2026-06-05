@@ -1154,10 +1154,22 @@ async function extractPricingFromPage(page) {
         // Check for image-based icons
         const imgs = el.querySelectorAll("img");
         for (const img of imgs) {
-          const alt = (img.getAttribute("alt") || "").toLowerCase();
-          const src = (img.getAttribute("src") || "").toLowerCase();
-          if (/check|tick|yes|included|done/i.test(alt + src)) return "included";
-          if (/cross|no|excluded|close|remove/i.test(alt + src)) return "excluded";
+          const src = [
+            img.getAttribute("src"),
+            img.getAttribute("data-src"),
+            img.getAttribute("data-lazy-src"),
+            img.getAttribute("srcset"),
+          ].filter(Boolean).join(" ").toLowerCase();
+          const meta = [
+            img.getAttribute("alt"),
+            img.getAttribute("title"),
+            img.getAttribute("aria-label"),
+            img.getAttribute("class"),
+            img.parentElement?.getAttribute("class"),
+            src,
+          ].filter(Boolean).join(" ").toLowerCase();
+          if (/cross|xmark|x-mark|times|no\b|not.?included|excluded|close|remove|cancel|minus|unavailable|disabled|false|fail|error|danger|destructive|red/i.test(meta)) return "excluded";
+          if (/check|checkmark|tick|yes\b|included|done|success|verified|available|enabled|approved|true|ok\b|green/i.test(meta)) return "included";
         }
 
         // Check for unicode symbols in text
@@ -2998,6 +3010,14 @@ async function extractStructured(page) {
       const iconDetect = (svg) => {
         const sc = (svg.getAttribute("class") || "").toLowerCase();
         const spc = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
+        const dataIcon = [
+          svg.getAttribute("data-icon"),
+          svg.getAttribute("data-lucide"),
+          svg.getAttribute("name"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const useHref = Array.from(svg.querySelectorAll("use"))
+          .map(u => (u.getAttribute("href") || u.getAttribute("xlink:href") || "").toLowerCase())
+          .join(" ");
         // Lucide
         if (/\blucide-x\b/.test(sc) && !/\blucide-x[a-z]/.test(sc)) return "excluded";
         if (/\blucide-check\b/.test(sc)) return "included";
@@ -3006,11 +3026,32 @@ async function extractStructured(page) {
         // General
         const al = (svg.getAttribute("aria-label") || "").toLowerCase();
         const ti = (svg.querySelector("title")?.textContent || "").toLowerCase();
-        const all = `${sc} ${spc} ${al} ${ti}`;
+        const all = `${sc} ${spc} ${al} ${ti} ${dataIcon} ${useHref}`;
         if (/close|cross|xmark|times|remove|cancel|minus|exclude|fa-times|fa-xmark|icon-x\b|icon-close|bi-x\b/i.test(all)) return "excluded";
         if (/\bcheck\b|tick|done|success|verified|included|fa-check|icon-check|bi-check/i.test(all)) return "included";
         if (/text-muted|text-destructive|text-danger|text-disabled|opacity-50/i.test(sc + " " + spc)) return "excluded";
         if (/text-primary|text-success|text-green/i.test(sc + " " + spc)) return "included";
+        return null;
+      };
+
+      const imageIconDetect = (img) => {
+        const src = [
+          img.getAttribute("src"),
+          img.getAttribute("data-src"),
+          img.getAttribute("data-lazy-src"),
+          img.getAttribute("srcset"),
+        ].filter(Boolean).join(" ").toLowerCase();
+        const meta = [
+          img.getAttribute("alt"),
+          img.getAttribute("title"),
+          img.getAttribute("aria-label"),
+          img.getAttribute("class"),
+          img.parentElement?.getAttribute("class"),
+          src,
+        ].filter(Boolean).join(" ").toLowerCase();
+
+        if (/cross|xmark|x-mark|times|no\b|not.?included|excluded|close|remove|cancel|minus|unavailable|disabled|false|fail|error|danger|destructive|red/i.test(meta)) return "excluded";
+        if (/check|checkmark|tick|yes\b|included|done|success|verified|available|enabled|approved|true|ok\b|green/i.test(meta)) return "included";
         return null;
       };
 
@@ -3037,16 +3078,16 @@ async function extractStructured(page) {
       };
 
       try {
-        document.querySelectorAll("svg").forEach(svg => {
-          if (isInBoilerplate(svg)) return;
-          const status = iconDetect(svg);
+        document.querySelectorAll("svg,img").forEach(iconEl => {
+          if (isInBoilerplate(iconEl)) return;
+          const status = iconEl.tagName === "IMG" ? imageIconDetect(iconEl) : iconDetect(iconEl);
           if (!status) return;
 
           // CONTEXT CHECK: only apply in pricing/feature sections
-          if (!isInFeatureContext(svg)) return;
+          if (!isInFeatureContext(iconEl)) return;
 
           // Walk up to the nearest short-text container (max 4 levels)
-          let container = svg.parentElement;
+          let container = iconEl.parentElement;
           for (let i = 0; i < 4 && container; i++) {
             if (processedElements.has(container)) return;
             if (container === document.body) return;
@@ -3095,9 +3136,14 @@ async function extractStructured(page) {
             const svgParentClass = (svg.parentElement?.getAttribute("class") || "").toLowerCase();
             const ariaLabel = (svg.getAttribute("aria-label") || "").toLowerCase();
             const titleEl = (svg.querySelector("title")?.textContent || "").toLowerCase();
+            const dataIcon = [
+              svg.getAttribute("data-icon"),
+              svg.getAttribute("data-lucide"),
+              svg.getAttribute("name"),
+            ].filter(Boolean).join(" ").toLowerCase();
             const searchText = `${svgClass} ${svgParentClass} ${ariaLabel} ${titleEl}`;
             const useHref = Array.from(svg.querySelectorAll("use")).map(u => (u.getAttribute("href") || u.getAttribute("xlink:href") || "").toLowerCase()).join(" ");
-            const combined = `${searchText} ${useHref}`;
+            const combined = `${searchText} ${dataIcon} ${useHref}`;
 
             // Lucide icons — exact match first
             if (/\blucide-x\b/i.test(svgClass) && !/\blucide-x[a-z]/i.test(svgClass)) { iconStatus = "excluded"; break; }
@@ -3129,6 +3175,14 @@ async function extractStructured(page) {
               const ct = (icon.textContent || "").trim();
               if (/fa-check|icon-check|icon-tick|material.*check|material.*done/i.test(cls) || /[✓✔☑]/.test(ct)) { iconStatus = "included"; break; }
               if (/fa-times|fa-close|fa-xmark|fa-remove|fa-minus|icon-x|icon-close|icon-cross|material.*close|material.*clear/i.test(cls) || /[✕✗✘☒✖]/.test(ct)) { iconStatus = "excluded"; break; }
+            }
+          }
+          // Check PNG/SVG image icons
+          if (!iconStatus) {
+            const imgs = el.querySelectorAll("img");
+            for (const img of imgs) {
+              iconStatus = imageIconDetect(img);
+              if (iconStatus) break;
             }
           }
           // Check unicode prefix
@@ -4046,7 +4100,7 @@ async function waitForRealContent(page, url) {
   return false;
 }
 
-async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
+async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialState = null) {
   const effectiveMs = deadlineMs
     ? Math.min(deadlineMs, MAX_SECONDS * 1000)
     : MAX_SECONDS * 1000;
@@ -4089,6 +4143,18 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
   let headerFooterText = ""; // captured once from homepage
 
   const contactAgg = { emails: new Set(), phones: new Set() };
+  const publishPartial = () => {
+    if (!partialState) return;
+    partialState.base = base;
+    partialState.pages = pages;
+    partialState.stats = stats;
+    partialState.siteMaps = siteMaps;
+    partialState.capabilitiesMaps = capabilitiesMaps;
+    partialState.contactAgg = contactAgg;
+    partialState.siteId = siteId;
+    partialState.updatedAt = Date.now();
+  };
+  publishPartial();
 
   try {
     const initContext = await makeStealthContext(browser);
@@ -4097,6 +4163,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
 
     await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
     base = new URL(initPage.url()).origin;
+    publishPartial();
 
     // Capture header/footer text ONCE from homepage
     try {
@@ -4177,7 +4244,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
       try {
         await recreatePage();
 
-        while (Date.now() < deadline && stats.saved < MAX_PAGES && browserConnected()) {
+        while (Date.now() < deadline && stats.saved < MAX_PAGES && browserConnected() && !partialState?.abortRequested) {
           let item = null;
           if (queue.length) {
             item = queue.shift();
@@ -4251,6 +4318,8 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
               console.log(`[QUEUE] +${newLinksAdded} new URLs (depth ${item.depth + 1}) → total: ${queue.length + lowPriorityQueue.length}`);
             }
           }
+
+          publishPartial();
         }
       } finally {
         await closeQuietly(pg, "worker page");
@@ -4264,6 +4333,11 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     await closeQuietly(browser, "crawl browser");
     activeBrowsers.delete(browser);
     console.log(`\n[CRAWL DONE] ${stats.saved}/${stats.visited} pages (max ${MAX_PAGES})`);
+  }
+
+  publishPartial();
+  if (partialState?.abortRequested) {
+    return snapshotCrawlPartial(partialState, siteId);
   }
 
   let combinedSiteMap = null;
@@ -4317,7 +4391,48 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null) {
     console.log(`[CONTACTS] Combined: ${contacts.phones.length} phones, ${contacts.emails.length} emails`);
   }
 
+  publishPartial();
   return { pages, stats, siteMap: combinedSiteMap, capabilities: combinedCapabilities, contacts };
+}
+
+function snapshotCrawlPartial(partialState = {}, fallbackSiteId = null) {
+  const pages = Array.isArray(partialState.pages) ? partialState.pages.slice() : [];
+  const rawStats = partialState.stats || {};
+  const stats = {
+    visited: Number(rawStats.visited) || 0,
+    saved: Number(rawStats.saved) || pages.length,
+    byType: { ...(rawStats.byType || {}) },
+    errors: Number(rawStats.errors) || 0,
+  };
+  const base = partialState.base || "";
+  const siteId = partialState.siteId || fallbackSiteId;
+
+  let siteMap = null;
+  if (Array.isArray(partialState.siteMaps) && partialState.siteMaps.length > 0 && siteId) {
+    try {
+      const enrichedMaps = partialState.siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
+      siteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
+    } catch (e) {
+      console.error("[PARTIAL] SiteMap snapshot error:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  let capabilities = [];
+  if (Array.isArray(partialState.capabilitiesMaps) && partialState.capabilitiesMaps.length > 0) {
+    try {
+      capabilities = buildCombinedCapabilities(partialState.capabilitiesMaps, base);
+    } catch (e) {
+      console.error("[PARTIAL] Capabilities snapshot error:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const contactAgg = partialState.contactAgg || {};
+  const contacts = {
+    emails: Array.from(contactAgg.emails || []).filter(Boolean).slice(0, 20),
+    phones: Array.from(contactAgg.phones || []).filter(Boolean).slice(0, 20),
+  };
+
+  return { pages, stats, siteMap, capabilities, contacts };
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -4369,6 +4484,9 @@ http
 
     req.on("end", async () => {
       let crawlToken = null;
+      let partialState = null;
+      let requestedUrl = null;
+      let siteId = null;
       try {
         const parsed = JSON.parse(body || "{}");
 
@@ -4380,8 +4498,8 @@ http
           }));
         }
 
-        const requestedUrl = normalizeUrl(parsed.url);
-        const siteId = parsed.site_id || null;
+        requestedUrl = normalizeUrl(parsed.url);
+        siteId = parsed.site_id || null;
         // Accept deadline from caller — scrape-website sends how many ms the crawler has
         // before the caller's own timeout fires. We subtract 5s for safety buffer.
         const rawDeadline = Number(parsed.deadline_ms) || 0;
@@ -4430,8 +4548,9 @@ http
           ? Math.min(deadlineMs, GLOBAL_CRAWL_TIMEOUT_MS)
           : GLOBAL_CRAWL_TIMEOUT_MS;
 
+        partialState = {};
         const result = await withTimeout(
-          crawlSmart(parsed.url, siteId, deadlineMs),
+          crawlSmart(parsed.url, siteId, deadlineMs, partialState),
           watchdogMs,
           `crawlSmart(${requestedUrl})`
         );
@@ -4460,7 +4579,19 @@ http
 
         res.end(gz);
       } catch (e) {
-        if (crawlToken && currentCrawlToken === crawlToken) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        const isWatchdogTimeout =
+          !!crawlToken &&
+          !!partialState &&
+          errorMessage.includes("crawlSmart(") &&
+          errorMessage.includes("timeout after");
+
+        if (isWatchdogTimeout) {
+          partialState.abortRequested = true;
+        }
+
+        const ownsCrawl = !!crawlToken && currentCrawlToken === crawlToken;
+        if (ownsCrawl) {
           crawlInProgress = false;
           crawlFinished = !!lastResult;
           currentCrawlStartedAt = null;
@@ -4468,12 +4599,35 @@ http
           await closeAllActiveBrowsers("crawl error or watchdog timeout");
         }
 
-        console.error("[CRAWL ERROR]", e.message);
+        if (isWatchdogTimeout) {
+          const partialResult = snapshotCrawlPartial(partialState, siteId);
+          if (ownsCrawl) {
+            crawlFinished = true;
+            lastResult = partialResult;
+            lastCrawlTime = Date.now();
+            if (requestedUrl) lastCrawlUrl = requestedUrl;
+          }
+
+          console.error(`[CRAWL TIMEOUT] Returning partial result for ${requestedUrl || "unknown URL"}: ${partialResult.pages.length} pages`);
+          if (!res.headersSent) {
+            const gz = gzipSync(
+              JSON.stringify({ success: true, partial: true, timedOut: true, ...partialResult })
+            );
+
+            res.writeHead(200, {
+              "Content-Type": "application/json",
+              "Content-Encoding": "gzip"
+            });
+            return res.end(gz);
+          }
+        }
+
+        console.error("[CRAWL ERROR]", errorMessage);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             success: false,
-            error: e instanceof Error ? e.message : String(e),
+            error: errorMessage,
           }));
         }
       }
