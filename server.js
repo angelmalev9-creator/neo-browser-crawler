@@ -40,7 +40,30 @@ const MUTATION_IDLE_MS = 2200;
 const MAX_PAGES = 40;                // max pages to crawl
 const MAX_DEPTH = 5;                 // max link-following depth
 const PAGE_TIMEOUT_MS = readPositiveIntEnv("CRAWLER_PAGE_TIMEOUT_MS", 35000);
+const BLOCK_HEAVY_RESOURCES = process.env.CRAWLER_BLOCK_HEAVY !== "0";
 const GLOBAL_CRAWL_TIMEOUT_MS = readPositiveIntEnv("CRAWLER_GLOBAL_TIMEOUT_MS", MAX_SECONDS * 1000 + 5000);
+
+// ── Трето-странични скриптове/ембеди, които само бавят crawl-а и трошат страницата ──
+// (YouTube, Facebook Pixel, 360° тури, chat widgets, analytics, ad tech, шрифтове)
+const BLOCKED_HOST_RE = new RegExp([
+  "google-analytics\\.com", "googletagmanager\\.com", "googlesyndication\\.com",
+  "doubleclick\\.net", "googleadservices\\.com", "adservice\\.google\\.",
+  "connect\\.facebook\\.net", "facebook\\.com/tr", "fbcdn\\.net",
+  "youtube\\.com", "youtube-nocookie\\.com", "ytimg\\.com", "googlevideo\\.com",
+  "vimeo\\.com", "player\\.vimeo\\.com", "dailymotion\\.com",
+  "tourmkr\\.com", "kuula\\.co", "matterport\\.com", "my\\.matterport",
+  "hotjar\\.com", "clarity\\.ms", "mouseflow\\.com", "fullstory\\.com",
+  "cloudflareinsights\\.com", "sentry\\.io", "bugsnag\\.com", "newrelic\\.com",
+  "tawk\\.to", "crisp\\.chat", "intercom\\.io", "livechatinc\\.com", "smartsupp\\.com",
+  "zopim\\.com", "drift\\.com", "tidio\\.co", "messenger\\.com",
+  "fonts\\.gstatic\\.com", "fonts\\.googleapis\\.com", "use\\.typekit\\.net",
+  "criteo\\.", "taboola\\.com", "outbrain\\.com", "hs-scripts\\.com",
+  "snap\\.licdn\\.com", "analytics\\.tiktok\\.com", "bat\\.bing\\.com",
+  "jnn-pa\\.googleapis\\.com", "recaptcha\\.net/recaptcha", "gstatic\\.com/recaptcha"
+].join("|"), "i");
+
+// Ресурси, които никога не носят текст → блокираме ги за скорост
+const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font"]);
 
 const SKIP_URL_RE =
   /(wp-content\/uploads|wp-json|\/feed\/?$|\/rss\/?$|sitemap\.xml|\/attachment\/|\/author\/|\/tag\/|\/category\/|\/comment|\/trackback|\/xmlrpc|\/wp-admin|\/wp-login|privacy|terms|cookies|gdpr|impressum|datenschutz|disclaimer|legal|politica|politique|blog\/|news\/|article\/|archive\/|login|register|signup|sign-up|sign-in|cart|checkout|wishlist|basket|warenkorb|panier)/i;
@@ -73,13 +96,61 @@ function stripFooterAndDedup(rawText) {
   return deduped.join('\n');
 }
 
+// Грешки, които идват от навигация/затваряне на страницата, а не от лош код
+const TRANSIENT_EVAL_RE =
+  /Execution context was destroyed|Target (page|browser|context)? ?closed|frame was detached|Navigation to|net::ERR_ABORTED|Most likely the page has been closed/i;
+
+function isTransientPageError(e) {
+  return TRANSIENT_EVAL_RE.test(e instanceof Error ? e.message : String(e));
+}
+
 // Safe evaluate with hard timeout — prevents hanging Promises inside page.evaluate
+// ✅ FIX: retry веднъж, ако контекстът е бил унищожен от навигация (SPA redirect,
+// клик по линк по време на forceRender и т.н.)
 async function safeEval(page, fn, arg, timeoutMs = 5000) {
-  return withTimeout(
+  const run = () => withTimeout(
     typeof arg !== 'undefined' ? page.evaluate(fn, arg) : page.evaluate(fn),
     timeoutMs,
     'safeEval'
   );
+
+  try {
+    return await run();
+  } catch (e) {
+    if (!isTransientPageError(e)) throw e;
+    // Изчакваме навигацията да приключи и опитваме пак веднъж
+    try { await page.waitForLoadState("domcontentloaded", { timeout: 5000 }); } catch {}
+    return await run();
+  }
+}
+
+// Никога не хвърля — връща fallback при всякаква грешка. Използва се за
+// незадължителни стъпки, които не бива да убиват цялата страница.
+async function tryEval(page, fn, arg, timeoutMs = 5000, fallback = null, label = "eval") {
+  try {
+    return await safeEval(page, fn, arg, timeoutMs);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!isTransientPageError(e)) console.error(`[EVAL] ${label}: ${msg}`);
+    return fallback;
+  }
+}
+
+// Изпълнява стъпка, но не позволява тя да провали цялата страница
+async function tryStep(label, fn, fallback = null) {
+  try {
+    return await fn();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!isTransientPageError(e)) console.error(`[STEP] ${label}: ${msg}`);
+    return fallback;
+  }
+}
+
+// Заключва навигацията в страницата, докато кликаме по бутони/акордеони.
+// Без това един клик по <a href> руши execution context-а и цялата страница пропада.
+async function setNavLock(page, on) {
+  await tryEval(page, (v) => { window.__neoNavLock = !!v; }, on, 3000, null, "setNavLock");
 }
 
 // Safe page operation with timeout — wraps any async page call
@@ -199,7 +270,7 @@ MUTATION_IDLE_MS,
 
 async function extractShadowAndPortalText(page){
 
-return await page.evaluate(()=>{
+return (await tryEval(page, ()=>{
 
 const out=[];
 const seen=new Set();
@@ -253,53 +324,74 @@ push(el.innerText||el.textContent);
 
 return out.join('\n');
 
-});
+}, undefined, 6000, "", "extractShadowAndPortalText")) || "";
 
 }
 
 
 
-async function attachNetworkMining(page){
+// ✅ FIX: слушателят се откача след страницата (иначе се трупа по един на всеки
+// URL, защото page обектът се преизползва) + твърди лимити за размера.
+const NETWORK_MINE_MAX_TOTAL = 400_000;
+const NETWORK_MINE_MAX_ONE = 100_000;
+
+async function attachNetworkMining(page, baseOrigin = ""){
 
 const payloads=[];
+let total=0;
+let detached=false;
 
-page.on("response",async(res)=>{
+const onResponse = async (res) => {
+  if (detached || total >= NETWORK_MINE_MAX_TOTAL) return;
+  try {
+    const ct = (res.headers()["content-type"] || "").toLowerCase();
+    if (!ct.includes("json") && !ct.includes("graphql")) return;
 
-try{
+    // Само същия хост (или релативни) — не дърпаме YouTube/analytics отговори
+    if (baseOrigin) {
+      try {
+        const h = new URL(res.url()).hostname;
+        const bh = new URL(baseOrigin).hostname;
+        const sameSite = h === bh || h.endsWith("." + bh.replace(/^www\./, "")) ;
+        if (!sameSite) return;
+      } catch { return; }
+    }
 
-const ct=(res.headers()["content-type"]||"").toLowerCase();
+    const len = Number(res.headers()["content-length"] || 0);
+    if (len && len > NETWORK_MINE_MAX_ONE * 3) return;
 
-if(
-ct.includes("json") ||
-ct.includes("graphql")
-){
+    const txt = await withTimeout(res.text(), 3000, "res.text");
+    if (!txt) return;
 
-const txt=await res.text();
+    if (/price|cost|amount|rate|tariff|subscription|monthly|annual|€|£|\$|¥|₹|currency|checkout|cart|product|service|plan|package|offer|catalog/i.test(txt)) {
+      const slice = txt.slice(0, NETWORK_MINE_MAX_ONE);
+      payloads.push(slice);
+      total += slice.length;
+    }
+  } catch {}
+};
 
-if(
-/price|cost|amount|rate|tariff|subscription|monthly|annual|€|£|\$|¥|₹|currency|checkout|cart|product|service|plan|package|offer|catalog/i.test(txt)
-){
-payloads.push(
-txt.slice(0,100000)
-);
-}
+page.on("response", onResponse);
 
-}
+const getPayloads = () => payloads.join("\n");
+getPayloads.detach = () => {
+  if (detached) return;
+  detached = true;
+  try { page.off("response", onResponse); } catch {}
+};
 
-}catch{}
-
-});
-
-return ()=>payloads.join("\n");
+return getPayloads;
 }
 
 
 
 async function forceRenderEverything(page){
 
-await page.evaluate(async()=>{
+await setNavLock(page, true);
+try {
+await tryEval(page, async()=>{
 
-for(let i=0;i<8;i++){
+for(let i=0;i<6;i++){
 
 window.scrollTo(
 0,
@@ -322,6 +414,14 @@ const isInteractive = el.tagName === 'SUMMARY' ||
 // Also click buttons with short text (likely tab/toggle labels, not navigation)
 const isShortLabel = t.length > 0 && t.length < 40;
 
+// ✅ FIX: никога не кликаме по нещо, което е (или е вътре в) реален линк —
+// това причиняваше "Execution context was destroyed" и убиваше цялата страница.
+const anchor = el.closest('a[href]');
+const navigates =
+  anchor &&
+  !/^(#|javascript:)/i.test(anchor.getAttribute('href') || '#');
+if (navigates) return;
+
 if(isInteractive || (isShortLabel && el.closest('[class*="tab"],[class*="accordion"],[class*="toggle"],[class*="pricing"],[class*="plan"]'))){
 try{el.click()}catch{}
 }
@@ -329,14 +429,17 @@ try{el.click()}catch{}
 });
 
 await new Promise(
-r=>setTimeout(r,180)
+r=>setTimeout(r,150)
 );
 
 }
 
 window.scrollTo(0,0);
 
-});
+}, undefined, 8000, null, "forceRenderEverything");
+} finally {
+await setNavLock(page, false);
+}
 
 }
 
@@ -350,17 +453,32 @@ function normalizeNumbers(text = "") {
 }
 
 // ================= URL NORMALIZER =================
+// ✅ FIX: НЕ пипаме trailing slash тук. Сайтове като hotelbalkan-gabrovo.com
+// сервират /accommodation/ и правят late client-side redirect от /accommodation.
+// Този redirect рушеше execution context-а и прекъсваше следващия goto.
 const normalizeUrl = (u) => {
   try {
     const url = new URL(u);
     url.hash = "";
     url.search = "";
     url.hostname = url.hostname.replace(/^www\./, "");
+    return url.toString();
+  } catch { return u; }
+};
+
+// Ключ само за дедупликация: /a, /a/, /A/ и www варианти са една и съща страница.
+const urlKey = (u) => {
+  try {
+    const url = new URL(u);
+    url.hash = "";
+    url.search = "";
+    url.hostname = url.hostname.replace(/^www\./, "").toLowerCase();
+    url.protocol = "https:";
     if (url.pathname.endsWith("/") && url.pathname !== "/") {
       url.pathname = url.pathname.slice(0, -1);
     }
-    return url.toString();
-  } catch { return u; }
+    return url.toString().toLowerCase();
+  } catch { return String(u || "").toLowerCase(); }
 };
 
 function normalizeDomain(u) {
@@ -945,9 +1063,13 @@ async function saveSiteMapToSupabase(siteMap) {
     return false;
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+
   try {
     const response = await fetch(`${SUPABASE_URL}/rest/v1/sites_map`, {
       method: "POST",
+      signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         "apikey": SUPABASE_SERVICE_KEY,
@@ -973,6 +1095,8 @@ async function saveSiteMapToSupabase(siteMap) {
   } catch (error) {
     console.error(`[SITEMAP] ✗ Save error:`, error.message);
     return false;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -987,7 +1111,7 @@ async function sendSiteMapToWorker(siteMap) {
     console.log(`[SITEMAP] Sending to worker: ${WORKER_URL}/prepare-session`);
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
     const response = await fetch(`${WORKER_URL}/prepare-session`, {
       method: "POST",
@@ -3758,13 +3882,62 @@ async function extractProductSpecsFromPage(page) {
 
 
 // ================= PROCESS SINGLE PAGE =================
+// Изчаква URL-ът на страницата да остане непроменен за stableMs.
+// Хваща късни client-side redirect-и (trailing slash, език, HTTPS upgrade).
+async function settleNavigation(page, { maxMs = 5000, stableMs = 500 } = {}) {
+  const started = Date.now();
+  let last = "";
+  try { last = page.url(); } catch { return; }
+  let stableSince = Date.now();
+
+  while (Date.now() - started < maxMs) {
+    await new Promise(r => setTimeout(r, 150));
+    let now = last;
+    try { now = page.url(); } catch { return; }
+
+    if (now !== last) {
+      last = now;
+      stableSince = Date.now();
+      continue;
+    }
+    if (Date.now() - stableSince >= stableMs) break;
+  }
+
+  try { await page.waitForLoadState("domcontentloaded", { timeout: 4000 }); } catch {}
+}
+
 async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
   const startTime = Date.now();
+  let detachMining = null;
 
   try {
     console.log("[PAGE]", url);
-    await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
-    
+
+    // ✅ FIX: убиваме всяка висяща навигация от ПРЕДИШНАТА страница.
+    // Без това late redirect (напр. /accommodation → /accommodation/) прекъсва
+    // goto на следващия URL: "interrupted by another navigation to ...".
+    await tryStep("about:blank", () =>
+      page.goto("about:blank", { timeout: 5000, waitUntil: "commit" }));
+
+    // goto с retry — client-side redirect-и (езикови, trailing slash, www→apex)
+    // прекъсват първия навигационен опит.
+    let navOk = false;
+    for (let attempt = 0; attempt < 3 && !navOk; attempt++) {
+      try {
+        await page.goto(url, { timeout: 15000, waitUntil: "domcontentloaded" });
+        navOk = true;
+      } catch (e) {
+        const m = (e && e.message ? e.message : String(e)).split("\n")[0];
+        if (attempt === 2 || !isTransientPageError(e)) throw e;
+        console.log(`[PAGE] retry goto #${attempt + 1} (${m})`);
+        await page.waitForTimeout(400 + attempt * 400);
+      }
+    }
+
+    // ✅ FIX: чакаме URL-ът да спре да се мени (late JS redirect). Това е
+    // директната причина за "Execution context was destroyed".
+    await settleNavigation(page);
+
     // Wait for SPA content to render — try networkidle first, then check for dynamic content
     try {
       await page.waitForLoadState('networkidle', { timeout: 3000 });
@@ -3793,20 +3966,29 @@ async function processPage(page, url, base, stats, siteMaps, capabilitiesMaps) {
     } catch {}
     
 const getNetworkPayloads =
-await attachNetworkMining(page);
+await attachNetworkMining(page, base);
+detachMining = getNetworkPayloads.detach;
 
 if(!/[?&]id=\d|\/detail\/|\/product\//i.test(url)){
- await waitForHydrationSettled(page);
+ await tryStep("waitForHydrationSettled", () => waitForHydrationSettled(page));
 }
 
-await forceRenderEverything(page);
+await tryStep("forceRenderEverything", () => forceRenderEverything(page));
 
     // Cloudflare / bot-protection check — изчакваме до 15с ако е challenge страница
     const passedCf = await waitForRealContent(page, url);
     if (!passedCf) return { links: [], page: null };
 
+    // Ако редиректът ни е върнал на вече обработена страница — не дублираме
+    let landedUrl = url;
+    try { landedUrl = normalizeUrl(page.url()) || url; } catch {}
+    if (urlKey(landedUrl) !== urlKey(url)) {
+      console.log(`[PAGE] redirect ${url} → ${landedUrl}`);
+    }
+
     // Scroll for lazy load — fast version (30ms steps, capped at MAX_SCROLL_STEPS)
-    await page.evaluate(async ({ stepMs, maxSteps }) => {
+    // ✅ FIX: tryEval вместо page.evaluate — навигация тук вече не убива страницата
+    await tryEval(page, async ({ stepMs, maxSteps }) => {
       const scrollStep = window.innerHeight;
       const maxScroll = document.body.scrollHeight;
       const steps = Math.min(Math.ceil(maxScroll / scrollStep), maxSteps);
@@ -3823,7 +4005,7 @@ await forceRenderEverything(page);
         if (img.dataset.src) img.src = img.dataset.src;
         if (img.dataset.lazy) img.src = img.dataset.lazy;
       });
-    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS });
+    }, { stepMs: SCROLL_STEP_MS, maxSteps: MAX_SCROLL_STEPS }, 6000, null, "scroll");
 
     await page.waitForTimeout(150); // ↓ was 500ms
 
@@ -3832,7 +4014,7 @@ await forceRenderEverything(page);
     } catch {}
 
     // ── Detect page type FIRST (needed before expandHiddenContent) ──
-    const title = clean(await page.title());
+    const title = clean(await tryStep("title", () => page.title(), "") || "");
     const pageType = detectPageType(url, title);
     stats.byType[pageType] = (stats.byType[pageType] || 0) + 1;
 
@@ -3842,23 +4024,27 @@ await forceRenderEverything(page);
     // leaving room for the rest of processPage within the 25s budget.
     let dialogTexts = '';
     try {
+      await setNavLock(page, true);
       dialogTexts = await withTimeout(
         expandHiddenContent(page),
         15000,
         'expandHiddenContent'
       );
     } catch (e) {
-      console.log(`[DIALOG] expandHiddenContent timed out: ${e.message}`);
+      console.log(`[DIALOG] expandHiddenContent skipped: ${e.message}`);
+    } finally {
+      await setNavLock(page, false);
     }
     if (dialogTexts) console.log(`[DIALOG] Collected ${dialogTexts.length} chars from dialogs`);
 
     // Extract structured content
-    const data = await extractStructured(page);
+    const data = (await tryStep("extractStructured", () => extractStructured(page), null))
+      || { rawContent: "" };
 
 let shadowText = "";
 
 if (/pricing|price|service|product|plan|package|tariff|shop|store|catalog/i.test(url)) {
- shadowText = await extractShadowAndPortalText(page);
+ shadowText = await tryStep("shadowText", () => extractShadowAndPortalText(page), "") || "";
 }
 
 const apiPayloads =
@@ -3945,7 +4131,8 @@ specsText
 
     // КРИТИЧНО: Извличаме контакти от СУРОВИЯ текст — ПРЕДИ normalizeNumbers
     // normalizeNumbers може да конвертира цифри в думи и да унищожи номерата
-    const domContacts = await extractContactsFromPage(page);
+    const domContacts = (await tryStep("extractContactsFromPage", () => extractContactsFromPage(page), null))
+      || { phones: [], emails: [], textHints: "" };
 
     // Подаваме RAW текст + textHints от DOM (footer, contact секции и т.н.)
     const rawForContacts = `${rawAll}\n\n${domContacts.textHints || ""}`;
@@ -3988,19 +4175,22 @@ rawAll
     console.log(`[PAGE] ✓ ${totalWords}w ${elapsed}ms`);
 
     // ── Link discovery: run expensive button discovery ONLY on listing/general pages ──
-const standardLinks = await collectAllLinks(page, base);
+const standardLinks = (await tryStep("collectAllLinks", () => collectAllLinks(page, base), [])) || [];
 
 let buttonLinks = [];
 
 if (pageType === "general") {
   try {
+    await setNavLock(page, true);
     buttonLinks = await withTimeout(
       discoverLinksViaButtons(page, base),
       8000,
       'discoverLinksViaButtons'
-    );
+    ) || [];
   } catch (e) {
-    console.error(`[DISCOVER] Timeout: ${e.message}`);
+    if (!isTransientPageError(e)) console.error(`[DISCOVER] ${e.message}`);
+  } finally {
+    await setNavLock(page, false);
   }
 
   const extraCount = buttonLinks.length;
@@ -4020,10 +4210,14 @@ const allLinks = Array.from(
       return { links: allLinks, page: null };
     }
 
+    let finalUrl = url;
+    try { finalUrl = normalizeUrl(page.url()) || url; } catch {}
+
     return {
       links: allLinks,
+      finalUrl,
       page: {
-        url,
+        url: finalUrl,
         title,
         pageType,
         content,
@@ -4034,9 +4228,39 @@ const allLinks = Array.from(
       }
     };
   } catch (e) {
-    console.error("[PAGE ERROR]", url, e.message);
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[PAGE ERROR]", url, msg);
     stats.errors++;
-    return { links: [], page: null };
+
+    // ✅ FIX: дори при грешка не изхвърляме всичко — вземаме каквото има в DOM-а.
+    // Преди това една навигация = 0 страници за целия сайт.
+    const salvaged = await tryEval(page, () => ({
+      title: document.title || "",
+      text: (document.body && document.body.innerText) || "",
+    }), undefined, 5000, null, "salvage");
+
+    if (salvaged && countWordsExact(salvaged.text) >= MIN_WORDS) {
+      console.log(`[PAGE] ~ salvaged ${countWordsExact(salvaged.text)}w from ${url}`);
+      const salvagedLinks = (await tryStep("salvageLinks", () => collectAllLinks(page, base), [])) || [];
+      return {
+        links: salvagedLinks,
+        needsRecycle: true,
+        page: {
+          url,
+          title: clean(salvaged.title),
+          pageType: detectPageType(url, salvaged.title),
+          content: clean(stripFooterAndDedup(salvaged.text)),
+          structured: { pricing: null, contacts: { emails: [], phones: [] }, product_specs: null },
+          wordCount: countWordsExact(salvaged.text),
+          status: "ok",
+          partial: true,
+        }
+      };
+    }
+
+    return { links: [], page: null, needsRecycle: true };
+  } finally {
+    if (detachMining) { try { detachMining(); } catch {} }
   }
 }
 
@@ -4044,8 +4268,53 @@ const allLinks = Array.from(
 // ================= STEALTH + CLOUDFLARE BYPASS =================
 const STEALTH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-async function makeStealthContext(browser) {
-  return browser.newContext({
+// Блокира тежки/шумни ресурси на ниво context — това е най-голямата печалба
+// за сайтове с YouTube/360° тур/booking iframe (напр. hotelbalkan-gabrovo.com).
+async function installResourceBlocking(context, baseOrigin = "") {
+  if (!BLOCK_HEAVY_RESOURCES) return;
+  let baseHost = "";
+  try { baseHost = baseOrigin ? new URL(baseOrigin).hostname.replace(/^www\./, "") : ""; } catch {}
+
+  await context.route("**/*", (route) => {
+    try {
+      const req = route.request();
+      const url = req.url();
+      const type = req.resourceType();
+
+      let host = "";
+      let path = "";
+      try {
+        const u = new URL(url);
+        host = u.hostname.replace(/^www\./, "");
+        path = u.pathname;
+      } catch {}
+
+      const isOwnHost =
+        !!baseHost && (host === baseHost || host.endsWith("." + baseHost));
+
+      // Никога не блокираме собствените HTML документи на сайта
+      if (type === "document" && isOwnHost) return route.continue();
+
+      // Тежки ресурси без текстова стойност
+      if (BLOCKED_RESOURCE_TYPES.has(type)) return route.abort();
+      if (type === "media" || type === "websocket" || type === "eventsource") {
+        return route.abort();
+      }
+
+      // Известни шумни трети страни (по хост, не по целия URL)
+      if (!isOwnHost && host && BLOCKED_HOST_RE.test(host + path)) {
+        return route.abort();
+      }
+
+      return route.continue();
+    } catch {
+      try { return route.continue(); } catch { return; }
+    }
+  });
+}
+
+async function makeStealthContext(browser, baseOrigin = "") {
+  const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: STEALTH_UA,
     locale: 'bg-BG',
@@ -4063,7 +4332,16 @@ async function makeStealthContext(browser) {
       'Sec-Fetch-User': '?1',
       'Upgrade-Insecure-Requests': '1',
     },
+    serviceWorkers: "block",   // ✅ спира "Service worker registration failed" шума
+    javaScriptEnabled: true,
+    bypassCSP: true,
+    ignoreHTTPSErrors: true,
   });
+
+  context.setDefaultTimeout(15000);
+  context.setDefaultNavigationTimeout(20000);
+  await installResourceBlocking(context, baseOrigin);
+  return context;
 }
 
 async function applyStealthScripts(page) {
@@ -4074,6 +4352,42 @@ async function applyStealthScripts(page) {
     if (!window.chrome) window.chrome = { runtime: {} };
     delete window.__playwright;
     delete window.__pw_manual;
+
+    // ── NAV LOCK ──────────────────────────────────────────────────────────
+    // Докато е вдигнат, кликовете по линкове не навигират. Това е причината
+    // за "Execution context was destroyed" при forceRender/expandHiddenContent.
+    window.__neoNavLock = false;
+
+    document.addEventListener("click", (e) => {
+      if (!window.__neoNavLock) return;
+      try {
+        const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+        if (!a) return;
+        const href = a.getAttribute("href") || "";
+        if (!href || href.startsWith("#") || href.toLowerCase().startsWith("javascript:")) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      } catch {}
+    }, true);
+
+    const _open = window.open;
+    window.open = function () {
+      if (window.__neoNavLock) return null;
+      return _open.apply(window, arguments);
+    };
+
+    try {
+      const _assign = window.location.assign.bind(window.location);
+      const _replace = window.location.replace.bind(window.location);
+      window.location.assign = function (u) { if (window.__neoNavLock) return; return _assign(u); };
+      window.location.replace = function (u) { if (window.__neoNavLock) return; return _replace(u); };
+    } catch {}
+
+    window.addEventListener("beforeunload", (e) => {
+      if (!window.__neoNavLock) return;
+      e.preventDefault();
+      e.returnValue = "";
+    });
   });
 }
 
@@ -4122,7 +4436,39 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
       "--no-default-browser-check",
       "--disable-extensions",
       "--lang=bg-BG,bg;q=0.9,en-US;q=0.8,en;q=0.7",
+      // ── Тишина: спира INFO:CONSOLE / dbus / UPower / video-capture спама ──
+      "--log-level=3",
+      "--disable-logging",
+      "--silent-debugger-extension-api",
+      "--disable-breakpad",
+      "--disable-crash-reporter",
+      "--disable-notifications",
+      "--disable-desktop-notifications",
+      "--deny-permission-prompts",
+      "--mute-audio",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-update",
+      "--disable-domain-reliability",
+      "--disable-sync",
+      "--disable-default-apps",
+      "--disable-hang-monitor",
+      "--disable-prompt-on-repost",
+      "--disable-print-preview",
+      "--disable-speech-api",
+      "--disable-permissions-api",
+      "--no-pings",
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      "--autoplay-policy=user-gesture-required",
+      "--blink-settings=imagesEnabled=false",
+      "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AudioServiceOutOfProcess",
     ],
+    // Спира "Failed to connect to the bus" / UPower грешките в контейнер
+    env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: "/dev/null" },
   });
   activeBrowsers.add(browser);
 
@@ -4157,11 +4503,24 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
   publishPartial();
 
   try {
-    const initContext = await makeStealthContext(browser);
+    let startOrigin = "";
+    try { startOrigin = new URL(startUrl).origin; } catch {}
+    const initContext = await makeStealthContext(browser, startOrigin);
     const initPage = await initContext.newPage();
     await applyStealthScripts(initPage);
 
-    await initPage.goto(startUrl, { timeout: 10000, waitUntil: "domcontentloaded" });
+    let initNavOk = false;
+    for (let attempt = 0; attempt < 2 && !initNavOk; attempt++) {
+      try {
+        await initPage.goto(startUrl, { timeout: 15000, waitUntil: "domcontentloaded" });
+        initNavOk = true;
+      } catch (e) {
+        if (attempt === 1 || !isTransientPageError(e)) throw e;
+        console.log(`[INIT] retry goto (${(e.message || "").split("\n")[0]})`);
+        await initPage.waitForTimeout(500);
+      }
+    }
+    await settleNavigation(initPage);
     base = new URL(initPage.url()).origin;
     publishPartial();
 
@@ -4184,32 +4543,36 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
     } catch {}
 
     // Use SELECTIVE nav link discovery — only header/footer/nav links
-    const navLinks = await collectNavLinks(initPage, base);
+    const navLinks = (await tryStep("collectNavLinks", () => collectNavLinks(initPage, base), [])) || [];
     // Also get button-discovered links for SPAs
     let initButtonLinks = [];
     try {
+      await setNavLock(initPage, true);
       initButtonLinks = await withTimeout(
         discoverLinksViaButtons(initPage, base),
         8000,
         'init discoverLinksViaButtons'
-      );
+      ) || [];
     } catch (e) {
-      console.error(`[INIT] Button discovery timeout: ${e.message}`);
+      if (!isTransientPageError(e)) console.error(`[INIT] Button discovery: ${e.message}`);
+    } finally {
+      await setNavLock(initPage, false);
     }
     const allInitialLinks = Array.from(new Set([...navLinks, ...initButtonLinks]));
 
-    // Add homepage first
+    // Add homepage first — пазим реалния URL (със slash, ако сайтът го иска)
     const homeNorm = normalizeUrl(initPage.url());
-    visited.add(homeNorm);
+    visited.add(urlKey(homeNorm));
     queue.push({ url: homeNorm, depth: 0 });
 
     // Prioritize important pages from nav, skip blog/news/terms/etc.
     let initCount = 0;
     allInitialLinks.forEach(l => {
       const nl = normalizeUrl(l);
-      if (visited.has(nl) || SKIP_URL_RE.test(nl)) return;
+      const key = urlKey(nl);
+      if (visited.has(key) || SKIP_URL_RE.test(nl)) return;
 
-      visited.add(nl);
+      visited.add(key);
 
       // Priority: pages likely to have important business info (services, pricing, about, contact, FAQ)
       // Universal slugs covering EN, BG, DE, FR, ES, IT, TR, RU, and common patterns
@@ -4236,7 +4599,7 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
         typeof browser.isConnected !== "function" || browser.isConnected();
 
       const recreatePage = async () => {
-        ctx = await makeStealthContext(browser);
+        ctx = await makeStealthContext(browser, base);
         pg = await ctx.newPage();
         await applyStealthScripts(pg);
       };
@@ -4265,11 +4628,17 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
 
           stats.visited++;
 
+          // ✅ FIX: бюджетът за страница не бива да надхвърля оставащото време
+          // до глобалния deadline — иначе една бавна страница = timeout за целия сайт.
+          const remainingMs = deadline - Date.now();
+          if (remainingMs < 4000) break;
+          const pageBudgetMs = Math.max(8000, Math.min(PAGE_TIMEOUT_MS, remainingMs - 3000));
+
           let result;
           try {
             result = await withTimeout(
               processPage(pg, item.url, base, stats, siteMaps, capabilitiesMaps),
-              PAGE_TIMEOUT_MS,
+              pageBudgetMs,
               `processPage(${item.url})`
             );
           } catch (e) {
@@ -4292,6 +4661,29 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
             continue;
           }
 
+          // Ако сървърът/JS е редиректнал, маркираме и финалния URL като видян,
+          // за да не го crawl-ваме втори път през друг линк.
+          if (result.finalUrl) {
+            const fk = urlKey(result.finalUrl);
+            if (!visited.has(fk)) visited.add(fk);
+          }
+
+          // ✅ FIX: страница, която е гръмнала, често носи висяща навигация.
+          // Рециклираме я, за да не отрови следващия URL в същия worker.
+          if (result.needsRecycle) {
+            await closeQuietly(pg, "poisoned page");
+            await closeQuietly(ctx, "poisoned context");
+            pg = null; ctx = null;
+            if (!browserConnected()) break;
+            try {
+              await recreatePage();
+            } catch (reopenErr) {
+              stats.errors++;
+              console.error(`[PAGE] ✗ Failed to recreate page:`, reopenErr instanceof Error ? reopenErr.message : String(reopenErr));
+              break;
+            }
+          }
+
           if (result.page) {
             // Collect contacts
             const c = result.page?.structured?.contacts;
@@ -4307,8 +4699,9 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
             let newLinksAdded = 0;
             result.links.forEach(l => {
               const nl = normalizeUrl(l);
-              if (!visited.has(nl) && !SKIP_URL_RE.test(nl)) {
-                visited.add(nl);
+              const key = urlKey(nl);
+              if (!visited.has(key) && !SKIP_URL_RE.test(nl)) {
+                visited.add(key);
                 // Inner page links go to low priority
                 lowPriorityQueue.push({ url: nl, depth: item.depth + 1 });
                 newLinksAdded++;
@@ -4327,7 +4720,13 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
       }
     };
 
-    await Promise.all(Array(PARALLEL_TABS).fill(0).map(() => createWorker()));
+    // ✅ FIX: не отваряме 8 контекста за сайт с 1 страница — пести RAM/CPU и
+    // предотвратява timeout при тежки сайтове.
+    const pending = queue.length + lowPriorityQueue.length;
+    const workerCount = Math.max(1, Math.min(PARALLEL_TABS, pending));
+    console.log(`[CONFIG] Spawning ${workerCount} worker tab(s) for ${pending} queued URL(s)`);
+
+    await Promise.all(Array(workerCount).fill(0).map(() => createWorker()));
 
   } finally {
     await closeQuietly(browser, "crawl browser");
@@ -4347,8 +4746,10 @@ async function crawlSmart(startUrl, siteId = null, deadlineMs = null, partialSta
     const enrichedMaps = siteMaps.map(raw => enrichSiteMap(raw, siteId, base));
     combinedSiteMap = buildCombinedSiteMap(enrichedMaps, siteId, base);
 
-    await saveSiteMapToSupabase(combinedSiteMap);
-    await sendSiteMapToWorker(combinedSiteMap);
+    await tryStep("saveSiteMapToSupabase",
+      () => withTimeout(saveSiteMapToSupabase(combinedSiteMap), 10000, "supabase save"), false);
+    await tryStep("sendSiteMapToWorker",
+      () => withTimeout(sendSiteMapToWorker(combinedSiteMap), 10000, "worker send"), false);
   }
 
   const portfolioRe = /\/(proekt\/|project\/|zavursheni-proekti\/|completed|portfolio\/|gallery\/)/i;
@@ -4476,7 +4877,16 @@ http
     }
 
     let body = "";
-    req.on("data", c => (body += c));
+    let bodyBytes = 0;
+    const MAX_BODY_BYTES = 1_000_000;
+    req.on("data", c => {
+      bodyBytes += c.length;
+      if (bodyBytes > MAX_BODY_BYTES) {
+        try { req.destroy(); } catch {}
+        return;
+      }
+      body += c;
+    });
     req.on("error", err => {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: false, error: "Request error" }));
@@ -4488,7 +4898,22 @@ http
       let requestedUrl = null;
       let siteId = null;
       try {
-        const parsed = JSON.parse(body || "{}");
+        // ✅ FIX: сканери/ботове пращат SOAP/XML на този порт. Преди това
+        // JSON.parse хвърляше и се логваше като "[CRAWL ERROR] Unexpected token '<'".
+        let parsed;
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          const preview = String(body || "").slice(0, 40).replace(/\s+/g, " ");
+          console.warn(`[BAD REQUEST] Non-JSON body ignored: ${preview}`);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ success: false, error: "Invalid JSON body" }));
+        }
+
+        if (!parsed || typeof parsed !== "object") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ success: false, error: "Invalid JSON body" }));
+        }
 
         if (!parsed.url) {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -4506,7 +4931,7 @@ http
         const deadlineMs = rawDeadline > 10000 ? rawDeadline - 5000 : null;
         const now = Date.now();
 
-        if (crawlFinished && lastResult && lastCrawlUrl === requestedUrl) {
+        if (crawlFinished && lastResult && urlKey(lastCrawlUrl || "") === urlKey(requestedUrl)) {
           if (now - lastCrawlTime < RESULT_TTL_MS) {
             console.log("[CACHE HIT] Returning cached result for:", requestedUrl);
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -4517,7 +4942,7 @@ http
         await resetStaleCrawlLock(now);
 
         if (crawlInProgress) {
-          if (lastCrawlUrl === requestedUrl) {
+          if (urlKey(lastCrawlUrl || "") === urlKey(requestedUrl)) {
             res.writeHead(202, { "Content-Type": "application/json" });
             return res.end(JSON.stringify({
               success: false,
